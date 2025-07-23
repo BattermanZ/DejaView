@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
-use clap::{ArgAction, Parser};
+use anyhow::{anyhow, Context, Result};
+use clap::{Parser, Subcommand};
 use colored::*;
 use comfy_table::{presets::UTF8_FULL, modifiers::UTF8_ROUND_CORNERS, ContentArrangement, Table};
 use hex;
@@ -18,31 +18,90 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use walkdir::{DirEntry, WalkDir};
 
-/// DejaView – fast duplicate detector that swaps download copies for symlinks.
+// ---- CLI --------------------------------------------------------------------
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Cli {
-    /// Path to the download tree (torrents seed here)
-    #[arg(short = 'd', long)]
-    downloads: PathBuf,
-
-    /// Path to the organised media library
-    #[arg(short = 'm', long)]
-    media: PathBuf,
-
-    /// Perform a dry run – no deletions or symlinks are written
-    #[arg(short = 'n', long, action = ArgAction::SetTrue)]
-    dry_run: bool,
-
-    /// Override number of Rayon threads (default = #physical CPUs)
-    #[arg(long)]
-    threads: Option<usize>,
-
-    /// Ignore files modified in the last N seconds (skip active downloads)
-    #[arg(long, default_value_t = 300)]
-    min_age: u64,
+    #[command(subcommand)]
+    command: Commands,
 }
 
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Scan for duplicates (dry run)
+    Scan,
+    /// Replace duplicates with symlinks
+    Link,
+    /// Manage the configuration
+    Config(ConfigArgs),
+    /// Manage the cache
+    Cache(CacheArgs),
+}
+
+#[derive(Parser, Debug)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommands {
+    /// Set the downloads path
+    SetDownloads { path: PathBuf },
+    /// Set the media path
+    SetMedia { path: PathBuf },
+    /// Show the current configuration
+    Show,
+}
+
+#[derive(Parser, Debug)]
+struct CacheArgs {
+    #[command(subcommand)]
+    command: CacheCommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum CacheCommands {
+    /// Clear the cache
+    Clear,
+    /// Show cache info
+    Info,
+}
+
+// ---- Configuration ----------------------------------------------------------
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct Config {
+    downloads: Option<PathBuf>,
+    media: Option<PathBuf>,
+    min_age: Option<u64>,
+    threads: Option<usize>,
+}
+
+fn config_path() -> Result<PathBuf> {
+    let config_dir = dirs::config_dir().ok_or_else(|| anyhow!("Could not find config directory"))?;
+    Ok(config_dir.join("dejaview").join("config.json"))
+}
+
+fn load_config() -> Result<Config> {
+    let path = config_path()?;
+    if !path.exists() {
+        return Ok(Config::default());
+    }
+    let s = fs::read_to_string(path)?;
+    let config = serde_json::from_str(&s)?;
+    Ok(config)
+}
+
+fn save_config(config: &Config) -> Result<()> {
+    let path = config_path()?;
+    let parent = path.parent().unwrap();
+    fs::create_dir_all(parent)?;
+    let s = serde_json::to_string_pretty(config)?;
+    fs::write(path, s)?;
+    Ok(())
+}
+
+// ---- File Info and Cache ----------------------------------------------------
 #[derive(Debug, Clone)]
 struct FileInfo {
     path: PathBuf,
@@ -61,9 +120,12 @@ struct CacheEntry {
     hash: String,
 }
 
-type Cache = HashMap<String, CacheEntry>; // key = absolute path
+type Cache = HashMap<String, CacheEntry>;
 
-const CACHE_FILE: &str = ".dejaview_cache.json";
+fn cache_path(config: &Config) -> Result<PathBuf> {
+    let downloads = config.downloads.as_ref().ok_or_else(|| anyhow!("Downloads path not set"))?;
+    Ok(downloads.join(".dejaview_cache.json"))
+}
 
 // ---- helpers --------------------------------------------------------------
 fn is_regular(entry: &DirEntry) -> bool {
@@ -97,19 +159,28 @@ fn collect_files(root: &Path, in_downloads: bool, min_age: Duration) -> Result<V
     Ok(files)
 }
 
-fn load_cache(root: &Path) -> Cache {
-    let cache_path = root.join(CACHE_FILE);
-    match fs::read_to_string(&cache_path) {
+fn load_cache(path: &Path) -> Cache {
+    match fs::read_to_string(path) {
         Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
         Err(_) => HashMap::new(),
     }
 }
 
-fn save_cache(root: &Path, cache: &Cache) {
-    let cache_path = root.join(CACHE_FILE);
+fn save_cache(path: &Path, cache: &Cache) {
     if let Ok(json) = serde_json::to_string(cache) {
-        let _ = fs::File::create(cache_path).and_then(|mut f| f.write_all(json.as_bytes()));
+        let _ = fs::File::create(path).and_then(|mut f| f.write_all(json.as_bytes()));
     }
+}
+
+fn format_size(bytes: u64) -> String {
+    let units = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
+    let mut size = bytes as f64;
+    let mut unit_index = 0;
+    while size >= 1024.0 && unit_index < units.len() - 1 {
+        size /= 1024.0;
+        unit_index += 1;
+    }
+    format!("{:.2} {}", size, units[unit_index])
 }
 
 // fast 2‑chunk hash (first & last 1 MiB)
@@ -142,13 +213,11 @@ fn full_digest(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    // tune thread‑pool if requested
-    if let Some(t) = cli.threads {
-        rayon::ThreadPoolBuilder::new().num_threads(t).build_global()?;
-    }
+// ---- Subcommand Implementations ---------------------------------------------
+fn run_scan(config: &Config, dry_run: bool) -> Result<()> {
+    let downloads = config.downloads.as_ref().ok_or_else(|| anyhow!("Downloads path not set"))?;
+    let media = config.media.as_ref().ok_or_else(|| anyhow!("Media path not set"))?;
+    let min_age = Duration::from_secs(config.min_age.unwrap_or(300));
 
     // -------- Progress bars --------
     let mp = MultiProgress::new();
@@ -158,22 +227,22 @@ fn main() -> Result<()> {
     spinner.set_message("Collecting files…".cyan().bold().to_string());
 
     // -------- Gather files --------
-    let min_age = Duration::from_secs(cli.min_age);
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
 
-    let mut files = collect_files(&cli.downloads, true, min_age)?;
+    let mut files = collect_files(downloads, true, min_age)?;
     for f in &files {
         seen.insert((f.dev, f.inode));
     }
 
-    let mut media_files = collect_files(&cli.media, false, min_age)?;
+    let mut media_files = collect_files(media, false, min_age)?;
     media_files.retain(|f| !seen.contains(&(f.dev, f.inode)));
     files.extend(media_files);
 
     spinner.finish_with_message("File list complete ✔".green().bold().to_string());
 
     // -------- Hashing phase --------
-    let cache = Arc::new(Mutex::new(load_cache(&cli.downloads)));
+    let cache_path = cache_path(config)?;
+    let cache = Arc::new(Mutex::new(load_cache(&cache_path)));
     let inode_hash: Arc<Mutex<HashMap<(u64, u64), String>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let mut size_map: HashMap<u64, Vec<FileInfo>> = HashMap::new();
@@ -238,7 +307,7 @@ fn main() -> Result<()> {
     bar.finish_with_message("Hashing complete ✔".green().bold().to_string());
 
     if let Ok(c) = Arc::try_unwrap(cache) {
-        save_cache(&cli.downloads, &c.into_inner().unwrap());
+        save_cache(&cache_path, &c.into_inner().unwrap());
     }
 
     // -------- Build hash map --------
@@ -260,6 +329,7 @@ fn main() -> Result<()> {
         .set_header(vec!["Download".yellow(), "Media".yellow()]);
 
     let mut actions = Vec::new();
+    let mut total_saved_space: u64 = 0;
 
     for group in hash_map.values() {
         // split into downloads vs media
@@ -280,6 +350,7 @@ fn main() -> Result<()> {
                 target.to_string_lossy().to_string(),
             ]);
             actions.push((src.path.clone(), target.clone()));
+            total_saved_space += src.size;
         }
     }
 
@@ -291,7 +362,10 @@ fn main() -> Result<()> {
         println!("{} No actions needed.", "✔".green());
         return Ok(());
     }
-    if cli.dry_run {
+
+    println!("{} Potential space saved: {}", "💾".cyan(), format_size(total_saved_space));
+
+    if dry_run {
         println!("{} Dry-run; no changes.", "ℹ".yellow());
         return Ok(());
     }
@@ -304,5 +378,49 @@ fn main() -> Result<()> {
         symlink(rel, &src).with_context(|| format!("ln {:?} -> {:?}", &src, &tgt))?;
     }
     println!("{} Done.", "✔".green());
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let mut config = load_config()?;
+
+    if let Some(threads) = config.threads {
+        rayon::ThreadPoolBuilder::new().num_threads(threads).build_global()?;
+    }
+
+    match cli.command {
+        Commands::Scan => run_scan(&config, true)?,
+        Commands::Link => run_scan(&config, false)?,
+        Commands::Config(args) => match args.command {
+            ConfigCommands::SetDownloads { path } => {
+                config.downloads = Some(path);
+                save_config(&config)?;
+                println!("{} Downloads path set.", "✔".green());
+            }
+            ConfigCommands::SetMedia { path } => {
+                config.media = Some(path);
+                save_config(&config)?;
+                println!("{} Media path set.", "✔".green());
+            }
+            ConfigCommands::Show => {
+                println!("{}", serde_json::to_string_pretty(&config)?);
+            }
+        },
+        Commands::Cache(args) => match args.command {
+            CacheCommands::Clear => {
+                let path = cache_path(&config)?;
+                fs::remove_file(path)?;
+                println!("{} Cache cleared.", "✔".green());
+            }
+            CacheCommands::Info => {
+                let path = cache_path(&config)?;
+                let cache = load_cache(&path);
+                println!("Cache location: {}", path.display());
+                println!("Cached entries: {}", cache.len());
+            }
+        },
+    }
+
     Ok(())
 }
