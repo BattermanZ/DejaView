@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use walkdir::{DirEntry, WalkDir};
-use comfy_table::{ContentArrangement,Table, presets::UTF8_FULL, modifiers::UTF8_ROUND_CORNERS, ContentArrangement::Dynamic};
+use comfy_table::{ContentArrangement,Table, presets::UTF8_FULL, modifiers::UTF8_ROUND_CORNERS};
 
 /// DejaView – fast duplicate detector that swaps download copies for symlinks.
 #[derive(Parser, Debug)]
@@ -182,7 +182,7 @@ fn main() -> Result<()> {
         let inode_hash = Arc::clone(&inode_hash);
         group.par_iter_mut().for_each(|fi| {
             let key = fi.path.to_string_lossy().into_owned();
-            if let Ok(mut c) = cache.lock() {
+            if let Ok(c) = cache.lock() {
                 if let Some(e) = c.get(&key) {
                     if e.size == fi.size && e.mtime == fi.mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() {
                         fi.hash = Some(e.hash.clone());
@@ -190,7 +190,7 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            if let Ok(mut ih) = inode_hash.lock() {
+            if let Ok(ih) = inode_hash.lock() {
                 if let Some(h) = ih.get(&(fi.dev, fi.inode)) {
                     fi.hash = Some(h.clone());
                     return;
