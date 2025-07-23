@@ -1,21 +1,22 @@
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser};
 use colored::*;
+use comfy_table::{presets::UTF8_FULL, modifiers::UTF8_ROUND_CORNERS, ContentArrangement, Table};
+use hex;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use pathdiff::diff_paths;
-use rayon::prelude::*;
+
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Read, Write, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{symlink, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use walkdir::{DirEntry, WalkDir};
-use comfy_table::{ContentArrangement,Table, presets::UTF8_FULL, modifiers::UTF8_ROUND_CORNERS};
 
 /// DejaView – fast duplicate detector that swaps download copies for symlinks.
 #[derive(Parser, Debug)]
@@ -79,7 +80,9 @@ fn collect_files(root: &Path, in_downloads: bool, min_age: Duration) -> Result<V
         .filter_map(|entry| {
             let meta = entry.metadata().ok()?;
             let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            if mtime > deadline { return None; }
+            if mtime > deadline {
+                return None;
+            }
             Some(FileInfo {
                 path: entry.into_path(),
                 size: meta.len(),
@@ -131,7 +134,9 @@ fn full_digest(path: &Path) -> Result<String> {
     let mut buf = [0u8; 1 << 20];
     loop {
         let n = file.read(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
     Ok(hasher.finalize().to_hex().to_string())
@@ -157,7 +162,9 @@ fn main() -> Result<()> {
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
 
     let mut files = collect_files(&cli.downloads, true, min_age)?;
-    for f in &files { seen.insert((f.dev, f.inode)); }
+    for f in &files {
+        seen.insert((f.dev, f.inode));
+    }
 
     let mut media_files = collect_files(&cli.media, false, min_age)?;
     media_files.retain(|f| !seen.contains(&(f.dev, f.inode)));
@@ -170,7 +177,9 @@ fn main() -> Result<()> {
     let inode_hash: Arc<Mutex<HashMap<(u64, u64), String>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let mut size_map: HashMap<u64, Vec<FileInfo>> = HashMap::new();
-    for f in files { size_map.entry(f.size).or_default().push(f); }
+    for f in files {
+        size_map.entry(f.size).or_default().push(f);
+    }
 
     let mut groups: Vec<&mut Vec<FileInfo>> = size_map.values_mut().filter(|v| v.len() > 1).collect();
     let bar = mp.add(ProgressBar::new(groups.len() as u64));
@@ -178,33 +187,52 @@ fn main() -> Result<()> {
     bar.set_message("Hashing groups".bold().to_string());
 
     for group in &mut groups {
-        let cache = Arc::clone(&cache);
-        let inode_hash = Arc::clone(&inode_hash);
-        group.par_iter_mut().for_each(|fi| {
-            let key = fi.path.to_string_lossy().into_owned();
-            if let Ok(c) = cache.lock() {
-                if let Some(e) = c.get(&key) {
-                    if e.size == fi.size && e.mtime == fi.mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() {
-                        fi.hash = Some(e.hash.clone());
-                        return;
+        // Phase 1: Fast sample hash
+        let mut sample_hashes: HashMap<String, Vec<usize>> = HashMap::new();
+        group.iter().enumerate().for_each(|(i, fi)| {
+            if let Ok(h) = sample_digest(&fi.path, fi.size) {
+                let hex_hash = hex::encode(h);
+                sample_hashes.entry(hex_hash).or_default().push(i);
+            }
+        });
+
+        // Phase 2: Full hash for sample-hash collisions
+        for (_, indices) in sample_hashes.iter().filter(|(_, v)| v.len() > 1) {
+            for &i in indices {
+                let fi = &mut group[i];
+                let key = fi.path.to_string_lossy().into_owned();
+                if let Ok(c) = cache.lock() {
+                    if let Some(e) = c.get(&key) {
+                        if e.size == fi.size && e.mtime == fi.mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() {
+                            fi.hash = Some(e.hash.clone());
+                            continue;
+                        }
+                    }
+                }
+                if let Ok(ih) = inode_hash.lock() {
+                    if let Some(h) = ih.get(&(fi.dev, fi.inode)) {
+                        fi.hash = Some(h.clone());
+                        continue;
+                    }
+                }
+                if let Ok(h) = full_digest(&fi.path) {
+                    if let Ok(mut ih) = inode_hash.lock() {
+                        ih.insert((fi.dev, fi.inode), h.clone());
+                    }
+                    fi.hash = Some(h.clone());
+                    if let Ok(mut c) = cache.lock() {
+                        c.insert(
+                            key,
+                            CacheEntry {
+                                size: fi.size,
+                                mtime: fi.mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
+                                hash: h,
+                            },
+                        );
                     }
                 }
             }
-            if let Ok(ih) = inode_hash.lock() {
-                if let Some(h) = ih.get(&(fi.dev, fi.inode)) {
-                    fi.hash = Some(h.clone());
-                    return;
-                }
-            }
-            let _ = sample_digest(&fi.path, fi.size); // quick sample (currently unused)
-            if let Ok(h) = full_digest(&fi.path) {
-                if let Ok(mut ih) = inode_hash.lock() { ih.insert((fi.dev, fi.inode), h.clone()); }
-                fi.hash = Some(h.clone());
-                if let Ok(mut c) = cache.lock() {
-                    c.insert(key, CacheEntry { size: fi.size, mtime: fi.mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(), hash: h });
-                }
-            }
-        });
+        }
         bar.inc(1);
     }
     bar.finish_with_message("Hashing complete ✔".green().bold().to_string());
@@ -226,18 +254,20 @@ fn main() -> Result<()> {
     // -------- Duplicate resolution & output --------
     let mut table = Table::new();
     table
-      .load_preset(UTF8_FULL)
-      .apply_modifier(UTF8_ROUND_CORNERS)
-      .set_content_arrangement(ContentArrangement::Dynamic)
-      .set_header(vec!["Download".yellow(), "Media".yellow()]);
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["Download".yellow(), "Media".yellow()]);
 
     let mut actions = Vec::new();
 
     for group in hash_map.values() {
         // split into downloads vs media
         let downloads: Vec<&&FileInfo> = group.iter().filter(|f| f.in_downloads).collect();
-        let media:     Vec<&&FileInfo> = group.iter().filter(|f| !f.in_downloads).collect();
-        if downloads.is_empty() || media.is_empty() { continue; }
+        let media: Vec<&&FileInfo> = group.iter().filter(|f| !f.in_downloads).collect();
+        if downloads.is_empty() || media.is_empty() {
+            continue;
+        }
         // choose first media file as canonical
         let target = &media[0].path;
         for src in downloads {
@@ -254,7 +284,8 @@ fn main() -> Result<()> {
     }
 
     // print results
-    println!("\n{} Found duplicates:", "▶".cyan());
+    println!("
+{} Found duplicates:", "▶".cyan());
     println!("{}", table);
     if actions.is_empty() {
         println!("{} No actions needed.", "✔".green());
@@ -269,8 +300,7 @@ fn main() -> Result<()> {
     println!("{} Applying…", "▶".cyan());
     for (src, tgt) in actions {
         fs::remove_file(&src).with_context(|| format!("rm {}", src.display()))?;
-        let rel = diff_paths(&tgt, &src.parent().unwrap())
-            .context("failed to compute relative path")?;
+        let rel = diff_paths(&tgt, &src.parent().unwrap()).context("failed to compute relative path")?;
         symlink(rel, &src).with_context(|| format!("ln {:?} -> {:?}", &src, &tgt))?;
     }
     println!("{} Done.", "✔".green());
