@@ -1,0 +1,1 @@
+This is a Rust project, as indicated by the presence of `Cargo.toml` and `src/main.rs`.
