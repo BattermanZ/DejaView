@@ -9,11 +9,12 @@ use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{symlink, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::{DirEntry, WalkDir};
 
 // ---- CLI --------------------------------------------------------------------
@@ -168,10 +169,35 @@ fn load_cache(path: &Path) -> Cache {
     }
 }
 
-fn save_cache(path: &Path, cache: &Cache) {
-    if let Ok(json) = serde_json::to_string(cache) {
-        let _ = fs::File::create(path).and_then(|mut f| f.write_all(json.as_bytes()));
+fn save_cache(path: &Path, cache: &Cache) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("cache path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)?;
+
+    let tmp_path = parent.join(format!(
+        ".dejaview_cache.tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let json = serde_json::to_vec(cache)?;
+
+    let write_result = (|| -> Result<()> {
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(&json)?;
+        file.sync_all()?;
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
     }
+
+    write_result
 }
 
 fn format_size(bytes: u64) -> String {
@@ -229,6 +255,43 @@ fn ensure_target_within_media_root(media_root: &Path, target: &Path) -> Result<(
     }
 
     Ok(())
+}
+
+fn replace_file_with_relative_symlink(src: &Path, tgt: &Path) -> Result<()> {
+    let parent = src
+        .parent()
+        .ok_or_else(|| anyhow!("source path has no parent: {}", src.display()))?;
+    let rel = diff_paths(tgt, parent).context("failed to compute relative path")?;
+    let tmp_link = parent.join(format!(
+        ".dejaview_link.tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+
+    let link_result = (|| -> Result<()> {
+        symlink(&rel, &tmp_link)
+            .with_context(|| format!("ln -s {:?} {:?}", rel, tmp_link.display()))?;
+        fs::rename(&tmp_link, src)
+            .with_context(|| format!("mv {:?} {:?}", tmp_link.display(), src.display()))?;
+        Ok(())
+    })();
+
+    if link_result.is_err() {
+        let _ = fs::remove_file(&tmp_link);
+    }
+
+    link_result
+}
+
+fn clear_cache_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("remove cache file {}", path.display())),
+    }
 }
 
 // ---- Subcommand Implementations ---------------------------------------------
@@ -350,7 +413,7 @@ fn run_scan(config: &Config, dry_run: bool) -> Result<()> {
     bar.finish_with_message("Hashing complete ✔".green().bold().to_string());
 
     if let Ok(c) = Arc::try_unwrap(cache) {
-        save_cache(&cache_path, &c.into_inner().unwrap());
+        save_cache(&cache_path, &c.into_inner().unwrap())?;
     }
 
     // -------- Build hash map --------
@@ -424,10 +487,7 @@ fn run_scan(config: &Config, dry_run: bool) -> Result<()> {
     println!("{} Applying…", "▶".cyan());
     for (src, tgt) in actions {
         ensure_target_within_media_root(media, &tgt)?;
-        fs::remove_file(&src).with_context(|| format!("rm {}", src.display()))?;
-        let rel =
-            diff_paths(&tgt, src.parent().unwrap()).context("failed to compute relative path")?;
-        symlink(rel, &src).with_context(|| format!("ln {:?} -> {:?}", &src, &tgt))?;
+        replace_file_with_relative_symlink(&src, &tgt)?;
     }
     println!("{} Done.", "✔".green());
     Ok(())
@@ -464,7 +524,7 @@ fn main() -> Result<()> {
         Commands::Cache(args) => match args.command {
             CacheCommands::Clear => {
                 let path = cache_path(&config)?;
-                fs::remove_file(path)?;
+                clear_cache_file(&path)?;
                 println!("{} Cache cleared.", "✔".green());
             }
             CacheCommands::Info => {
@@ -482,7 +542,6 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
         let ts = SystemTime::now()
@@ -519,6 +578,69 @@ mod tests {
 
         let result = ensure_target_within_media_root(&media, &target);
         assert!(result.is_err());
+
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn replaces_file_with_relative_symlink_atomically() {
+        let root = unique_temp_dir("replace");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        fs::create_dir_all(&downloads).expect("create downloads dir");
+        fs::create_dir_all(&media).expect("create media dir");
+
+        let src = downloads.join("duplicate.mkv");
+        let tgt = media.join("canonical.mkv");
+        fs::write(&src, b"old").expect("write source");
+        fs::write(&tgt, b"new").expect("write target");
+
+        replace_file_with_relative_symlink(&src, &tgt).expect("replace with symlink");
+
+        let meta = fs::symlink_metadata(&src).expect("metadata");
+        assert!(meta.file_type().is_symlink());
+        assert_eq!(
+            fs::read_link(&src).expect("read link"),
+            PathBuf::from("../media/canonical.mkv")
+        );
+        assert_eq!(fs::read(&src).expect("read through link"), b"new");
+
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn clear_cache_file_is_idempotent() {
+        let root = unique_temp_dir("cache_clear");
+        fs::create_dir_all(&root).expect("create temp dir");
+        let cache = root.join(".dejaview_cache.json");
+
+        clear_cache_file(&cache).expect("first clear on missing file");
+        fs::write(&cache, b"{}").expect("write cache");
+        clear_cache_file(&cache).expect("second clear removes file");
+        clear_cache_file(&cache).expect("third clear still ok");
+
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn save_cache_writes_json() {
+        let root = unique_temp_dir("save_cache");
+        fs::create_dir_all(&root).expect("create temp dir");
+        let cache_path = root.join(".dejaview_cache.json");
+        let mut cache = Cache::new();
+        cache.insert(
+            "foo".into(),
+            CacheEntry {
+                size: 42,
+                mtime: 123,
+                hash: "abc".into(),
+            },
+        );
+
+        save_cache(&cache_path, &cache).expect("save cache");
+        let loaded = load_cache(&cache_path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get("foo").expect("foo key").hash, "abc");
 
         fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
