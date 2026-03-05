@@ -1,14 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use colored::*;
-use comfy_table::{presets::UTF8_FULL, modifiers::UTF8_ROUND_CORNERS, ContentArrangement, Table};
-use hex;
+use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, ContentArrangement, Table};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use pathdiff::diff_paths;
 
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
-use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -78,7 +76,8 @@ struct Config {
 }
 
 fn config_path() -> Result<PathBuf> {
-    let config_dir = dirs::config_dir().ok_or_else(|| anyhow!("Could not find config directory"))?;
+    let config_dir =
+        dirs::config_dir().ok_or_else(|| anyhow!("Could not find config directory"))?;
     Ok(config_dir.join("dejaview").join("config.json"))
 }
 
@@ -123,7 +122,10 @@ struct CacheEntry {
 type Cache = HashMap<String, CacheEntry>;
 
 fn cache_path(config: &Config) -> Result<PathBuf> {
-    let downloads = config.downloads.as_ref().ok_or_else(|| anyhow!("Downloads path not set"))?;
+    let downloads = config
+        .downloads
+        .as_ref()
+        .ok_or_else(|| anyhow!("Downloads path not set"))?;
     Ok(downloads.join(".dejaview_cache.json"))
 }
 
@@ -213,16 +215,42 @@ fn full_digest(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+fn ensure_target_within_media_root(media_root: &Path, target: &Path) -> Result<()> {
+    let canonical_media = fs::canonicalize(media_root)
+        .with_context(|| format!("canonicalize {}", media_root.display()))?;
+    let canonical_target =
+        fs::canonicalize(target).with_context(|| format!("canonicalize {}", target.display()))?;
+
+    if !canonical_target.starts_with(&canonical_media) {
+        return Err(anyhow!(
+            "refusing to link to target outside media root: {}",
+            canonical_target.display()
+        ));
+    }
+
+    Ok(())
+}
+
 // ---- Subcommand Implementations ---------------------------------------------
 fn run_scan(config: &Config, dry_run: bool) -> Result<()> {
-    let downloads = config.downloads.as_ref().ok_or_else(|| anyhow!("Downloads path not set"))?;
-    let media = config.media.as_ref().ok_or_else(|| anyhow!("Media path not set"))?;
+    let downloads = config
+        .downloads
+        .as_ref()
+        .ok_or_else(|| anyhow!("Downloads path not set"))?;
+    let media = config
+        .media
+        .as_ref()
+        .ok_or_else(|| anyhow!("Media path not set"))?;
     let min_age = Duration::from_secs(config.min_age.unwrap_or(300));
 
     // -------- Progress bars --------
     let mp = MultiProgress::new();
     let spinner = mp.add(ProgressBar::new_spinner());
-    spinner.set_style(ProgressStyle::default_spinner().template("{spinner} {msg}").unwrap());
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner} {msg}")
+            .unwrap(),
+    );
     spinner.enable_steady_tick(Duration::from_millis(120));
     spinner.set_message("Collecting files…".cyan().bold().to_string());
 
@@ -250,9 +278,13 @@ fn run_scan(config: &Config, dry_run: bool) -> Result<()> {
         size_map.entry(f.size).or_default().push(f);
     }
 
-    let mut groups: Vec<&mut Vec<FileInfo>> = size_map.values_mut().filter(|v| v.len() > 1).collect();
+    let mut groups: Vec<&mut Vec<FileInfo>> =
+        size_map.values_mut().filter(|v| v.len() > 1).collect();
     let bar = mp.add(ProgressBar::new(groups.len() as u64));
-    bar.set_style(ProgressStyle::with_template("{msg} {pos}/{len} [{wide_bar:.cyan/blue}] {elapsed}").unwrap());
+    bar.set_style(
+        ProgressStyle::with_template("{msg} {pos}/{len} [{wide_bar:.cyan/blue}] {elapsed}")
+            .unwrap(),
+    );
     bar.set_message("Hashing groups".bold().to_string());
 
     for group in &mut groups {
@@ -272,7 +304,14 @@ fn run_scan(config: &Config, dry_run: bool) -> Result<()> {
                 let key = fi.path.to_string_lossy().into_owned();
                 if let Ok(c) = cache.lock() {
                     if let Some(e) = c.get(&key) {
-                        if e.size == fi.size && e.mtime == fi.mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() {
+                        if e.size == fi.size
+                            && e.mtime
+                                == fi
+                                    .mtime
+                                    .duration_since(SystemTime::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs()
+                        {
                             fi.hash = Some(e.hash.clone());
                             continue;
                         }
@@ -294,7 +333,11 @@ fn run_scan(config: &Config, dry_run: bool) -> Result<()> {
                             key,
                             CacheEntry {
                                 size: fi.size,
-                                mtime: fi.mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
+                                mtime: fi
+                                    .mtime
+                                    .duration_since(SystemTime::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs(),
                                 hash: h,
                             },
                         );
@@ -355,15 +398,22 @@ fn run_scan(config: &Config, dry_run: bool) -> Result<()> {
     }
 
     // print results
-    println!("
-{} Found duplicates:", "▶".cyan());
+    println!(
+        "
+{} Found duplicates:",
+        "▶".cyan()
+    );
     println!("{}", table);
     if actions.is_empty() {
         println!("{} No actions needed.", "✔".green());
         return Ok(());
     }
 
-    println!("{} Potential space saved: {}", "💾".cyan(), format_size(total_saved_space));
+    println!(
+        "{} Potential space saved: {}",
+        "💾".cyan(),
+        format_size(total_saved_space)
+    );
 
     if dry_run {
         println!("{} Dry-run; no changes.", "ℹ".yellow());
@@ -373,8 +423,10 @@ fn run_scan(config: &Config, dry_run: bool) -> Result<()> {
     // apply replacements
     println!("{} Applying…", "▶".cyan());
     for (src, tgt) in actions {
+        ensure_target_within_media_root(media, &tgt)?;
         fs::remove_file(&src).with_context(|| format!("rm {}", src.display()))?;
-        let rel = diff_paths(&tgt, &src.parent().unwrap()).context("failed to compute relative path")?;
+        let rel =
+            diff_paths(&tgt, src.parent().unwrap()).context("failed to compute relative path")?;
         symlink(rel, &src).with_context(|| format!("ln {:?} -> {:?}", &src, &tgt))?;
     }
     println!("{} Done.", "✔".green());
@@ -386,7 +438,9 @@ fn main() -> Result<()> {
     let mut config = load_config()?;
 
     if let Some(threads) = config.threads {
-        rayon::ThreadPoolBuilder::new().num_threads(threads).build_global()?;
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()?;
     }
 
     match cli.command {
@@ -423,4 +477,49 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("dejaview_{prefix}_{}_{}", std::process::id(), ts))
+    }
+
+    #[test]
+    fn allows_target_inside_media_root() {
+        let root = unique_temp_dir("inside");
+        let media = root.join("media");
+        let nested = media.join("movies");
+        let target = nested.join("a.mkv");
+        fs::create_dir_all(&nested).expect("create media dir");
+        fs::write(&target, b"content").expect("write target");
+
+        let result = ensure_target_within_media_root(&media, &target);
+        assert!(result.is_ok());
+
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_target_outside_media_root() {
+        let root = unique_temp_dir("outside");
+        let media = root.join("media");
+        let other = root.join("other");
+        let target = other.join("b.mkv");
+        fs::create_dir_all(&media).expect("create media dir");
+        fs::create_dir_all(&other).expect("create other dir");
+        fs::write(&target, b"content").expect("write target");
+
+        let result = ensure_target_within_media_root(&media, &target);
+        assert!(result.is_err());
+
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
 }
