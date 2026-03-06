@@ -8,7 +8,11 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("time before epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("dejaview_perf_{prefix}_{}_{}", std::process::id(), ts))
+    std::env::temp_dir().join(format!(
+        "dejaview_perf_{prefix}_{}_{}",
+        std::process::id(),
+        ts
+    ))
 }
 
 fn run_cmd(root: &Path, args: &[&str]) -> (std::process::Output, Duration) {

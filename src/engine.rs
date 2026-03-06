@@ -740,12 +740,11 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         println!("{} Dry-run; no changes.", "ℹ".yellow());
     }
 
-    if options.strict && warning_total(&warnings) > 0 {
-        return Err(anyhow!("strict mode failed due to scan/hash warnings"));
-    }
-
     if let Some(err) = strict_link_error {
         return Err(err);
+    }
+    if options.strict && warning_total(&warnings) > 0 {
+        return Err(anyhow!("strict mode failed due to scan/hash warnings"));
     }
     if !options.json_output {
         println!("{} Done.", "✔".green());
@@ -1296,6 +1295,11 @@ mod tests {
             },
         );
         assert!(result.is_err());
+        let err = result.expect_err("strict link failure expected");
+        assert!(
+            err.to_string().contains("strict mode link failure"),
+            "unexpected strict error: {err}"
+        );
 
         let mut reset = fs::metadata(&src_dir)
             .expect("readonly dir metadata")
