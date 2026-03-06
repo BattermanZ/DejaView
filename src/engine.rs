@@ -292,11 +292,7 @@ fn print_run_summary(
         println!("{} Applied actions: {}", "ℹ".cyan(), applied_actions);
     }
 
-    let warning_total = warnings.walk_errors
-        + warnings.metadata_errors
-        + warnings.sample_hash_errors
-        + warnings.full_hash_errors
-        + warnings.link_errors;
+    let warning_total = warning_total(warnings);
     if warning_total > 0 {
         println!(
             "{} Warnings: walk={} metadata={} sample-hash={} full-hash={} link={}",
@@ -308,6 +304,14 @@ fn print_run_summary(
             warnings.link_errors
         );
     }
+}
+
+fn warning_total(warnings: &RunWarnings) -> u64 {
+    warnings.walk_errors
+        + warnings.metadata_errors
+        + warnings.sample_hash_errors
+        + warnings.full_hash_errors
+        + warnings.link_errors
 }
 
 pub fn run_scan(config: &Config, dry_run: bool, strict: bool) -> Result<()> {
@@ -485,7 +489,11 @@ pub fn run_scan(config: &Config, dry_run: bool, strict: bool) -> Result<()> {
 
     println!("\n{} Found duplicates:", "▶".cyan());
     println!("{}", table);
+    print_run_summary(files_seen, actions.len(), 0, &warnings);
     if actions.is_empty() {
+        if strict && warning_total(&warnings) > 0 {
+            return Err(anyhow!("strict mode failed due to scan/hash warnings"));
+        }
         println!("{} No actions needed.", "✔".green());
         return Ok(());
     }
@@ -495,18 +503,10 @@ pub fn run_scan(config: &Config, dry_run: bool, strict: bool) -> Result<()> {
         "💾".cyan(),
         format_size(total_saved_space)
     );
-    print_run_summary(files_seen, actions.len(), 0, &warnings);
 
     if dry_run {
         println!("{} Dry-run; no changes.", "ℹ".yellow());
-        if strict
-            && (warnings.walk_errors
-                + warnings.metadata_errors
-                + warnings.sample_hash_errors
-                + warnings.full_hash_errors
-                + warnings.link_errors
-                > 0)
-        {
+        if strict && warning_total(&warnings) > 0 {
             return Err(anyhow!("strict mode failed due to scan/hash warnings"));
         }
         return Ok(());
@@ -550,6 +550,8 @@ pub fn run_scan(config: &Config, dry_run: bool, strict: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use std::os::unix::fs::PermissionsExt;
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
         let ts = SystemTime::now()
@@ -557,6 +559,20 @@ mod tests {
             .expect("time before epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("dejaview_{prefix}_{}_{}", std::process::id(), ts))
+    }
+
+    fn make_config(downloads: &Path, media: &Path, min_age: u64) -> Config {
+        Config {
+            downloads: Some(downloads.to_path_buf()),
+            media: Some(media.to_path_buf()),
+            min_age: Some(min_age),
+            threads: None,
+        }
+    }
+
+    fn write_file(path: &Path, content: &[u8]) {
+        fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        fs::write(path, content).expect("write file");
     }
 
     #[test]
@@ -702,11 +718,262 @@ mod tests {
     }
 
     #[test]
+    fn plan_group_actions_skips_already_hardlinked_source() {
+        let media = FileInfo {
+            path: PathBuf::from("/media/a.mkv"),
+            size: 10,
+            mtime: SystemTime::UNIX_EPOCH,
+            dev: 1,
+            inode: 111,
+            hash: Some("h".into()),
+            in_downloads: false,
+        };
+        let download = FileInfo {
+            path: PathBuf::from("/downloads/a.mkv"),
+            size: 10,
+            mtime: SystemTime::UNIX_EPOCH,
+            dev: 1,
+            inode: 111,
+            hash: Some("h".into()),
+            in_downloads: true,
+        };
+        let actions = plan_group_actions(&[&media, &download]);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn plan_group_actions_requires_both_sides() {
+        let media_only = FileInfo {
+            path: PathBuf::from("/media/a.mkv"),
+            size: 10,
+            mtime: SystemTime::UNIX_EPOCH,
+            dev: 1,
+            inode: 1,
+            hash: Some("h".into()),
+            in_downloads: false,
+        };
+        let downloads_only = FileInfo {
+            path: PathBuf::from("/downloads/a.mkv"),
+            size: 10,
+            mtime: SystemTime::UNIX_EPOCH,
+            dev: 2,
+            inode: 2,
+            hash: Some("h".into()),
+            in_downloads: true,
+        };
+        assert!(plan_group_actions(&[&media_only]).is_empty());
+        assert!(plan_group_actions(&[&downloads_only]).is_empty());
+    }
+
+    #[test]
     fn collect_files_strict_fails_on_walk_error() {
         let missing = PathBuf::from("/this/path/does/not/exist/dejaview");
         let mut warnings = RunWarnings::default();
         let result = collect_files(&missing, true, Duration::from_secs(0), true, &mut warnings);
         assert!(result.is_err());
         assert!(warnings.walk_errors > 0);
+    }
+
+    #[test]
+    fn run_scan_dry_run_does_not_replace_file() {
+        let root = unique_temp_dir("dry_run");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        let src = downloads.join("movie.mkv");
+        let tgt = media.join("movie.mkv");
+        write_file(&src, b"same-content");
+        write_file(&tgt, b"same-content");
+        let config = make_config(&downloads, &media, 0);
+
+        run_scan(&config, true, false).expect("dry run scan");
+
+        let meta = fs::symlink_metadata(&src).expect("source metadata");
+        assert!(meta.file_type().is_file());
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn run_scan_apply_replaces_with_symlink() {
+        let root = unique_temp_dir("apply_run");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        let src = downloads.join("movie.mkv");
+        let tgt = media.join("movie.mkv");
+        write_file(&src, b"same-content");
+        write_file(&tgt, b"same-content");
+        let config = make_config(&downloads, &media, 0);
+
+        run_scan(&config, false, false).expect("apply scan");
+
+        let meta = fs::symlink_metadata(&src).expect("source metadata");
+        assert!(meta.file_type().is_symlink());
+        assert_eq!(
+            fs::read(&src).expect("read through symlink"),
+            b"same-content"
+        );
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn run_scan_respects_min_age_filter() {
+        let root = unique_temp_dir("min_age");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        let src = downloads.join("movie.mkv");
+        let tgt = media.join("movie.mkv");
+        write_file(&src, b"same-content");
+        write_file(&tgt, b"same-content");
+        let config = make_config(&downloads, &media, 3600);
+
+        run_scan(&config, false, false).expect("apply scan");
+
+        let meta = fs::symlink_metadata(&src).expect("source metadata");
+        assert!(meta.file_type().is_file());
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn run_scan_strict_fails_on_sample_hash_error() {
+        let root = unique_temp_dir("strict_hash");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        let src = downloads.join("bad.mkv");
+        let tgt = media.join("bad.mkv");
+        write_file(&src, b"same-content");
+        write_file(&tgt, b"same-content");
+        let mut perms = fs::metadata(&src).expect("src metadata").permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&src, perms).expect("make unreadable");
+        let config = make_config(&downloads, &media, 0);
+
+        let strict_result = run_scan(&config, true, true);
+        assert!(strict_result.is_err());
+        let non_strict_result = run_scan(&config, true, false);
+        assert!(non_strict_result.is_ok());
+
+        let mut reset = fs::metadata(&src).expect("src metadata").permissions();
+        reset.set_mode(0o644);
+        fs::set_permissions(&src, reset).expect("reset perms");
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn run_scan_non_strict_link_failure_continues() {
+        let root = unique_temp_dir("link_fail_non_strict");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        let src_dir = downloads.join("readonly");
+        let src = src_dir.join("movie.mkv");
+        let tgt = media.join("movie.mkv");
+        write_file(&src, b"same-content");
+        write_file(&tgt, b"same-content");
+        let mut dir_perms = fs::metadata(&src_dir)
+            .expect("readonly dir metadata")
+            .permissions();
+        dir_perms.set_mode(0o555);
+        fs::set_permissions(&src_dir, dir_perms).expect("make dir readonly");
+        let config = make_config(&downloads, &media, 0);
+
+        let result = run_scan(&config, false, false);
+        assert!(result.is_ok());
+        let meta = fs::symlink_metadata(&src).expect("source metadata");
+        assert!(meta.file_type().is_file());
+
+        let mut reset = fs::metadata(&src_dir)
+            .expect("readonly dir metadata")
+            .permissions();
+        reset.set_mode(0o755);
+        fs::set_permissions(&src_dir, reset).expect("reset dir perms");
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn run_scan_strict_link_failure_returns_error() {
+        let root = unique_temp_dir("link_fail_strict");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        let src_dir = downloads.join("readonly");
+        let src = src_dir.join("movie.mkv");
+        let tgt = media.join("movie.mkv");
+        write_file(&src, b"same-content");
+        write_file(&tgt, b"same-content");
+        let mut dir_perms = fs::metadata(&src_dir)
+            .expect("readonly dir metadata")
+            .permissions();
+        dir_perms.set_mode(0o555);
+        fs::set_permissions(&src_dir, dir_perms).expect("make dir readonly");
+        let config = make_config(&downloads, &media, 0);
+
+        let result = run_scan(&config, false, true);
+        assert!(result.is_err());
+
+        let mut reset = fs::metadata(&src_dir)
+            .expect("readonly dir metadata")
+            .permissions();
+        reset.set_mode(0o755);
+        fs::set_permissions(&src_dir, reset).expect("reset dir perms");
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn run_scan_creates_and_reuses_cache_file() {
+        let root = unique_temp_dir("cache_reuse");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        let src = downloads.join("movie.mkv");
+        let tgt = media.join("movie.mkv");
+        write_file(&src, b"same-content");
+        write_file(&tgt, b"same-content");
+        let config = make_config(&downloads, &media, 0);
+
+        run_scan(&config, true, false).expect("first dry run");
+        let cache_file = downloads.join(".dejaview_cache.json");
+        assert!(cache_file.exists());
+        let first_cache = load_cache(&cache_file);
+        assert!(!first_cache.is_empty());
+
+        run_scan(&config, true, false).expect("second dry run");
+        let second_cache = load_cache(&cache_file);
+        assert_eq!(second_cache.len(), first_cache.len());
+
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn save_cache_failure_cleans_up_temp_file() {
+        let root = unique_temp_dir("cache_fail");
+        fs::create_dir_all(&root).expect("create root");
+        let cache_file = root.join(".dejaview_cache.json");
+        let mut perms = fs::metadata(&root).expect("root metadata").permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&root, perms).expect("set readonly");
+
+        let mut cache = Cache::new();
+        cache.insert(
+            "k".into(),
+            CacheEntry {
+                size: 1,
+                mtime: 1,
+                hash: "h".into(),
+            },
+        );
+        let result = save_cache(&cache_file, &cache);
+        assert!(result.is_err());
+
+        let entries = fs::read_dir(&root)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".dejaview_cache.tmp.")
+            })
+            .count();
+        assert_eq!(entries, 0);
+
+        let mut reset = fs::metadata(&root).expect("root metadata").permissions();
+        reset.set_mode(0o755);
+        fs::set_permissions(&root, reset).expect("reset perms");
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 }

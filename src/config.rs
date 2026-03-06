@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -19,6 +19,15 @@ pub fn config_path() -> Result<PathBuf> {
 
 pub fn load_config() -> Result<Config> {
     let path = config_path()?;
+    load_config_from_path(&path)
+}
+
+pub fn save_config(config: &Config) -> Result<()> {
+    let path = config_path()?;
+    save_config_to_path(&path, config)
+}
+
+fn load_config_from_path(path: &Path) -> Result<Config> {
     if !path.exists() {
         return Ok(Config::default());
     }
@@ -27,8 +36,7 @@ pub fn load_config() -> Result<Config> {
     Ok(config)
 }
 
-pub fn save_config(config: &Config) -> Result<()> {
-    let path = config_path()?;
+fn save_config_to_path(path: &Path, config: &Config) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("config path has no parent: {}", path.display()))?;
@@ -44,4 +52,63 @@ pub fn cache_path(config: &Config) -> Result<PathBuf> {
         .as_ref()
         .ok_or_else(|| anyhow!("Downloads path not set"))?;
     Ok(downloads.join(".dejaview_cache.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "dejaview_config_{prefix}_{}_{}",
+            std::process::id(),
+            ts
+        ))
+    }
+
+    #[test]
+    fn load_save_roundtrip() {
+        let root = unique_temp_dir("roundtrip");
+        let path = root.join("config").join("config.json");
+        let config = Config {
+            downloads: Some(root.join("downloads")),
+            media: Some(root.join("media")),
+            min_age: Some(60),
+            threads: Some(4),
+        };
+
+        save_config_to_path(&path, &config).expect("save config");
+        let loaded = load_config_from_path(&path).expect("load config");
+        assert_eq!(loaded.downloads, config.downloads);
+        assert_eq!(loaded.media, config.media);
+        assert_eq!(loaded.min_age, config.min_age);
+        assert_eq!(loaded.threads, config.threads);
+
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn load_invalid_json_fails() {
+        let root = unique_temp_dir("invalid_json");
+        let path = root.join("config").join("config.json");
+        fs::create_dir_all(path.parent().expect("parent")).expect("create config dir");
+        fs::write(&path, b"{not-valid-json").expect("write invalid config");
+
+        let result = load_config_from_path(&path);
+        assert!(result.is_err());
+
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn cache_path_requires_downloads() {
+        let config = Config::default();
+        let result = cache_path(&config);
+        assert!(result.is_err());
+    }
 }
