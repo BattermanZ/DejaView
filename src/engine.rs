@@ -4,6 +4,7 @@ use colored::*;
 use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, ContentArrangement, Table};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use pathdiff::diff_paths;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -11,6 +12,7 @@ use std::io::ErrorKind;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{symlink, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::{DirEntry, WalkDir};
@@ -21,7 +23,7 @@ use crate::config::{cache_path, Config};
 struct FileInfo {
     path: PathBuf,
     size: u64,
-    mtime: SystemTime,
+    mtime_secs: u64,
     dev: u64,
     inode: u64,
     hash: Option<String>,
@@ -124,13 +126,17 @@ fn collect_files(
             }
         };
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let mtime_secs = mtime
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         if mtime > deadline {
             continue;
         }
         files.push(FileInfo {
             path: entry.into_path(),
             size: meta.len(),
-            mtime,
+            mtime_secs,
             dev: meta.dev(),
             inode: meta.ino(),
             hash: None,
@@ -476,8 +482,7 @@ pub fn run_scan(
         size_map.entry(f.size).or_default().push(f);
     }
 
-    let mut groups: Vec<&mut Vec<FileInfo>> =
-        size_map.values_mut().filter(|v| v.len() > 1).collect();
+    let mut groups: Vec<Vec<FileInfo>> = size_map.into_values().filter(|v| v.len() > 1).collect();
     let bar = mp.add(ProgressBar::new(groups.len() as u64));
     bar.set_style(
         ProgressStyle::with_template("{msg} {pos}/{len} [{wide_bar:.cyan/blue}] {elapsed}")
@@ -485,16 +490,20 @@ pub fn run_scan(
     );
     bar.set_message("Hashing groups".bold().to_string());
 
-    for group in &mut groups {
-        let mut sample_hashes: HashMap<String, Vec<usize>> = HashMap::new();
+    let sample_hash_errors = Arc::new(AtomicU64::new(0));
+    let full_hash_errors = Arc::new(AtomicU64::new(0));
+    let bar_for_threads = bar.clone();
+    let sample_counter = Arc::clone(&sample_hash_errors);
+    let full_counter = Arc::clone(&full_hash_errors);
+    groups.par_iter_mut().try_for_each(|group| -> Result<()> {
+        let mut sample_hashes: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
         for (i, fi) in group.iter().enumerate() {
             match sample_digest(&fi.path, fi.size) {
                 Ok(h) => {
-                    let hex_hash = hex::encode(h);
-                    sample_hashes.entry(hex_hash).or_default().push(i);
+                    sample_hashes.entry(h).or_default().push(i);
                 }
                 Err(err) => {
-                    warnings.sample_hash_errors += 1;
+                    sample_counter.fetch_add(1, Ordering::Relaxed);
                     if strict {
                         return Err(anyhow!(
                             "sample hash error for {}: {}",
@@ -506,29 +515,22 @@ pub fn run_scan(
             }
         }
 
-        for (_, indices) in sample_hashes.iter().filter(|(_, v)| v.len() > 1) {
+        for indices in sample_hashes.values().filter(|v| v.len() > 1) {
             for &i in indices {
                 let fi = &mut group[i];
-                let key = fi.path.to_string_lossy().into_owned();
-                if let Ok(c) = cache.lock() {
-                    if let Some(e) = c.get(&key) {
-                        if e.size == fi.size
-                            && e.mtime
-                                == fi
-                                    .mtime
-                                    .duration_since(SystemTime::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs()
-                        {
-                            fi.hash = Some(e.hash.clone());
-                            continue;
-                        }
-                    }
-                }
                 if let Ok(ih) = inode_hash.lock() {
                     if let Some(h) = ih.get(&(fi.dev, fi.inode)) {
                         fi.hash = Some(h.clone());
                         continue;
+                    }
+                }
+                let key = fi.path.to_string_lossy().into_owned();
+                if let Ok(c) = cache.lock() {
+                    if let Some(e) = c.get(&key) {
+                        if e.size == fi.size && e.mtime == fi.mtime_secs {
+                            fi.hash = Some(e.hash.clone());
+                            continue;
+                        }
                     }
                 }
                 match full_digest(&fi.path) {
@@ -542,18 +544,14 @@ pub fn run_scan(
                                 key,
                                 CacheEntry {
                                     size: fi.size,
-                                    mtime: fi
-                                        .mtime
-                                        .duration_since(SystemTime::UNIX_EPOCH)
-                                        .unwrap()
-                                        .as_secs(),
+                                    mtime: fi.mtime_secs,
                                     hash: h,
                                 },
                             );
                         }
                     }
                     Err(err) => {
-                        warnings.full_hash_errors += 1;
+                        full_counter.fetch_add(1, Ordering::Relaxed);
                         if strict {
                             return Err(anyhow!(
                                 "full hash error for {}: {}",
@@ -565,8 +563,11 @@ pub fn run_scan(
                 }
             }
         }
-        bar.inc(1);
-    }
+        bar_for_threads.inc(1);
+        Ok(())
+    })?;
+    warnings.sample_hash_errors += sample_hash_errors.load(Ordering::Relaxed);
+    warnings.full_hash_errors += full_hash_errors.load(Ordering::Relaxed);
     bar.finish_with_message("Hashing complete ✔".green().bold().to_string());
 
     if let Ok(c) = Arc::try_unwrap(cache) {
@@ -892,7 +893,7 @@ mod tests {
         let later_media = FileInfo {
             path: PathBuf::from("/media/z-last.mkv"),
             size: 10,
-            mtime: SystemTime::UNIX_EPOCH,
+            mtime_secs: 0,
             dev: 1,
             inode: 2,
             hash: Some("h".into()),
@@ -901,7 +902,7 @@ mod tests {
         let first_media = FileInfo {
             path: PathBuf::from("/media/a-first.mkv"),
             size: 10,
-            mtime: SystemTime::UNIX_EPOCH,
+            mtime_secs: 0,
             dev: 1,
             inode: 3,
             hash: Some("h".into()),
@@ -910,7 +911,7 @@ mod tests {
         let download_b = FileInfo {
             path: PathBuf::from("/downloads/b.mkv"),
             size: 10,
-            mtime: SystemTime::UNIX_EPOCH,
+            mtime_secs: 0,
             dev: 2,
             inode: 4,
             hash: Some("h".into()),
@@ -919,7 +920,7 @@ mod tests {
         let download_a = FileInfo {
             path: PathBuf::from("/downloads/a.mkv"),
             size: 10,
-            mtime: SystemTime::UNIX_EPOCH,
+            mtime_secs: 0,
             dev: 2,
             inode: 5,
             hash: Some("h".into()),
@@ -940,7 +941,7 @@ mod tests {
         let media = FileInfo {
             path: PathBuf::from("/media/a.mkv"),
             size: 10,
-            mtime: SystemTime::UNIX_EPOCH,
+            mtime_secs: 0,
             dev: 1,
             inode: 111,
             hash: Some("h".into()),
@@ -949,7 +950,7 @@ mod tests {
         let download = FileInfo {
             path: PathBuf::from("/downloads/a.mkv"),
             size: 10,
-            mtime: SystemTime::UNIX_EPOCH,
+            mtime_secs: 0,
             dev: 1,
             inode: 111,
             hash: Some("h".into()),
@@ -964,7 +965,7 @@ mod tests {
         let media_only = FileInfo {
             path: PathBuf::from("/media/a.mkv"),
             size: 10,
-            mtime: SystemTime::UNIX_EPOCH,
+            mtime_secs: 0,
             dev: 1,
             inode: 1,
             hash: Some("h".into()),
@@ -973,7 +974,7 @@ mod tests {
         let downloads_only = FileInfo {
             path: PathBuf::from("/downloads/a.mkv"),
             size: 10,
-            mtime: SystemTime::UNIX_EPOCH,
+            mtime_secs: 0,
             dev: 2,
             inode: 2,
             hash: Some("h".into()),
