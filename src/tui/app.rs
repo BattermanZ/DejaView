@@ -68,7 +68,6 @@ pub struct App {
     min_age: Option<u64>,
     threads: Option<usize>,
     running_job: Option<RunningJob>,
-    tick_count: u64,
     should_quit: bool,
 }
 
@@ -88,7 +87,6 @@ impl App {
             min_age: config.min_age,
             threads: config.threads,
             running_job: None,
-            tick_count: 0,
             should_quit: false,
         }
     }
@@ -104,10 +102,7 @@ impl App {
     pub fn step(&mut self) -> Result<()> {
         let event = events::next_event(self.tick_rate())?;
         match event {
-            Event::Tick => {
-                self.tick_count = self.tick_count.wrapping_add(1);
-                self.poll_running_job();
-            }
+            Event::Tick => self.poll_running_job(),
             Event::Key(key) => {
                 if key.kind == KeyEventKind::Press {
                     self.handle_key(key.code, key.modifiers)?;
@@ -222,36 +217,39 @@ impl App {
     }
 
     pub fn progress_ratio(&self) -> f64 {
-        if let Some(job) = &self.running_job {
-            let pulse = ((self.tick_count % 24) as f64) / 24.0;
-            return match job.kind {
-                JobKind::Scan => 0.12 + pulse * 0.48,
-                JobKind::Link => 0.58 + pulse * 0.32,
-            };
-        }
-        match &self.report {
-            Some(_) => 1.0,
-            None => 0.05,
+        match &self.running_job {
+            Some(job) => match job.kind {
+                JobKind::Scan => 0.35,
+                JobKind::Link => 0.75,
+            },
+            None => match &self.report {
+                Some(_) => 1.0,
+                None => 0.0,
+            },
         }
     }
 
     pub fn progress_label(&self) -> String {
-        if self.running_job.is_some() {
-            format!("{:>3}%", (self.progress_ratio() * 100.0).round() as u64)
-        } else if self.report.is_some() {
-            "100%".to_string()
-        } else {
-            "READY".to_string()
+        match &self.running_job {
+            Some(job) => match job.kind {
+                JobKind::Scan => "SCAN".to_string(),
+                JobKind::Link => "LINK".to_string(),
+            },
+            None => {
+                if self.report.is_some() {
+                    "DONE".to_string()
+                } else {
+                    "IDLE".to_string()
+                }
+            }
         }
     }
 
     pub fn throughput_label(&self) -> String {
         if self.running_job.is_some() {
-            let sweep = 8 + (self.tick_count % 9) as usize;
             return format!(
-                "{} files active  |  {} actions visible",
-                sweep,
-                self.planned_actions().max(self.rows().len())
+                "subprocess active  |  waiting for final report  |  {} rows currently visible",
+                self.rows().len()
             );
         }
         format!(

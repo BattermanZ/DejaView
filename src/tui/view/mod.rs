@@ -39,9 +39,6 @@ fn trim_middle(input: &str, max_len: usize) -> String {
 }
 
 fn status_chip_style(row: &LinkReportEntry, is_selected: bool) -> Style {
-    if is_selected {
-        return Theme::badge_accent();
-    }
     if row.status.eq_ignore_ascii_case("failed") {
         return Theme::chip_danger();
     }
@@ -53,7 +50,11 @@ fn status_chip_style(row: &LinkReportEntry, is_selected: bool) -> Style {
     {
         return Theme::chip_warning();
     }
-    Theme::chip_success()
+    if is_selected {
+        Theme::badge_accent()
+    } else {
+        Theme::chip_success()
+    }
 }
 
 fn row_style(row: &LinkReportEntry, is_selected: bool) -> Style {
@@ -216,7 +217,7 @@ fn details_lines(app: &App) -> Vec<Line<'static>> {
             chip_style,
         )),
         Line::raw(""),
-        Line::from(Span::styled(" RUN SAVED", Theme::muted())),
+        Line::from(Span::styled(" RUN TOTAL SAVED", Theme::muted())),
         Line::from(Span::styled(
             format_bytes(app.total_saved_bytes()),
             Theme::metric_value(),
