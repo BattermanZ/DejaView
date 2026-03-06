@@ -53,6 +53,35 @@ struct LinkAction {
     size: u64,
 }
 
+#[derive(Serialize)]
+struct WarningSummary {
+    walk_errors: u64,
+    metadata_errors: u64,
+    sample_hash_errors: u64,
+    full_hash_errors: u64,
+    link_errors: u64,
+}
+
+#[derive(Serialize)]
+struct LinkReportEntry {
+    source: String,
+    target: String,
+    status: String,
+    method: Option<String>,
+    fallback_reason: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct LinkReport {
+    strict: bool,
+    files_considered: usize,
+    planned_actions: usize,
+    applied_actions: usize,
+    warnings: WarningSummary,
+    entries: Vec<LinkReportEntry>,
+}
+
 fn is_regular(entry: &DirEntry) -> bool {
     entry.file_type().is_file() && !entry.path_is_symlink()
 }
@@ -234,6 +263,69 @@ fn replace_file_with_relative_symlink(src: &Path, tgt: &Path) -> Result<()> {
     link_result
 }
 
+fn replace_file_with_hardlink_with<F>(src: &Path, tgt: &Path, hard_link_fn: F) -> Result<()>
+where
+    F: Fn(&Path, &Path) -> std::io::Result<()>,
+{
+    let parent = src
+        .parent()
+        .ok_or_else(|| anyhow!("source path has no parent: {}", src.display()))?;
+    let tmp_link = parent.join(format!(
+        ".dejaview_hardlink.tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+
+    let link_result = (|| -> Result<()> {
+        hard_link_fn(tgt, &tmp_link)
+            .with_context(|| format!("ln {:?} {:?}", tgt.display(), tmp_link.display()))?;
+        fs::rename(&tmp_link, src)
+            .with_context(|| format!("mv {:?} {:?}", tmp_link.display(), src.display()))?;
+        Ok(())
+    })();
+
+    if link_result.is_err() {
+        let _ = fs::remove_file(&tmp_link);
+    }
+
+    link_result
+}
+
+fn replace_file_with_best_link_with<F>(
+    src: &Path,
+    tgt: &Path,
+    hard_link_fn: F,
+) -> Result<(String, Option<String>)>
+where
+    F: Fn(&Path, &Path) -> std::io::Result<()>,
+{
+    let src_dev = fs::metadata(src)
+        .with_context(|| format!("metadata {}", src.display()))?
+        .dev();
+    let tgt_dev = fs::metadata(tgt)
+        .with_context(|| format!("metadata {}", tgt.display()))?
+        .dev();
+
+    let fallback_reason = if src_dev == tgt_dev {
+        match replace_file_with_hardlink_with(src, tgt, hard_link_fn) {
+            Ok(()) => return Ok(("hardlink".to_string(), None)),
+            Err(err) => Some(format!("hardlink failed: {err}")),
+        }
+    } else {
+        Some("cross-device; hardlink not possible".to_string())
+    };
+
+    replace_file_with_relative_symlink(src, tgt)?;
+    Ok(("symlink".to_string(), fallback_reason))
+}
+
+fn replace_file_with_best_link(src: &Path, tgt: &Path) -> Result<(String, Option<String>)> {
+    replace_file_with_best_link_with(src, tgt, |from, to| fs::hard_link(from, to))
+}
+
 fn clear_cache_file(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -314,7 +406,21 @@ fn warning_total(warnings: &RunWarnings) -> u64 {
         + warnings.link_errors
 }
 
-pub fn run_scan(config: &Config, dry_run: bool, strict: bool) -> Result<()> {
+fn write_link_report(path: &Path, report: &LinkReport) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_vec_pretty(report)?;
+    fs::write(path, json)?;
+    Ok(())
+}
+
+pub fn run_scan(
+    config: &Config,
+    dry_run: bool,
+    strict: bool,
+    report_path: Option<&Path>,
+) -> Result<()> {
     let downloads = config
         .downloads
         .as_ref()
@@ -490,11 +596,42 @@ pub fn run_scan(config: &Config, dry_run: bool, strict: bool) -> Result<()> {
     println!("\n{} Found duplicates:", "▶".cyan());
     println!("{}", table);
     print_run_summary(files_seen, actions.len(), 0, &warnings);
+    let mut report_entries: Vec<LinkReportEntry> = actions
+        .iter()
+        .map(|action| LinkReportEntry {
+            source: action.src.display().to_string(),
+            target: action.tgt.display().to_string(),
+            status: "planned".to_string(),
+            method: None,
+            fallback_reason: None,
+            error: None,
+        })
+        .collect();
     if actions.is_empty() {
         if strict && warning_total(&warnings) > 0 {
             return Err(anyhow!("strict mode failed due to scan/hash warnings"));
         }
         println!("{} No actions needed.", "✔".green());
+        if !dry_run {
+            let out_path = report_path
+                .map(PathBuf::from)
+                .unwrap_or_else(|| downloads.join(".dejaview_link_report.json"));
+            let report = LinkReport {
+                strict,
+                files_considered: files_seen,
+                planned_actions: 0,
+                applied_actions: 0,
+                warnings: WarningSummary {
+                    walk_errors: warnings.walk_errors,
+                    metadata_errors: warnings.metadata_errors,
+                    sample_hash_errors: warnings.sample_hash_errors,
+                    full_hash_errors: warnings.full_hash_errors,
+                    link_errors: warnings.link_errors,
+                },
+                entries: Vec::new(),
+            };
+            write_link_report(&out_path, &report)?;
+        }
         return Ok(());
     }
 
@@ -515,34 +652,65 @@ pub fn run_scan(config: &Config, dry_run: bool, strict: bool) -> Result<()> {
     println!("{} Applying…", "▶".cyan());
     let mut applied_actions = 0usize;
     let planned_actions = actions.len();
-    for action in actions {
+    let mut strict_link_error: Option<anyhow::Error> = None;
+    for (index, action) in actions.into_iter().enumerate() {
         let apply_result = (|| -> Result<()> {
             ensure_target_within_media_root(media, &action.tgt)?;
-            replace_file_with_relative_symlink(&action.src, &action.tgt)?;
+            let (method, fallback_reason) = replace_file_with_best_link(&action.src, &action.tgt)?;
+            report_entries[index].method = Some(method);
+            report_entries[index].fallback_reason = fallback_reason;
+            report_entries[index].status = "applied".to_string();
             Ok(())
         })();
         if let Err(err) = apply_result {
             warnings.link_errors += 1;
+            report_entries[index].status = "failed".to_string();
+            report_entries[index].error = Some(err.to_string());
             if strict {
-                return Err(anyhow!(
+                strict_link_error = Some(anyhow!(
                     "strict mode link failure for {} -> {}: {}",
                     action.src.display(),
                     action.tgt.display(),
                     err
                 ));
+                break;
+            } else {
+                eprintln!(
+                    "{} Failed to apply {} -> {}: {}",
+                    "⚠".yellow(),
+                    action.src.display(),
+                    action.tgt.display(),
+                    err
+                );
+                continue;
             }
-            eprintln!(
-                "{} Failed to apply {} -> {}: {}",
-                "⚠".yellow(),
-                action.src.display(),
-                action.tgt.display(),
-                err
-            );
-            continue;
         }
         applied_actions += 1;
     }
     print_run_summary(files_seen, planned_actions, applied_actions, &warnings);
+
+    let out_path = report_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| downloads.join(".dejaview_link_report.json"));
+    let report = LinkReport {
+        strict,
+        files_considered: files_seen,
+        planned_actions,
+        applied_actions,
+        warnings: WarningSummary {
+            walk_errors: warnings.walk_errors,
+            metadata_errors: warnings.metadata_errors,
+            sample_hash_errors: warnings.sample_hash_errors,
+            full_hash_errors: warnings.full_hash_errors,
+            link_errors: warnings.link_errors,
+        },
+        entries: report_entries,
+    };
+    write_link_report(&out_path, &report)?;
+
+    if let Some(err) = strict_link_error {
+        return Err(err);
+    }
     println!("{} Done.", "✔".green());
     Ok(())
 }
@@ -552,6 +720,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
         let ts = SystemTime::now()
@@ -573,6 +742,14 @@ mod tests {
     fn write_file(path: &Path, content: &[u8]) {
         fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
         fs::write(path, content).expect("write file");
+    }
+
+    fn running_as_root() -> bool {
+        let output = Command::new("id").arg("-u").output();
+        match output {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim() == "0",
+            _ => false,
+        }
     }
 
     #[test]
@@ -628,6 +805,39 @@ mod tests {
             PathBuf::from("../media/canonical.mkv")
         );
         assert_eq!(fs::read(&src).expect("read through link"), b"new");
+
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn replace_file_with_best_link_falls_back_to_symlink_on_hardlink_error() {
+        let root = unique_temp_dir("fallback_symlink");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        fs::create_dir_all(&downloads).expect("create downloads dir");
+        fs::create_dir_all(&media).expect("create media dir");
+
+        let src = downloads.join("duplicate.mkv");
+        let tgt = media.join("canonical.mkv");
+        fs::write(&src, b"old").expect("write source");
+        fs::write(&tgt, b"new").expect("write target");
+
+        let result = replace_file_with_best_link_with(&src, &tgt, |_old, _new| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated hardlink failure",
+            ))
+        })
+        .expect("replace with fallback");
+
+        assert_eq!(result.0, "symlink");
+        assert!(result
+            .1
+            .expect("fallback reason")
+            .contains("hardlink failed"));
+        let meta = fs::symlink_metadata(&src).expect("source metadata");
+        assert!(meta.file_type().is_symlink());
+        assert_eq!(fs::read(&src).expect("read through symlink"), b"new");
 
         fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
@@ -785,7 +995,7 @@ mod tests {
         write_file(&tgt, b"same-content");
         let config = make_config(&downloads, &media, 0);
 
-        run_scan(&config, true, false).expect("dry run scan");
+        run_scan(&config, true, false, None).expect("dry run scan");
 
         let meta = fs::symlink_metadata(&src).expect("source metadata");
         assert!(meta.file_type().is_file());
@@ -793,7 +1003,7 @@ mod tests {
     }
 
     #[test]
-    fn run_scan_apply_replaces_with_symlink() {
+    fn run_scan_apply_prefers_hardlink_when_possible() {
         let root = unique_temp_dir("apply_run");
         let downloads = root.join("downloads");
         let media = root.join("media");
@@ -803,14 +1013,61 @@ mod tests {
         write_file(&tgt, b"same-content");
         let config = make_config(&downloads, &media, 0);
 
-        run_scan(&config, false, false).expect("apply scan");
+        run_scan(&config, false, false, None).expect("apply scan");
 
-        let meta = fs::symlink_metadata(&src).expect("source metadata");
-        assert!(meta.file_type().is_symlink());
+        let src_meta = fs::metadata(&src).expect("source metadata");
+        let tgt_meta = fs::metadata(&tgt).expect("target metadata");
+        assert_eq!(src_meta.dev(), tgt_meta.dev());
+        assert_eq!(src_meta.ino(), tgt_meta.ino());
         assert_eq!(
-            fs::read(&src).expect("read through symlink"),
+            fs::read(&src).expect("read through hardlink"),
             b"same-content"
         );
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn run_scan_writes_link_report_manifest() {
+        let root = unique_temp_dir("report_manifest");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        let report = root.join("report.json");
+        let src = downloads.join("movie.mkv");
+        let tgt = media.join("movie.mkv");
+        write_file(&src, b"same-content");
+        write_file(&tgt, b"same-content");
+        let config = make_config(&downloads, &media, 0);
+
+        run_scan(&config, false, false, Some(&report)).expect("apply scan");
+
+        let report_json = fs::read_to_string(&report).expect("read report");
+        let report_value: serde_json::Value =
+            serde_json::from_str(&report_json).expect("parse report json");
+        assert_eq!(
+            report_value["planned_actions"]
+                .as_u64()
+                .expect("planned actions"),
+            1
+        );
+        assert_eq!(
+            report_value["applied_actions"]
+                .as_u64()
+                .expect("applied actions"),
+            1
+        );
+        assert_eq!(
+            report_value["entries"][0]["method"]
+                .as_str()
+                .expect("method"),
+            "hardlink"
+        );
+        assert_eq!(
+            report_value["entries"][0]["status"]
+                .as_str()
+                .expect("status"),
+            "applied"
+        );
+
         fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
@@ -825,7 +1082,7 @@ mod tests {
         write_file(&tgt, b"same-content");
         let config = make_config(&downloads, &media, 3600);
 
-        run_scan(&config, false, false).expect("apply scan");
+        run_scan(&config, false, false, None).expect("apply scan");
 
         let meta = fs::symlink_metadata(&src).expect("source metadata");
         assert!(meta.file_type().is_file());
@@ -834,6 +1091,9 @@ mod tests {
 
     #[test]
     fn run_scan_strict_fails_on_sample_hash_error() {
+        if running_as_root() {
+            return;
+        }
         let root = unique_temp_dir("strict_hash");
         let downloads = root.join("downloads");
         let media = root.join("media");
@@ -846,9 +1106,9 @@ mod tests {
         fs::set_permissions(&src, perms).expect("make unreadable");
         let config = make_config(&downloads, &media, 0);
 
-        let strict_result = run_scan(&config, true, true);
+        let strict_result = run_scan(&config, true, true, None);
         assert!(strict_result.is_err());
-        let non_strict_result = run_scan(&config, true, false);
+        let non_strict_result = run_scan(&config, true, false, None);
         assert!(non_strict_result.is_ok());
 
         let mut reset = fs::metadata(&src).expect("src metadata").permissions();
@@ -859,6 +1119,9 @@ mod tests {
 
     #[test]
     fn run_scan_non_strict_link_failure_continues() {
+        if running_as_root() {
+            return;
+        }
         let root = unique_temp_dir("link_fail_non_strict");
         let downloads = root.join("downloads");
         let media = root.join("media");
@@ -874,7 +1137,7 @@ mod tests {
         fs::set_permissions(&src_dir, dir_perms).expect("make dir readonly");
         let config = make_config(&downloads, &media, 0);
 
-        let result = run_scan(&config, false, false);
+        let result = run_scan(&config, false, false, None);
         assert!(result.is_ok());
         let meta = fs::symlink_metadata(&src).expect("source metadata");
         assert!(meta.file_type().is_file());
@@ -889,6 +1152,9 @@ mod tests {
 
     #[test]
     fn run_scan_strict_link_failure_returns_error() {
+        if running_as_root() {
+            return;
+        }
         let root = unique_temp_dir("link_fail_strict");
         let downloads = root.join("downloads");
         let media = root.join("media");
@@ -904,7 +1170,7 @@ mod tests {
         fs::set_permissions(&src_dir, dir_perms).expect("make dir readonly");
         let config = make_config(&downloads, &media, 0);
 
-        let result = run_scan(&config, false, true);
+        let result = run_scan(&config, false, true, None);
         assert!(result.is_err());
 
         let mut reset = fs::metadata(&src_dir)
@@ -926,13 +1192,13 @@ mod tests {
         write_file(&tgt, b"same-content");
         let config = make_config(&downloads, &media, 0);
 
-        run_scan(&config, true, false).expect("first dry run");
+        run_scan(&config, true, false, None).expect("first dry run");
         let cache_file = downloads.join(".dejaview_cache.json");
         assert!(cache_file.exists());
         let first_cache = load_cache(&cache_file);
         assert!(!first_cache.is_empty());
 
-        run_scan(&config, true, false).expect("second dry run");
+        run_scan(&config, true, false, None).expect("second dry run");
         let second_cache = load_cache(&cache_file);
         assert_eq!(second_cache.len(), first_cache.len());
 
@@ -941,6 +1207,9 @@ mod tests {
 
     #[test]
     fn save_cache_failure_cleans_up_temp_file() {
+        if running_as_root() {
+            return;
+        }
         let root = unique_temp_dir("cache_fail");
         fs::create_dir_all(&root).expect("create root");
         let cache_file = root.join(".dejaview_cache.json");

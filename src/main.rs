@@ -28,6 +28,9 @@ enum Commands {
         /// Fail if any scan/hash/link errors occur
         #[arg(long)]
         strict: bool,
+        /// Write link report manifest to this path
+        #[arg(long)]
+        report: Option<PathBuf>,
     },
     /// Manage the configuration
     Config(ConfigArgs),
@@ -76,8 +79,10 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Scan { strict } => engine::run_scan(&config, true, strict)?,
-        Commands::Link { strict } => engine::run_scan(&config, false, strict)?,
+        Commands::Scan { strict } => engine::run_scan(&config, true, strict, None)?,
+        Commands::Link { strict, report } => {
+            engine::run_scan(&config, false, strict, report.as_deref())?
+        }
         Commands::Config(args) => match args.command {
             ConfigCommands::SetDownloads { path } => {
                 config.downloads = Some(path);
@@ -124,9 +129,13 @@ mod tests {
 
     #[test]
     fn parses_link_command() {
-        let cli = Cli::try_parse_from(["dejaview", "link"]).expect("parse link");
+        let cli = Cli::try_parse_from(["dejaview", "link", "--report", "/tmp/report.json"])
+            .expect("parse link");
         match cli.command {
-            Commands::Link { strict } => assert!(!strict),
+            Commands::Link { strict, report } => {
+                assert!(!strict);
+                assert_eq!(report, Some(PathBuf::from("/tmp/report.json")));
+            }
             _ => panic!("expected link command"),
         }
     }
