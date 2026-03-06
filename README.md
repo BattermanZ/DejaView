@@ -106,6 +106,41 @@ DejaView uses a cache to speed up subsequent runs. You can manage it with these 
 
 ---
 
+## Performance Harness
+
+DejaView includes an ignored integration benchmark harness with regression thresholds across dataset sizes.
+
+Run all profiles (small/medium/large):
+
+```bash
+cargo test --test perf_harness -- --ignored --nocapture
+```
+
+Run one profile:
+
+```bash
+cargo test --test perf_harness perf_medium_dataset -- --ignored --nocapture
+```
+
+Thresholds are configurable via environment variables (milliseconds):
+
+*   `DEJAVIEW_PERF_SMALL_COLD_MS`
+*   `DEJAVIEW_PERF_SMALL_WARM_MS`
+*   `DEJAVIEW_PERF_MEDIUM_COLD_MS`
+*   `DEJAVIEW_PERF_MEDIUM_WARM_MS`
+*   `DEJAVIEW_PERF_LARGE_COLD_MS`
+*   `DEJAVIEW_PERF_LARGE_WARM_MS`
+
+Example with stricter medium thresholds:
+
+```bash
+DEJAVIEW_PERF_MEDIUM_COLD_MS=5000 \
+DEJAVIEW_PERF_MEDIUM_WARM_MS=2500 \
+cargo test --test perf_harness perf_medium_dataset -- --ignored --nocapture
+```
+
+---
+
 ## License
 
 MIT
