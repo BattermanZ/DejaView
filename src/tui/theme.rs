@@ -12,7 +12,8 @@ impl Theme {
     const TEXT: Color = Color::Rgb(205, 214, 244);
     const SUBTEXT0: Color = Color::Rgb(166, 173, 200);
     const LAVENDER: Color = Color::Rgb(180, 190, 254);
-    const BLUE: Color = Color::Rgb(137, 180, 250);
+    const TEAL: Color = Color::Rgb(148, 226, 213);
+    const GREEN: Color = Color::Rgb(166, 227, 161);
     const YELLOW: Color = Color::Rgb(249, 226, 175);
     const RED: Color = Color::Rgb(243, 139, 168);
 
@@ -26,7 +27,7 @@ impl Theme {
 
     pub fn accent() -> Style {
         Style::default()
-            .fg(Self::BLUE)
+            .fg(Self::TEAL)
             .bg(Self::BASE)
             .add_modifier(Modifier::BOLD)
     }
@@ -63,7 +64,7 @@ impl Theme {
     }
 
     pub fn title(active: bool) -> Style {
-        let color = if active { Self::BLUE } else { Self::LAVENDER };
+        let color = if active { Self::TEAL } else { Self::LAVENDER };
         Style::default()
             .fg(color)
             .bg(Self::CRUST)
@@ -76,8 +77,47 @@ impl Theme {
 
     pub fn badge_accent() -> Style {
         Style::default()
-            .fg(Self::BLUE)
+            .fg(Self::TEAL)
             .bg(Self::MANTLE)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn banner() -> Style {
+        Style::default()
+            .fg(Self::CRUST)
+            .bg(Self::TEAL)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn metric_value() -> Style {
+        Style::default()
+            .fg(Self::TEXT)
+            .bg(Self::SURFACE1)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn metric_label() -> Style {
+        Style::default().fg(Self::SUBTEXT0).bg(Self::SURFACE1)
+    }
+
+    pub fn chip_success() -> Style {
+        Style::default()
+            .fg(Self::CRUST)
+            .bg(Self::GREEN)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn chip_warning() -> Style {
+        Style::default()
+            .fg(Self::CRUST)
+            .bg(Self::YELLOW)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn chip_danger() -> Style {
+        Style::default()
+            .fg(Self::CRUST)
+            .bg(Self::RED)
             .add_modifier(Modifier::BOLD)
     }
 

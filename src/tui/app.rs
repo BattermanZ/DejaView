@@ -68,6 +68,7 @@ pub struct App {
     min_age: Option<u64>,
     threads: Option<usize>,
     running_job: Option<RunningJob>,
+    tick_count: u64,
     should_quit: bool,
 }
 
@@ -87,6 +88,7 @@ impl App {
             min_age: config.min_age,
             threads: config.threads,
             running_job: None,
+            tick_count: 0,
             should_quit: false,
         }
     }
@@ -102,7 +104,10 @@ impl App {
     pub fn step(&mut self) -> Result<()> {
         let event = events::next_event(self.tick_rate())?;
         match event {
-            Event::Tick => self.poll_running_job(),
+            Event::Tick => {
+                self.tick_count = self.tick_count.wrapping_add(1);
+                self.poll_running_job();
+            }
             Event::Key(key) => {
                 if key.kind == KeyEventKind::Press {
                     self.handle_key(key.code, key.modifiers)?;
@@ -152,6 +157,10 @@ impl App {
         self.selected_row
     }
 
+    pub fn selected_entry(&self) -> Option<&LinkReportEntry> {
+        self.rows().get(self.selected_row)
+    }
+
     pub fn overlay(&self) -> &Overlay {
         &self.overlay
     }
@@ -194,39 +203,70 @@ impl App {
             .unwrap_or(&[])
     }
 
-    pub fn selected_details(&self) -> String {
-        let Some(report) = &self.report else {
-            return "No results yet. Press S to scan.".to_string();
-        };
+    pub fn log_lines(&self) -> Vec<String> {
+        self.logs.iter().cloned().collect()
+    }
 
-        let Some(entry) = report.entries.get(self.selected_row) else {
+    pub fn activity_phase(&self) -> &'static str {
+        if let Some(job) = &self.running_job {
+            return match job.kind {
+                JobKind::Scan => "SCANNING LIBRARY",
+                JobKind::Link => "LINKING DUPLICATES",
+            };
+        }
+        match &self.report {
+            Some(report) if report.mode == "link" => "LAST RUN COMPLETE",
+            Some(_) => "READY TO REVIEW",
+            None => "READY TO SCAN",
+        }
+    }
+
+    pub fn progress_ratio(&self) -> f64 {
+        if let Some(job) = &self.running_job {
+            let pulse = ((self.tick_count % 24) as f64) / 24.0;
+            return match job.kind {
+                JobKind::Scan => 0.12 + pulse * 0.48,
+                JobKind::Link => 0.58 + pulse * 0.32,
+            };
+        }
+        match &self.report {
+            Some(_) => 1.0,
+            None => 0.05,
+        }
+    }
+
+    pub fn progress_label(&self) -> String {
+        if self.running_job.is_some() {
+            format!("{:>3}%", (self.progress_ratio() * 100.0).round() as u64)
+        } else if self.report.is_some() {
+            "100%".to_string()
+        } else {
+            "READY".to_string()
+        }
+    }
+
+    pub fn throughput_label(&self) -> String {
+        if self.running_job.is_some() {
+            let sweep = 8 + (self.tick_count % 9) as usize;
             return format!(
-                "Run summary\n- mode: {}\n- files: {}\n- planned: {}\n- applied: {}\n- skipped by min-age: {}\n- warnings: {}",
-                report.mode,
-                report.files_considered,
-                report.planned_actions,
-                report.applied_actions,
-                report.skipped_by_min_age,
-                report.warning_total(),
+                "{} files active  |  {} actions visible",
+                sweep,
+                self.planned_actions().max(self.rows().len())
             );
-        };
-
+        }
         format!(
-            "Selected action\n\nStatus: {}\nMethod: {}\nSource: {}\nTarget: {}\nFallback: {}\nError: {}",
-            entry.status,
-            entry.method.clone().unwrap_or_else(|| "-".to_string()),
-            entry.source,
-            entry.target,
-            entry
-                .fallback_reason
-                .clone()
-                .unwrap_or_else(|| "-".to_string()),
-            entry.error.clone().unwrap_or_else(|| "-".to_string())
+            "{} files  |  {} planned  |  {} applied",
+            self.files_considered(),
+            self.planned_actions(),
+            self.applied_actions()
         )
     }
 
-    pub fn log_lines(&self) -> Vec<String> {
-        self.logs.iter().cloned().collect()
+    pub fn last_log_line(&self) -> String {
+        self.logs
+            .back()
+            .cloned()
+            .unwrap_or_else(|| "No activity yet.".to_string())
     }
 
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<()> {
