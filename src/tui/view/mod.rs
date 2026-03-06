@@ -3,6 +3,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, R
 
 use crate::tui::app::{App, FocusPane, Overlay};
 use crate::tui::layout;
+use crate::tui::model::LinkReportEntry;
 use crate::tui::theme::Theme;
 
 fn format_bytes(bytes: u64) -> String {
@@ -14,6 +15,25 @@ fn format_bytes(bytes: u64) -> String {
         idx += 1;
     }
     format!("{value:.2} {}", units[idx])
+}
+
+fn row_style(row: &LinkReportEntry, is_selected: bool) -> Style {
+    if is_selected {
+        return Theme::accent();
+    }
+    if row.status.eq_ignore_ascii_case("failed") {
+        return Theme::danger();
+    }
+    if row
+        .method
+        .as_deref()
+        .is_some_and(|method| method.eq_ignore_ascii_case("symlink"))
+        || row.fallback_reason.is_some()
+        || row.status.eq_ignore_ascii_case("fallback")
+    {
+        return Theme::warning();
+    }
+    Theme::base()
 }
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -53,15 +73,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(idx, row)| {
-            let base_style = if idx == app.selected_row() {
-                Theme::accent()
-            } else if row.status.eq_ignore_ascii_case("failed") {
-                Theme::danger()
-            } else if row.status.eq_ignore_ascii_case("fallback") {
-                Theme::warning()
-            } else {
-                Theme::base()
-            };
+            let base_style = row_style(row, idx == app.selected_row());
             Row::new(vec![
                 Cell::from(row.status.clone()),
                 Cell::from(row.method.clone().unwrap_or_else(|| "-".to_string())),
@@ -119,6 +131,8 @@ pub fn render(frame: &mut Frame, app: &App) {
         Overlay::None => {}
         Overlay::Help => render_help_overlay(frame),
         Overlay::JsonPreview(json) => render_json_overlay(frame, json),
+        Overlay::ConfirmLink => render_confirm_link_overlay(frame, app),
+        Overlay::BlockingNotice(message) => render_blocking_notice_overlay(frame, message),
     }
 }
 
@@ -126,7 +140,7 @@ fn render_help_overlay(frame: &mut Frame) {
     let area = centered_rect(80, 70, frame.area());
     frame.render_widget(Clear, area);
     let help = Paragraph::new(
-        "Help\n\nGlobal:\n- q: quit\n- ?: toggle help\n- tab: switch focus pane\n\nActions:\n- S: run scan (json subprocess)\n- L: run link (json subprocess)\n- j/k or arrows: move selected row\n- R: save current report\n- J: view current report JSON\n\nClose overlays with Esc or ?."
+        "Help\n\nGlobal:\n- q: close overlay or quit when idle\n- ?: toggle help\n- tab: switch focus pane\n\nActions:\n- S: run scan (json subprocess)\n- L: open link confirmation\n- l: reserved for per-group action intent\n- j/k or arrows: move selected row\n- R: save current report\n- J: view current report JSON\n\nClose overlays with Esc, q, or the documented toggle key."
     )
     .block(Block::default().borders(Borders::ALL).title("Help"))
     .wrap(Wrap { trim: true });
@@ -139,6 +153,36 @@ fn render_json_overlay(frame: &mut Frame, json: &str) {
     let body = Paragraph::new(json)
         .block(Block::default().borders(Borders::ALL).title("Report JSON"))
         .wrap(Wrap { trim: false });
+    frame.render_widget(body, area);
+}
+
+fn render_confirm_link_overlay(frame: &mut Frame, app: &App) {
+    let area = centered_rect(70, 45, frame.area());
+    frame.render_widget(Clear, area);
+    let body = Paragraph::new(format!(
+        "Confirm link run\n\nThis will execute filesystem changes for the current configuration.\n\nEstimated planned actions: {}\nCurrent report mode: {}\nRows with warnings or errors: {}\n\nPress y to continue or n/q to cancel.",
+        app.planned_actions(),
+        app.mode_label(),
+        app.rows()
+            .iter()
+            .filter(|row| row.error.is_some() || row.fallback_reason.is_some())
+            .count()
+    ))
+    .block(Block::default().borders(Borders::ALL).title("Link Confirmation"))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(body, area);
+}
+
+fn render_blocking_notice_overlay(frame: &mut Frame, message: &str) {
+    let area = centered_rect(70, 35, frame.area());
+    frame.render_widget(Clear, area);
+    let body = Paragraph::new(format!("{message}\n\nPress q, Esc, or Enter to dismiss."))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Action Blocked"),
+        )
+        .wrap(Wrap { trim: true });
     frame.render_widget(body, area);
 }
 
@@ -180,4 +224,37 @@ fn trim_middle(input: &str, max_len: usize) -> String {
         .rev()
         .collect();
     format!("{start}...{end}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symlink_rows_use_warning_style() {
+        let row = LinkReportEntry {
+            source: "a".to_string(),
+            target: "b".to_string(),
+            status: "applied".to_string(),
+            method: Some("symlink".to_string()),
+            fallback_reason: Some("cross-device".to_string()),
+            error: None,
+        };
+
+        assert_eq!(row_style(&row, false), Theme::warning());
+    }
+
+    #[test]
+    fn selected_rows_keep_selection_style() {
+        let row = LinkReportEntry {
+            source: "a".to_string(),
+            target: "b".to_string(),
+            status: "failed".to_string(),
+            method: None,
+            fallback_reason: None,
+            error: Some("boom".to_string()),
+        };
+
+        assert_eq!(row_style(&row, true), Theme::accent());
+    }
 }

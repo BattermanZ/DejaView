@@ -28,6 +28,8 @@ pub enum Overlay {
     None,
     Help,
     JsonPreview(String),
+    ConfirmLink,
+    BlockingNotice(String),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -217,19 +219,36 @@ impl App {
 
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<()> {
         if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
-            self.should_quit = true;
+            self.request_quit();
             return Ok(());
         }
 
         match &mut self.overlay {
             Overlay::Help => match code {
-                KeyCode::Esc | KeyCode::Char('?') => self.overlay = Overlay::None,
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                    self.overlay = Overlay::None
+                }
                 _ => {}
             },
             Overlay::JsonPreview(_) => match code {
-                KeyCode::Esc | KeyCode::Char('j') | KeyCode::Char('J') => {
+                KeyCode::Esc | KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Char('q') => {
                     self.overlay = Overlay::None
                 }
+                _ => {}
+            },
+            Overlay::ConfirmLink => match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.overlay = Overlay::None;
+                    self.start_link_job();
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
+                    self.overlay = Overlay::None;
+                    self.push_log("Link run cancelled.".to_string());
+                }
+                _ => {}
+            },
+            Overlay::BlockingNotice(_) => match code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.overlay = Overlay::None,
                 _ => {}
             },
             Overlay::None => self.handle_main_key(code)?,
@@ -239,14 +258,17 @@ impl App {
 
     fn handle_main_key(&mut self, code: KeyCode) -> Result<()> {
         match code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('?') => self.overlay = Overlay::Help,
             KeyCode::Tab => self.focus = next_focus(self.focus),
             KeyCode::BackTab => self.focus = prev_focus(self.focus),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Char('S') | KeyCode::Char('s') => self.start_scan_job(),
-            KeyCode::Char('L') | KeyCode::Char('l') => self.start_link_job(),
+            KeyCode::Char('L') => self.overlay = Overlay::ConfirmLink,
+            KeyCode::Char('l') => {
+                self.push_log("Per-group link intent is not implemented yet. Use uppercase L to confirm a full link run.".to_string());
+            }
             KeyCode::Char('R') | KeyCode::Char('r') => {
                 if let Err(err) = self.save_report() {
                     self.push_log(format!("Save report failed: {err}"));
@@ -307,6 +329,19 @@ impl App {
             kind: JobKind::Link,
             receiver: rx,
         });
+    }
+
+    fn request_quit(&mut self) {
+        if self.running_job.is_some() {
+            self.overlay = Overlay::BlockingNotice(
+                "A run is still active. Quitting is disabled until it finishes so the TUI cannot detach from a live filesystem operation.".to_string(),
+            );
+            self.push_log("Quit blocked while a run is active.".to_string());
+        } else if !matches!(self.overlay, Overlay::None) {
+            self.overlay = Overlay::None;
+        } else {
+            self.should_quit = true;
+        }
     }
 
     fn poll_running_job(&mut self) {
@@ -517,5 +552,64 @@ mod tests {
         assert!(app.running_job.is_none());
         assert_eq!(app.files_considered(), 2);
         assert!(app.logs.iter().any(|line| line.contains("Scan finished")));
+    }
+
+    #[test]
+    fn quit_is_blocked_while_job_is_running() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+
+        let (_tx, rx) = mpsc::channel();
+        app.running_job = Some(RunningJob {
+            kind: JobKind::Link,
+            receiver: rx,
+        });
+
+        app.handle_main_key(KeyCode::Char('q'))
+            .expect("key handling should not fail");
+
+        assert!(!app.should_quit());
+        assert!(matches!(app.overlay, Overlay::BlockingNotice(_)));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "Quit blocked while a run is active."));
+    }
+
+    #[test]
+    fn lower_l_does_not_start_link_run() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+
+        app.handle_main_key(KeyCode::Char('l'))
+            .expect("key handling should not fail");
+
+        assert!(app.running_job.is_none());
+        assert!(app.logs.iter().any(|line| line.contains("uppercase L")));
+    }
+
+    #[test]
+    fn uppercase_l_opens_confirmation_overlay() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+
+        app.handle_main_key(KeyCode::Char('L'))
+            .expect("key handling should not fail");
+
+        assert!(matches!(app.overlay, Overlay::ConfirmLink));
+        assert!(app.running_job.is_none());
+    }
+
+    #[test]
+    fn q_closes_help_overlay_before_quitting() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        app.overlay = Overlay::Help;
+
+        app.handle_key(KeyCode::Char('q'), KeyModifiers::NONE)
+            .expect("key handling should not fail");
+
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(!app.should_quit());
     }
 }
