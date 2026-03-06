@@ -8,7 +8,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::style::Style;
 
-use crate::config::{save_config, validate_runtime_paths, Config};
+use crate::config::{load_config, save_config, validate_runtime_paths, Config};
 
 use super::actions;
 use super::events::{self, Event};
@@ -418,26 +418,31 @@ impl App {
     }
 
     fn save_config_from_editor(&mut self) -> Result<()> {
-        self.save_config_from_editor_with(save_config)
+        self.save_config_from_editor_with(load_config, save_config)
     }
 
-    fn save_config_from_editor_with<F>(&mut self, save_fn: F) -> Result<()>
+    fn save_config_from_editor_with<L, S>(&mut self, load_fn: L, save_fn: S) -> Result<()>
     where
-        F: FnOnce(&Config) -> Result<()>,
+        L: FnOnce() -> Result<Config>,
+        S: FnOnce(&Config) -> Result<()>,
     {
         let Some(editor) = self.config_editor().cloned() else {
             return Ok(());
         };
 
-        let config = self.config_from_editor(&editor);
-        if let Err(err) = validate_runtime_paths(&config) {
-            if let Overlay::ConfigEditor(current) = &mut self.overlay {
-                current.error = Some(err.to_string());
+        let config = match self.normalized_config_from_editor(load_fn, &editor) {
+            Ok(config) => config,
+            Err(err) => {
+                self.set_config_editor_error(err.to_string());
+                return Ok(());
             }
+        };
+
+        if let Err(err) = save_fn(&config) {
+            self.set_config_editor_error(format!("Failed to save config: {err}"));
             return Ok(());
         }
 
-        save_fn(&config)?;
         self.downloads = config.downloads.clone();
         self.media = config.media.clone();
         self.overlay = Overlay::None;
@@ -445,12 +450,20 @@ impl App {
         Ok(())
     }
 
-    fn config_from_editor(&self, editor: &ConfigEditor) -> Config {
-        Config {
-            downloads: Some(PathBuf::from(editor.downloads.trim())),
-            media: Some(PathBuf::from(editor.media.trim())),
-            min_age: self.min_age,
-            threads: self.threads,
+    fn normalized_config_from_editor<L>(&self, load_fn: L, editor: &ConfigEditor) -> Result<Config>
+    where
+        L: FnOnce() -> Result<Config>,
+    {
+        let mut config = load_fn()?;
+        config.downloads = Some(std::fs::canonicalize(editor.downloads.trim())?);
+        config.media = Some(std::fs::canonicalize(editor.media.trim())?);
+        validate_runtime_paths(&config)?;
+        Ok(config)
+    }
+
+    fn set_config_editor_error(&mut self, error: String) {
+        if let Overlay::ConfigEditor(current) = &mut self.overlay {
+            current.error = Some(error);
         }
     }
 
@@ -789,7 +802,7 @@ mod tests {
             error: None,
         });
 
-        app.save_config_from_editor_with(|_| Ok(()))
+        app.save_config_from_editor_with(|| Ok(Config::default()), |_| Ok(()))
             .expect("save flow should not hard fail");
 
         let editor = app.config_editor().expect("editor should stay open");
@@ -815,15 +828,25 @@ mod tests {
 
         let saved = Arc::new(Mutex::new(None::<Config>));
         let saved_clone = Arc::clone(&saved);
-        app.save_config_from_editor_with(|config| {
-            *saved_clone.lock().expect("lock saved config") = Some(Config {
-                downloads: config.downloads.clone(),
-                media: config.media.clone(),
-                min_age: config.min_age,
-                threads: config.threads,
-            });
-            Ok(())
-        })
+        app.save_config_from_editor_with(
+            || {
+                Ok(Config {
+                    downloads: Some(PathBuf::from("/stale/downloads")),
+                    media: Some(PathBuf::from("/stale/media")),
+                    min_age: Some(900),
+                    threads: Some(8),
+                })
+            },
+            |config| {
+                *saved_clone.lock().expect("lock saved config") = Some(Config {
+                    downloads: config.downloads.clone(),
+                    media: config.media.clone(),
+                    min_age: config.min_age,
+                    threads: config.threads,
+                });
+                Ok(())
+            },
+        )
         .expect("save should succeed");
 
         assert!(matches!(app.overlay, Overlay::None));
@@ -838,6 +861,48 @@ mod tests {
                 .downloads,
             Some(downloads)
         );
+        assert_eq!(
+            saved
+                .lock()
+                .expect("lock saved config")
+                .as_ref()
+                .expect("config was saved")
+                .min_age,
+            Some(900)
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn config_editor_save_failure_stays_in_overlay() {
+        let root = unique_temp_path("config_editor_save_failure");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        fs::create_dir_all(&downloads).expect("create downloads");
+        fs::create_dir_all(&media).expect("create media");
+
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        app.overlay = Overlay::ConfigEditor(ConfigEditor {
+            downloads: downloads.display().to_string(),
+            media: media.display().to_string(),
+            active_field: ConfigField::Media,
+            error: None,
+        });
+
+        app.save_config_from_editor_with(
+            || Ok(Config::default()),
+            |_| Err(anyhow::anyhow!("disk full")),
+        )
+        .expect("save flow should not hard fail");
+
+        let editor = app.config_editor().expect("editor should stay open");
+        assert!(editor
+            .error
+            .as_ref()
+            .expect("save error")
+            .contains("Failed to save config"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

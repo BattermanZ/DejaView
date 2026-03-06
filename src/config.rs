@@ -64,6 +64,16 @@ pub fn validate_runtime_paths(config: &Config) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("media path not set"))?;
 
+    if !downloads.is_absolute() {
+        return Err(anyhow!(
+            "downloads path must be absolute: {}",
+            downloads.display()
+        ));
+    }
+    if !media.is_absolute() {
+        return Err(anyhow!("media path must be absolute: {}", media.display()));
+    }
+
     if !downloads.exists() {
         return Err(anyhow!(
             "downloads path does not exist: {}",
@@ -175,6 +185,26 @@ mod tests {
         let config = Config {
             downloads: Some(downloads),
             media: Some(root.join("missing-media")),
+            min_age: None,
+            threads: None,
+        };
+
+        let result = validate_runtime_paths(&config);
+        assert!(result.is_err());
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn validate_runtime_paths_rejects_relative_directories() {
+        let root = unique_temp_dir("validate_relative");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        fs::create_dir_all(&downloads).expect("create downloads");
+        fs::create_dir_all(&media).expect("create media");
+
+        let config = Config {
+            downloads: Some(PathBuf::from("downloads")),
+            media: Some(PathBuf::from("media")),
             min_age: None,
             threads: None,
         };
