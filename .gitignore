@@ -1,1 +1,6 @@
 /target
+
+# Local manual test fixtures
+/test-fixtures/fake-library/downloads/
+/test-fixtures/fake-library/media/
+/test-fixtures/fake-library/**/*.json
