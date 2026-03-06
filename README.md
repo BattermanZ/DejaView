@@ -52,6 +52,21 @@ Before running any scans or links, you need to tell DejaView where your download
     cargo run -- config show
     ```
 
+*   **Set Minimum File Age (seconds):**
+    ```bash
+    cargo run -- config set-min-age 0
+    ```
+
+*   **Set Worker Threads:**
+    ```bash
+    cargo run -- config set-threads 4
+    ```
+
+*   **Validate Configuration and Access:**
+    ```bash
+    cargo run -- config validate
+    ```
+
 ### 2. Scanning for Duplicates (Dry Run)
 
 This command will scan your configured directories for duplicates and report them, including the potential space savings. No files will be modified.
@@ -72,6 +87,12 @@ This command will perform the actual file operations: deleting duplicates in you
 
 ```bash
 cargo run -- link
+```
+
+Prompt before applying changes (interactive terminals):
+
+```bash
+cargo run -- link --confirm
 ```
 
 Machine-readable link output for automation:
@@ -104,14 +125,16 @@ DejaView uses a cache to speed up subsequent runs. You can manage it with these 
 *   `--report <path>`: write the same run summary JSON to a file.
 *   `--progress <auto|on|off>`: control progress UI behaviour (default `auto`).
 *   `--no-progress`: shortcut for `--progress off` (useful for scripts/CI).
+*   `--confirm` (link only): require explicit interactive confirmation before applying actions.
 
 When `--json` is enabled, progress UI is automatically disabled so stdout remains parseable JSON.
+`link --confirm` cannot be combined with `--json`.
 
 ---
 
 ## How it works
 
-1.  **File collection**: Recursively scans both the configured download and media directories, skipping symlinks and files younger than the `min-age` setting (default: 300 seconds).
+1.  **File collection**: Recursively scans both the configured download and media directories, skipping symlinks and files younger than the `min-age` setting (default: 300 seconds). For first-run testing on freshly created files, use `config set-min-age 0`.
 2.  **Duplicate grouping**: Buckets files by size; only buckets with more than one file enter the hashing phase.
 3.  **Two-phase Hashing**: 
     *   **Phase 1 (Sample Hash):** For files in a group, a fast BLAKE3 hash is computed using only the first and last megabyte of the file.

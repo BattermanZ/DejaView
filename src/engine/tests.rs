@@ -13,7 +13,7 @@ use super::linking::{
     ensure_target_within_media_root, plan_group_actions, replace_file_with_best_link_with,
     replace_file_with_relative_symlink,
 };
-use super::types::{Cache, CacheEntry, FileInfo, RunWarnings};
+use super::types::{Cache, CacheEntry, FileInfo, RunMetrics, RunWarnings};
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     let ts = SystemTime::now()
@@ -46,6 +46,7 @@ fn run_scan(config: &Config, dry_run: bool, strict: bool, report_path: Option<&P
             report_path,
             json_output: false,
             show_progress: false,
+            require_confirm: false,
         },
     )
     .expect("run scan");
@@ -286,7 +287,15 @@ fn plan_group_actions_requires_both_sides() {
 fn collect_files_strict_fails_on_walk_error() {
     let missing = PathBuf::from("/this/path/does/not/exist/dejaview");
     let mut warnings = RunWarnings::default();
-    let result = collect_files(&missing, true, Duration::from_secs(0), true, &mut warnings);
+    let mut metrics = RunMetrics::default();
+    let result = collect_files(
+        &missing,
+        true,
+        Duration::from_secs(0),
+        true,
+        &mut warnings,
+        &mut metrics,
+    );
     assert!(result.is_err());
     assert!(warnings.walk_errors > 0);
 }
@@ -457,6 +466,7 @@ fn run_scan_strict_fails_on_sample_hash_error() {
             report_path: None,
             json_output: false,
             show_progress: false,
+            require_confirm: false,
         },
     );
     assert!(strict_result.is_err());
@@ -468,6 +478,7 @@ fn run_scan_strict_fails_on_sample_hash_error() {
             report_path: None,
             json_output: false,
             show_progress: false,
+            require_confirm: false,
         },
     );
     assert!(non_strict_result.is_ok());
@@ -506,6 +517,7 @@ fn run_scan_non_strict_link_failure_continues() {
             report_path: None,
             json_output: false,
             show_progress: false,
+            require_confirm: false,
         },
     );
     assert!(result.is_ok());
@@ -548,6 +560,7 @@ fn run_scan_strict_link_failure_returns_error() {
             report_path: None,
             json_output: false,
             show_progress: false,
+            require_confirm: false,
         },
     );
     assert!(result.is_err());

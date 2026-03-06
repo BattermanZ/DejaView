@@ -22,13 +22,18 @@ pub(super) struct CacheEntry {
 
 pub(super) type Cache = HashMap<String, CacheEntry>;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(super) struct RunWarnings {
     pub(super) walk_errors: u64,
     pub(super) metadata_errors: u64,
     pub(super) sample_hash_errors: u64,
     pub(super) full_hash_errors: u64,
     pub(super) link_errors: u64,
+}
+
+#[derive(Default, Clone)]
+pub(super) struct RunMetrics {
+    pub(super) skipped_by_min_age: u64,
 }
 
 #[derive(Clone)]
@@ -66,6 +71,7 @@ pub(super) struct RunReport {
     pub(super) planned_actions: usize,
     pub(super) applied_actions: usize,
     pub(super) total_saved_bytes: u64,
+    pub(super) skipped_by_min_age: u64,
     pub(super) warnings: WarningSummary,
     pub(super) entries: Vec<LinkReportEntry>,
 }
@@ -76,4 +82,5 @@ pub struct ScanRunOptions<'a> {
     pub report_path: Option<&'a Path>,
     pub json_output: bool,
     pub show_progress: bool,
+    pub require_confirm: bool,
 }

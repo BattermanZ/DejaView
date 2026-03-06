@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::types::{
-    LinkAction, LinkReportEntry, RunReport, RunWarnings, ScanRunOptions, WarningSummary,
+    LinkAction, LinkReportEntry, RunMetrics, RunReport, RunWarnings, ScanRunOptions, WarningSummary,
 };
 
 fn format_size(bytes: u64) -> String {
@@ -20,11 +20,13 @@ fn format_size(bytes: u64) -> String {
 
 pub(super) fn print_run_summary(
     files_seen: usize,
+    skipped_by_min_age: u64,
     planned_actions: usize,
     applied_actions: usize,
     warnings: &RunWarnings,
 ) {
     println!("{} Files considered: {}", "ℹ".cyan(), files_seen);
+    println!("{} Skipped by min-age: {}", "ℹ".cyan(), skipped_by_min_age);
     println!("{} Planned actions: {}", "ℹ".cyan(), planned_actions);
     if applied_actions > 0 {
         println!("{} Applied actions: {}", "ℹ".cyan(), applied_actions);
@@ -53,6 +55,31 @@ pub(super) fn print_space_summary(actions_empty: bool, total_saved_space: u64) {
             "💾".cyan(),
             format_size(total_saved_space)
         );
+    }
+}
+
+pub(super) fn maybe_confirm_apply(require_confirm: bool, planned_actions: usize) -> Result<()> {
+    if !require_confirm || planned_actions == 0 {
+        return Ok(());
+    }
+
+    use std::io::{self, BufRead, IsTerminal, Write};
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(anyhow!(
+            "--confirm requires an interactive terminal; rerun without --confirm for non-interactive runs"
+        ));
+    }
+
+    print!("Apply {planned_actions} planned action(s)? [y/N]: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    let mut stdin = io::stdin().lock();
+    stdin.read_line(&mut input)?;
+    let answer = input.trim().to_ascii_lowercase();
+    if answer == "y" || answer == "yes" {
+        Ok(())
+    } else {
+        Err(anyhow!("operation cancelled by user"))
     }
 }
 
@@ -111,15 +138,7 @@ pub(super) fn build_report_entries(actions: &[LinkAction]) -> Vec<LinkReportEntr
         .collect()
 }
 
-pub(super) fn build_run_report(
-    options: &ScanRunOptions<'_>,
-    files_seen: usize,
-    planned_actions: usize,
-    applied_actions: usize,
-    total_saved_space: u64,
-    warnings: &RunWarnings,
-    entries: Vec<LinkReportEntry>,
-) -> RunReport {
+pub(super) fn build_run_report(options: &ScanRunOptions<'_>, input: RunReportInput) -> RunReport {
     RunReport {
         mode: if options.dry_run {
             "scan".to_string()
@@ -128,19 +147,30 @@ pub(super) fn build_run_report(
         },
         dry_run: options.dry_run,
         strict: options.strict,
-        files_considered: files_seen,
-        planned_actions,
-        applied_actions,
-        total_saved_bytes: total_saved_space,
+        files_considered: input.files_seen,
+        planned_actions: input.planned_actions,
+        applied_actions: input.applied_actions,
+        total_saved_bytes: input.total_saved_space,
+        skipped_by_min_age: input.metrics.skipped_by_min_age,
         warnings: WarningSummary {
-            walk_errors: warnings.walk_errors,
-            metadata_errors: warnings.metadata_errors,
-            sample_hash_errors: warnings.sample_hash_errors,
-            full_hash_errors: warnings.full_hash_errors,
-            link_errors: warnings.link_errors,
+            walk_errors: input.warnings.walk_errors,
+            metadata_errors: input.warnings.metadata_errors,
+            sample_hash_errors: input.warnings.sample_hash_errors,
+            full_hash_errors: input.warnings.full_hash_errors,
+            link_errors: input.warnings.link_errors,
         },
-        entries,
+        entries: input.entries,
     }
+}
+
+pub(super) struct RunReportInput {
+    pub(super) files_seen: usize,
+    pub(super) planned_actions: usize,
+    pub(super) applied_actions: usize,
+    pub(super) total_saved_space: u64,
+    pub(super) metrics: RunMetrics,
+    pub(super) warnings: RunWarnings,
+    pub(super) entries: Vec<LinkReportEntry>,
 }
 
 pub(super) fn maybe_return_strict_errors(

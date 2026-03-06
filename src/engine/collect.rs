@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 use walkdir::{DirEntry, WalkDir};
 
-use super::types::{FileInfo, RunWarnings};
+use super::types::{FileInfo, RunMetrics, RunWarnings};
 
 fn is_regular(entry: &DirEntry) -> bool {
     entry.file_type().is_file() && !entry.path_is_symlink()
@@ -19,6 +19,7 @@ pub(super) fn collect_files(
     min_age: Duration,
     strict: bool,
     warnings: &mut RunWarnings,
+    metrics: &mut RunMetrics,
 ) -> Result<Vec<FileInfo>> {
     let deadline = SystemTime::now() - min_age;
     let mut files = Vec::new();
@@ -56,6 +57,7 @@ pub(super) fn collect_files(
             .unwrap_or_default()
             .as_secs();
         if mtime > deadline {
+            metrics.skipped_by_min_age += 1;
             continue;
         }
         files.push(FileInfo {
@@ -78,6 +80,7 @@ pub(super) fn collect_run_files(
     strict: bool,
     show_progress: bool,
     warnings: &mut RunWarnings,
+    metrics: &mut RunMetrics,
 ) -> Result<Vec<FileInfo>> {
     let spinner = if show_progress {
         let mp = MultiProgress::new();
@@ -95,12 +98,12 @@ pub(super) fn collect_run_files(
     };
 
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
-    let mut files = collect_files(downloads, true, min_age, strict, warnings)?;
+    let mut files = collect_files(downloads, true, min_age, strict, warnings, metrics)?;
     for f in &files {
         seen.insert((f.dev, f.inode));
     }
 
-    let mut media_files = collect_files(media, false, min_age, strict, warnings)?;
+    let mut media_files = collect_files(media, false, min_age, strict, warnings, metrics)?;
     media_files.retain(|f| !seen.contains(&(f.dev, f.inode)));
     files.extend(media_files);
 

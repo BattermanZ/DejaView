@@ -17,10 +17,11 @@ use collect::{collect_run_files, group_files_by_size};
 use hashing::hash_groups_and_update_cache;
 use linking::{apply_actions, plan_actions_and_table};
 use report::{
-    build_report_entries, build_run_report, maybe_return_strict_errors, print_run_summary,
-    print_space_summary, resolve_report_path, try_write_run_report,
+    build_report_entries, build_run_report, maybe_confirm_apply, maybe_return_strict_errors,
+    print_run_summary, print_space_summary, resolve_report_path, try_write_run_report,
+    RunReportInput,
 };
-use types::RunWarnings;
+use types::{RunMetrics, RunWarnings};
 
 use crate::config::{cache_path, Config};
 
@@ -44,6 +45,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
     let min_age = std::time::Duration::from_secs(config.min_age.unwrap_or(300));
 
     let mut warnings = RunWarnings::default();
+    let mut metrics = RunMetrics::default();
     let files = collect_run_files(
         downloads,
         media,
@@ -51,6 +53,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         options.strict,
         options.show_progress,
         &mut warnings,
+        &mut metrics,
     )?;
     let files_seen = files.len();
 
@@ -73,22 +76,25 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
     }
 
     let (table, actions, total_saved_space) = plan_actions_and_table(&groups);
+    let planned_actions = actions.len();
 
     if !options.json_output {
         println!("\n{} Found duplicates:", "▶".cyan());
         println!("{}", table);
-        print_run_summary(files_seen, actions.len(), 0, &warnings);
+        print_space_summary(actions.is_empty(), total_saved_space);
     }
     let out_path = resolve_report_path(downloads, &options);
     let mut report_entries = build_report_entries(&actions);
-    if !options.json_output {
-        print_space_summary(actions.is_empty(), total_saved_space);
-    }
 
-    let planned_actions = actions.len();
     let (applied_actions, strict_link_error) = if options.dry_run {
         (0usize, None)
     } else {
+        if options.json_output && options.require_confirm {
+            return Err(anyhow!(
+                "--confirm cannot be combined with --json; automation runs must stay non-interactive"
+            ));
+        }
+        maybe_confirm_apply(options.require_confirm, planned_actions)?;
         apply_actions(
             &actions,
             media,
@@ -100,17 +106,26 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
     };
 
     if !options.json_output {
-        print_run_summary(files_seen, planned_actions, applied_actions, &warnings);
+        print_run_summary(
+            files_seen,
+            metrics.skipped_by_min_age,
+            planned_actions,
+            applied_actions,
+            &warnings,
+        );
     }
 
     let report = build_run_report(
         &options,
-        files_seen,
-        planned_actions,
-        applied_actions,
-        total_saved_space,
-        &warnings,
-        report_entries,
+        RunReportInput {
+            files_seen,
+            planned_actions,
+            applied_actions,
+            total_saved_space,
+            metrics: metrics.clone(),
+            warnings: warnings.clone(),
+            entries: report_entries,
+        },
     );
     if let Some(path) = out_path.as_deref() {
         try_write_run_report(path, &report);

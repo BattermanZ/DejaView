@@ -110,8 +110,8 @@ fn config_and_cache_commands_work_end_to_end() {
 }
 
 #[test]
-fn scan_strict_fails_when_walk_errors_exist() {
-    let root = unique_temp_dir("strict_walk");
+fn scan_fails_with_actionable_message_when_paths_missing() {
+    let root = unique_temp_dir("missing_paths");
     let missing_downloads = root.join("downloads_missing");
     let media = root.join("media");
     fs::create_dir_all(&media).expect("create media");
@@ -130,16 +130,11 @@ fn scan_strict_fails_when_walk_errors_exist() {
         &["config", "set-media", media.to_str().expect("media str")],
     );
 
-    let strict = run_cmd(&root, &["scan", "--strict"]);
-    assert!(!strict.status.success());
-
-    let non_strict = run_cmd(&root, &["scan"]);
-    assert!(
-        non_strict.status.success(),
-        "stdout={}\nstderr={}",
-        String::from_utf8_lossy(&non_strict.stdout),
-        String::from_utf8_lossy(&non_strict.stderr)
-    );
+    let out = run_cmd(&root, &["scan"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("downloads path does not exist"));
+    assert!(stderr.contains("config set-downloads"));
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
@@ -240,6 +235,7 @@ fn scan_json_writes_machine_readable_stdout_and_report() {
     assert_eq!(stdout_json["dry_run"], true);
     assert_eq!(stdout_json["planned_actions"], 1);
     assert_eq!(stdout_json["applied_actions"], 0);
+    assert_eq!(stdout_json["skipped_by_min_age"], 0);
     assert!(stdout_json["entries"].is_array());
 
     let report_json: serde_json::Value =
@@ -295,6 +291,74 @@ fn link_json_reports_applied_actions() {
     assert!(
         stdout_json["entries"][0]["method"] == "hardlink"
             || stdout_json["entries"][0]["method"] == "symlink"
+    );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn config_validate_reports_success_for_valid_paths() {
+    let root = unique_temp_dir("config_validate");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    fs::create_dir_all(&downloads).expect("create downloads");
+    fs::create_dir_all(&media).expect("create media");
+
+    run_ok(
+        &root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        &root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+    run_ok(&root, &["config", "set-min-age", "0"]);
+    run_ok(&root, &["config", "set-threads", "2"]);
+
+    let out = run_cmd(&root, &["config", "validate"]);
+    assert!(
+        out.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Configuration is valid"));
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn link_confirm_conflicts_with_json_mode() {
+    let root = unique_temp_dir("confirm_json_conflict");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    fs::create_dir_all(&downloads).expect("create downloads");
+    fs::create_dir_all(&media).expect("create media");
+    fs::write(downloads.join("a.txt"), b"x").expect("write download");
+    fs::write(media.join("a.txt"), b"x").expect("write media");
+
+    run_ok(
+        &root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        &root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+    run_ok(&root, &["config", "set-min-age", "0"]);
+
+    let out = run_cmd(&root, &["link", "--json", "--confirm"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--confirm cannot be combined with --json")
     );
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
