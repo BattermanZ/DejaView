@@ -443,18 +443,15 @@ fn try_write_run_report(path: &Path, report: &RunReport) {
     }
 }
 
-pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
-    let downloads = config
-        .downloads
-        .as_ref()
-        .ok_or_else(|| anyhow!("Downloads path not set"))?;
-    let media = config
-        .media
-        .as_ref()
-        .ok_or_else(|| anyhow!("Media path not set"))?;
-    let min_age = Duration::from_secs(config.min_age.unwrap_or(300));
-
-    let spinner = if options.show_progress {
+fn collect_run_files(
+    downloads: &Path,
+    media: &Path,
+    min_age: Duration,
+    strict: bool,
+    show_progress: bool,
+    warnings: &mut RunWarnings,
+) -> Result<Vec<FileInfo>> {
+    let spinner = if show_progress {
         let mp = MultiProgress::new();
         let spinner = mp.add(ProgressBar::new_spinner());
         spinner.set_style(
@@ -469,34 +466,40 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         None
     };
 
-    let mut warnings = RunWarnings::default();
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
-
-    let mut files = collect_files(downloads, true, min_age, options.strict, &mut warnings)?;
+    let mut files = collect_files(downloads, true, min_age, strict, warnings)?;
     for f in &files {
         seen.insert((f.dev, f.inode));
     }
 
-    let mut media_files = collect_files(media, false, min_age, options.strict, &mut warnings)?;
+    let mut media_files = collect_files(media, false, min_age, strict, warnings)?;
     media_files.retain(|f| !seen.contains(&(f.dev, f.inode)));
     files.extend(media_files);
-    let files_seen = files.len();
 
     if let Some(spinner) = spinner {
         spinner.finish_with_message("File list complete ✔".green().bold().to_string());
     }
 
-    let cache_path = cache_path(config)?;
-    let cache = Arc::new(Mutex::new(load_cache(&cache_path)));
-    let inode_hash: Arc<Mutex<HashMap<(u64, u64), String>>> = Arc::new(Mutex::new(HashMap::new()));
+    Ok(files)
+}
 
+fn group_files_by_size(files: Vec<FileInfo>) -> Vec<Vec<FileInfo>> {
     let mut size_map: HashMap<u64, Vec<FileInfo>> = HashMap::new();
     for f in files {
         size_map.entry(f.size).or_default().push(f);
     }
+    size_map.into_values().filter(|v| v.len() > 1).collect()
+}
 
-    let mut groups: Vec<Vec<FileInfo>> = size_map.into_values().filter(|v| v.len() > 1).collect();
-    let bar = if options.show_progress {
+fn hash_groups_and_update_cache(
+    groups: &mut [Vec<FileInfo>],
+    cache: &Arc<Mutex<Cache>>,
+    inode_hash: &Arc<Mutex<HashMap<(u64, u64), String>>>,
+    strict: bool,
+    show_progress: bool,
+    warnings: &mut RunWarnings,
+) -> Result<()> {
+    let bar = if show_progress {
         let bar = ProgressBar::new(groups.len() as u64);
         bar.set_style(
             ProgressStyle::with_template("{msg} {pos}/{len} [{wide_bar:.cyan/blue}] {elapsed}")
@@ -513,6 +516,8 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
     let bar_for_threads = bar.clone();
     let sample_counter = Arc::clone(&sample_hash_errors);
     let full_counter = Arc::clone(&full_hash_errors);
+    let cache_for_threads = Arc::clone(cache);
+    let inode_hash_for_threads = Arc::clone(inode_hash);
     groups.par_iter_mut().try_for_each(|group| -> Result<()> {
         let mut sample_hashes: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
         for (i, fi) in group.iter().enumerate() {
@@ -522,7 +527,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
                 }
                 Err(err) => {
                     sample_counter.fetch_add(1, Ordering::Relaxed);
-                    if options.strict {
+                    if strict {
                         return Err(anyhow!(
                             "sample hash error for {}: {}",
                             fi.path.display(),
@@ -536,14 +541,14 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         for indices in sample_hashes.values().filter(|v| v.len() > 1) {
             for &i in indices {
                 let fi = &mut group[i];
-                if let Ok(ih) = inode_hash.lock() {
+                if let Ok(ih) = inode_hash_for_threads.lock() {
                     if let Some(h) = ih.get(&(fi.dev, fi.inode)) {
                         fi.hash = Some(h.clone());
                         continue;
                     }
                 }
                 let key = fi.path.to_string_lossy().into_owned();
-                if let Ok(c) = cache.lock() {
+                if let Ok(c) = cache_for_threads.lock() {
                     if let Some(e) = c.get(&key) {
                         if e.size == fi.size && e.mtime == fi.mtime_secs {
                             fi.hash = Some(e.hash.clone());
@@ -553,11 +558,11 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
                 }
                 match full_digest(&fi.path) {
                     Ok(h) => {
-                        if let Ok(mut ih) = inode_hash.lock() {
+                        if let Ok(mut ih) = inode_hash_for_threads.lock() {
                             ih.insert((fi.dev, fi.inode), h.clone());
                         }
                         fi.hash = Some(h.clone());
-                        if let Ok(mut c) = cache.lock() {
+                        if let Ok(mut c) = cache_for_threads.lock() {
                             c.insert(
                                 key,
                                 CacheEntry {
@@ -570,7 +575,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
                     }
                     Err(err) => {
                         full_counter.fetch_add(1, Ordering::Relaxed);
-                        if options.strict {
+                        if strict {
                             return Err(anyhow!(
                                 "full hash error for {}: {}",
                                 fi.path.display(),
@@ -581,24 +586,26 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
                 }
             }
         }
+
         if let Some(bar) = &bar_for_threads {
             bar.inc(1);
         }
         Ok(())
     })?;
+
     warnings.sample_hash_errors += sample_hash_errors.load(Ordering::Relaxed);
     warnings.full_hash_errors += full_hash_errors.load(Ordering::Relaxed);
     if let Some(bar) = bar {
         bar.finish_with_message("Hashing complete ✔".green().bold().to_string());
     }
 
-    if let Ok(c) = Arc::try_unwrap(cache) {
-        save_cache(&cache_path, &c.into_inner().unwrap())?;
-    }
+    Ok(())
+}
 
+fn plan_actions_and_table(groups: &[Vec<FileInfo>]) -> (Table, Vec<LinkAction>, u64) {
     let mut hash_map: HashMap<String, Vec<&FileInfo>> = HashMap::new();
-    for group in &groups {
-        for fi in group.iter() {
+    for group in groups {
+        for fi in group {
             if let Some(ref h) = fi.hash {
                 hash_map.entry(h.clone()).or_default().push(fi);
             }
@@ -614,7 +621,6 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
 
     let mut actions = Vec::new();
     let mut total_saved_space: u64 = 0;
-
     for group in hash_map.values() {
         let planned = plan_group_actions(group);
         for action in planned {
@@ -627,19 +633,21 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         }
     }
 
-    if !options.json_output {
-        println!("\n{} Found duplicates:", "▶".cyan());
-        println!("{}", table);
-        print_run_summary(files_seen, actions.len(), 0, &warnings);
-    }
-    let out_path = options.report_path.map(PathBuf::from).or_else(|| {
+    (table, actions, total_saved_space)
+}
+
+fn resolve_report_path(downloads: &Path, options: &ScanRunOptions<'_>) -> Option<PathBuf> {
+    options.report_path.map(PathBuf::from).or_else(|| {
         if options.dry_run {
             None
         } else {
             Some(downloads.join(".dejaview_link_report.json"))
         }
-    });
-    let mut report_entries: Vec<LinkReportEntry> = actions
+    })
+}
+
+fn build_report_entries(actions: &[LinkAction]) -> Vec<LinkReportEntry> {
+    actions
         .iter()
         .map(|action| LinkReportEntry {
             source: action.src.display().to_string(),
@@ -649,68 +657,76 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
             fallback_reason: None,
             error: None,
         })
-        .collect();
-    if !options.json_output {
-        if actions.is_empty() {
-            println!("{} No actions needed.", "✔".green());
-        } else {
-            println!(
-                "{} Potential space saved: {}",
-                "💾".cyan(),
-                format_size(total_saved_space)
-            );
-        }
-    }
+        .collect()
+}
 
+fn apply_actions(
+    actions: &[LinkAction],
+    media: &Path,
+    strict: bool,
+    json_output: bool,
+    warnings: &mut RunWarnings,
+    report_entries: &mut [LinkReportEntry],
+) -> (usize, Option<anyhow::Error>) {
     let mut applied_actions = 0usize;
-    let planned_actions = actions.len();
     let mut strict_link_error: Option<anyhow::Error> = None;
-    if !options.dry_run && !actions.is_empty() {
-        if !options.json_output {
-            println!("{} Applying…", "▶".cyan());
-        }
-        for (index, action) in actions.into_iter().enumerate() {
-            let apply_result = (|| -> Result<()> {
-                ensure_target_within_media_root(media, &action.tgt)?;
-                let (method, fallback_reason) =
-                    replace_file_with_best_link(&action.src, &action.tgt)?;
-                report_entries[index].method = Some(method);
-                report_entries[index].fallback_reason = fallback_reason;
-                report_entries[index].status = "applied".to_string();
-                Ok(())
-            })();
-            if let Err(err) = apply_result {
-                warnings.link_errors += 1;
-                report_entries[index].status = "failed".to_string();
-                report_entries[index].error = Some(err.to_string());
-                if options.strict {
-                    strict_link_error = Some(anyhow!(
-                        "strict mode link failure for {} -> {}: {}",
-                        action.src.display(),
-                        action.tgt.display(),
-                        err
-                    ));
-                    break;
-                } else {
-                    eprintln!(
-                        "{} Failed to apply {} -> {}: {}",
-                        "⚠".yellow(),
-                        action.src.display(),
-                        action.tgt.display(),
-                        err
-                    );
-                    continue;
-                }
+
+    if actions.is_empty() {
+        return (applied_actions, strict_link_error);
+    }
+
+    if !json_output {
+        println!("{} Applying…", "▶".cyan());
+    }
+
+    for (index, action) in actions.iter().enumerate() {
+        let apply_result = (|| -> Result<()> {
+            ensure_target_within_media_root(media, &action.tgt)?;
+            let (method, fallback_reason) = replace_file_with_best_link(&action.src, &action.tgt)?;
+            report_entries[index].method = Some(method);
+            report_entries[index].fallback_reason = fallback_reason;
+            report_entries[index].status = "applied".to_string();
+            Ok(())
+        })();
+        if let Err(err) = apply_result {
+            warnings.link_errors += 1;
+            report_entries[index].status = "failed".to_string();
+            report_entries[index].error = Some(err.to_string());
+            if strict {
+                strict_link_error = Some(anyhow!(
+                    "strict mode link failure for {} -> {}: {}",
+                    action.src.display(),
+                    action.tgt.display(),
+                    err
+                ));
+                break;
+            } else {
+                eprintln!(
+                    "{} Failed to apply {} -> {}: {}",
+                    "⚠".yellow(),
+                    action.src.display(),
+                    action.tgt.display(),
+                    err
+                );
+                continue;
             }
-            applied_actions += 1;
         }
+        applied_actions += 1;
     }
 
-    if !options.json_output {
-        print_run_summary(files_seen, planned_actions, applied_actions, &warnings);
-    }
+    (applied_actions, strict_link_error)
+}
 
-    let report = RunReport {
+fn build_run_report(
+    options: &ScanRunOptions<'_>,
+    files_seen: usize,
+    planned_actions: usize,
+    applied_actions: usize,
+    total_saved_space: u64,
+    warnings: &RunWarnings,
+    entries: Vec<LinkReportEntry>,
+) -> RunReport {
+    RunReport {
         mode: if options.dry_run {
             "scan".to_string()
         } else {
@@ -729,8 +745,97 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
             full_hash_errors: warnings.full_hash_errors,
             link_errors: warnings.link_errors,
         },
-        entries: report_entries,
+        entries,
+    }
+}
+
+pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
+    let downloads = config
+        .downloads
+        .as_ref()
+        .ok_or_else(|| anyhow!("Downloads path not set"))?;
+    let media = config
+        .media
+        .as_ref()
+        .ok_or_else(|| anyhow!("Media path not set"))?;
+    let min_age = Duration::from_secs(config.min_age.unwrap_or(300));
+
+    let mut warnings = RunWarnings::default();
+    let files = collect_run_files(
+        downloads,
+        media,
+        min_age,
+        options.strict,
+        options.show_progress,
+        &mut warnings,
+    )?;
+    let files_seen = files.len();
+
+    let cache_path = cache_path(config)?;
+    let cache = Arc::new(Mutex::new(load_cache(&cache_path)));
+    let inode_hash: Arc<Mutex<HashMap<(u64, u64), String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut groups = group_files_by_size(files);
+    hash_groups_and_update_cache(
+        &mut groups,
+        &cache,
+        &inode_hash,
+        options.strict,
+        options.show_progress,
+        &mut warnings,
+    )?;
+
+    if let Ok(c) = Arc::try_unwrap(cache) {
+        save_cache(&cache_path, &c.into_inner().unwrap())?;
+    }
+
+    let (table, actions, total_saved_space) = plan_actions_and_table(&groups);
+
+    if !options.json_output {
+        println!("\n{} Found duplicates:", "▶".cyan());
+        println!("{}", table);
+        print_run_summary(files_seen, actions.len(), 0, &warnings);
+    }
+    let out_path = resolve_report_path(downloads, &options);
+    let mut report_entries = build_report_entries(&actions);
+    if !options.json_output {
+        if actions.is_empty() {
+            println!("{} No actions needed.", "✔".green());
+        } else {
+            println!(
+                "{} Potential space saved: {}",
+                "💾".cyan(),
+                format_size(total_saved_space)
+            );
+        }
+    }
+
+    let planned_actions = actions.len();
+    let (applied_actions, strict_link_error) = if options.dry_run {
+        (0usize, None)
+    } else {
+        apply_actions(
+            &actions,
+            media,
+            options.strict,
+            options.json_output,
+            &mut warnings,
+            &mut report_entries,
+        )
     };
+
+    if !options.json_output {
+        print_run_summary(files_seen, planned_actions, applied_actions, &warnings);
+    }
+
+    let report = build_run_report(
+        &options,
+        files_seen,
+        planned_actions,
+        applied_actions,
+        total_saved_space,
+        &warnings,
+        report_entries,
+    );
     if let Some(path) = out_path.as_deref() {
         try_write_run_report(path, &report);
     }
