@@ -54,6 +54,41 @@ pub fn cache_path(config: &Config) -> Result<PathBuf> {
     Ok(downloads.join(".dejaview_cache.json"))
 }
 
+pub fn validate_runtime_paths(config: &Config) -> Result<()> {
+    let downloads = config
+        .downloads
+        .as_ref()
+        .ok_or_else(|| anyhow!("downloads path not set"))?;
+    let media = config
+        .media
+        .as_ref()
+        .ok_or_else(|| anyhow!("media path not set"))?;
+
+    if !downloads.exists() {
+        return Err(anyhow!(
+            "downloads path does not exist: {}",
+            downloads.display()
+        ));
+    }
+    if !media.exists() {
+        return Err(anyhow!("media path does not exist: {}", media.display()));
+    }
+    if !downloads.is_dir() {
+        return Err(anyhow!(
+            "downloads path is not a directory: {}",
+            downloads.display()
+        ));
+    }
+    if !media.is_dir() {
+        return Err(anyhow!(
+            "media path is not a directory: {}",
+            media.display()
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +145,42 @@ mod tests {
         let config = Config::default();
         let result = cache_path(&config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_runtime_paths_accepts_existing_directories() {
+        let root = unique_temp_dir("validate_ok");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        fs::create_dir_all(&downloads).expect("create downloads");
+        fs::create_dir_all(&media).expect("create media");
+
+        let config = Config {
+            downloads: Some(downloads),
+            media: Some(media),
+            min_age: None,
+            threads: None,
+        };
+
+        validate_runtime_paths(&config).expect("paths should validate");
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn validate_runtime_paths_rejects_missing_directory() {
+        let root = unique_temp_dir("validate_missing");
+        let downloads = root.join("downloads");
+        fs::create_dir_all(&downloads).expect("create downloads");
+
+        let config = Config {
+            downloads: Some(downloads),
+            media: Some(root.join("missing-media")),
+            min_age: None,
+            threads: None,
+        };
+
+        let result = validate_runtime_paths(&config);
+        assert!(result.is_err());
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 }

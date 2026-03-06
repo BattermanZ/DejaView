@@ -8,7 +8,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::style::Style;
 
-use crate::config::Config;
+use crate::config::{save_config, validate_runtime_paths, Config};
 
 use super::actions;
 use super::events::{self, Event};
@@ -28,8 +28,23 @@ pub enum Overlay {
     None,
     Help,
     JsonPreview(String),
+    ConfigEditor(ConfigEditor),
     ConfirmLink,
     BlockingNotice(String),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ConfigField {
+    Downloads,
+    Media,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfigEditor {
+    pub downloads: String,
+    pub media: String,
+    pub active_field: ConfigField,
+    pub error: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -143,6 +158,13 @@ impl App {
         &self.overlay
     }
 
+    pub fn config_editor(&self) -> Option<&ConfigEditor> {
+        match &self.overlay {
+            Overlay::ConfigEditor(editor) => Some(editor),
+            _ => None,
+        }
+    }
+
     pub fn downloads_label(&self) -> String {
         self.downloads
             .as_ref()
@@ -223,7 +245,7 @@ impl App {
             return Ok(());
         }
 
-        match &mut self.overlay {
+        match &self.overlay {
             Overlay::Help => match code {
                 KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
                     self.overlay = Overlay::None
@@ -236,6 +258,7 @@ impl App {
                 }
                 _ => {}
             },
+            Overlay::ConfigEditor(_) => self.handle_config_editor_key(code)?,
             Overlay::ConfirmLink => match code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.overlay = Overlay::None;
@@ -264,6 +287,7 @@ impl App {
             KeyCode::BackTab => self.focus = prev_focus(self.focus),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Char('e') => self.open_config_editor(),
             KeyCode::Char('S') | KeyCode::Char('s') => self.start_scan_job(),
             KeyCode::Char('L') => self.overlay = Overlay::ConfirmLink,
             KeyCode::Char('l') => {
@@ -282,6 +306,15 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn open_config_editor(&mut self) {
+        self.overlay = Overlay::ConfigEditor(ConfigEditor {
+            downloads: self.downloads_label_or_empty(),
+            media: self.media_label_or_empty(),
+            active_field: ConfigField::Downloads,
+            error: None,
+        });
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -329,6 +362,110 @@ impl App {
             kind: JobKind::Link,
             receiver: rx,
         });
+    }
+
+    fn handle_config_editor_key(&mut self, code: KeyCode) -> Result<()> {
+        match code {
+            KeyCode::Esc => {
+                self.overlay = Overlay::None;
+                self.push_log("Config editor cancelled.".to_string());
+            }
+            KeyCode::Tab | KeyCode::Down => self.cycle_config_field(true),
+            KeyCode::BackTab | KeyCode::Up => self.cycle_config_field(false),
+            KeyCode::Enter => {
+                if matches!(
+                    self.config_editor().map(|e| e.active_field),
+                    Some(ConfigField::Downloads)
+                ) {
+                    self.cycle_config_field(true);
+                } else {
+                    self.save_config_from_editor()?;
+                }
+            }
+            KeyCode::Backspace => self.edit_config_field(|field| {
+                field.pop();
+            }),
+            KeyCode::Char(c) => self.edit_config_field(|field| field.push(c)),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn cycle_config_field(&mut self, forward: bool) {
+        if let Overlay::ConfigEditor(editor) = &mut self.overlay {
+            editor.active_field = match (editor.active_field, forward) {
+                (ConfigField::Downloads, true) => ConfigField::Media,
+                (ConfigField::Media, true) => ConfigField::Downloads,
+                (ConfigField::Downloads, false) => ConfigField::Media,
+                (ConfigField::Media, false) => ConfigField::Downloads,
+            };
+            editor.error = None;
+        }
+    }
+
+    fn edit_config_field<F>(&mut self, mut update: F)
+    where
+        F: FnMut(&mut String),
+    {
+        if let Overlay::ConfigEditor(editor) = &mut self.overlay {
+            let field = match editor.active_field {
+                ConfigField::Downloads => &mut editor.downloads,
+                ConfigField::Media => &mut editor.media,
+            };
+            update(field);
+            editor.error = None;
+        }
+    }
+
+    fn save_config_from_editor(&mut self) -> Result<()> {
+        self.save_config_from_editor_with(save_config)
+    }
+
+    fn save_config_from_editor_with<F>(&mut self, save_fn: F) -> Result<()>
+    where
+        F: FnOnce(&Config) -> Result<()>,
+    {
+        let Some(editor) = self.config_editor().cloned() else {
+            return Ok(());
+        };
+
+        let config = self.config_from_editor(&editor);
+        if let Err(err) = validate_runtime_paths(&config) {
+            if let Overlay::ConfigEditor(current) = &mut self.overlay {
+                current.error = Some(err.to_string());
+            }
+            return Ok(());
+        }
+
+        save_fn(&config)?;
+        self.downloads = config.downloads.clone();
+        self.media = config.media.clone();
+        self.overlay = Overlay::None;
+        self.push_log("Saved TUI path configuration.".to_string());
+        Ok(())
+    }
+
+    fn config_from_editor(&self, editor: &ConfigEditor) -> Config {
+        Config {
+            downloads: Some(PathBuf::from(editor.downloads.trim())),
+            media: Some(PathBuf::from(editor.media.trim())),
+            min_age: self.min_age,
+            threads: self.threads,
+        }
+    }
+
+    fn downloads_label_or_empty(&self) -> String {
+        self.downloads
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    }
+
+    fn media_label_or_empty(&self) -> String {
+        self.media
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
     }
 
     fn request_quit(&mut self) {
@@ -446,6 +583,7 @@ mod tests {
     use super::*;
     use crossterm::event::KeyCode;
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_temp_path(prefix: &str) -> PathBuf {
@@ -611,5 +749,96 @@ mod tests {
 
         assert!(matches!(app.overlay, Overlay::None));
         assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn edit_key_opens_config_editor() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+
+        app.handle_main_key(KeyCode::Char('e'))
+            .expect("key handling should not fail");
+
+        assert!(matches!(app.overlay, Overlay::ConfigEditor(_)));
+    }
+
+    #[test]
+    fn config_editor_updates_active_field_text() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        app.open_config_editor();
+
+        app.handle_key(KeyCode::Char('/'), KeyModifiers::NONE)
+            .expect("key handling should not fail");
+        app.handle_key(KeyCode::Char('t'), KeyModifiers::NONE)
+            .expect("key handling should not fail");
+
+        let editor = app.config_editor().expect("editor should be open");
+        assert_eq!(editor.downloads, "/t");
+        assert_eq!(editor.active_field, ConfigField::Downloads);
+    }
+
+    #[test]
+    fn config_editor_validation_error_stays_in_overlay() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        app.overlay = Overlay::ConfigEditor(ConfigEditor {
+            downloads: "/does/not/exist".to_string(),
+            media: "/also/missing".to_string(),
+            active_field: ConfigField::Media,
+            error: None,
+        });
+
+        app.save_config_from_editor_with(|_| Ok(()))
+            .expect("save flow should not hard fail");
+
+        let editor = app.config_editor().expect("editor should stay open");
+        assert!(editor.error.is_some());
+    }
+
+    #[test]
+    fn config_editor_persists_valid_paths() {
+        let root = unique_temp_path("config_editor_save");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        fs::create_dir_all(&downloads).expect("create downloads");
+        fs::create_dir_all(&media).expect("create media");
+
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        app.overlay = Overlay::ConfigEditor(ConfigEditor {
+            downloads: downloads.display().to_string(),
+            media: media.display().to_string(),
+            active_field: ConfigField::Media,
+            error: None,
+        });
+
+        let saved = Arc::new(Mutex::new(None::<Config>));
+        let saved_clone = Arc::clone(&saved);
+        app.save_config_from_editor_with(|config| {
+            *saved_clone.lock().expect("lock saved config") = Some(Config {
+                downloads: config.downloads.clone(),
+                media: config.media.clone(),
+                min_age: config.min_age,
+                threads: config.threads,
+            });
+            Ok(())
+        })
+        .expect("save should succeed");
+
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(app.downloads, Some(downloads.clone()));
+        assert_eq!(app.media, Some(media.clone()));
+        assert_eq!(
+            saved
+                .lock()
+                .expect("lock saved config")
+                .as_ref()
+                .expect("config was saved")
+                .downloads,
+            Some(downloads)
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }
