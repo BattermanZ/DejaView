@@ -415,6 +415,17 @@ fn write_link_report(path: &Path, report: &LinkReport) -> Result<()> {
     Ok(())
 }
 
+fn try_write_link_report(path: &Path, report: &LinkReport) {
+    if let Err(err) = write_link_report(path, report) {
+        eprintln!(
+            "{} Failed to write link report at {}: {}",
+            "⚠".yellow(),
+            path.display(),
+            err
+        );
+    }
+}
+
 pub fn run_scan(
     config: &Config,
     dry_run: bool,
@@ -596,6 +607,9 @@ pub fn run_scan(
     println!("\n{} Found duplicates:", "▶".cyan());
     println!("{}", table);
     print_run_summary(files_seen, actions.len(), 0, &warnings);
+    let out_path = report_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| downloads.join(".dejaview_link_report.json"));
     let mut report_entries: Vec<LinkReportEntry> = actions
         .iter()
         .map(|action| LinkReportEntry {
@@ -608,14 +622,7 @@ pub fn run_scan(
         })
         .collect();
     if actions.is_empty() {
-        if strict && warning_total(&warnings) > 0 {
-            return Err(anyhow!("strict mode failed due to scan/hash warnings"));
-        }
-        println!("{} No actions needed.", "✔".green());
         if !dry_run {
-            let out_path = report_path
-                .map(PathBuf::from)
-                .unwrap_or_else(|| downloads.join(".dejaview_link_report.json"));
             let report = LinkReport {
                 strict,
                 files_considered: files_seen,
@@ -630,8 +637,12 @@ pub fn run_scan(
                 },
                 entries: Vec::new(),
             };
-            write_link_report(&out_path, &report)?;
+            try_write_link_report(&out_path, &report);
         }
+        if strict && warning_total(&warnings) > 0 {
+            return Err(anyhow!("strict mode failed due to scan/hash warnings"));
+        }
+        println!("{} No actions needed.", "✔".green());
         return Ok(());
     }
 
@@ -689,9 +700,6 @@ pub fn run_scan(
     }
     print_run_summary(files_seen, planned_actions, applied_actions, &warnings);
 
-    let out_path = report_path
-        .map(PathBuf::from)
-        .unwrap_or_else(|| downloads.join(".dejaview_link_report.json"));
     let report = LinkReport {
         strict,
         files_considered: files_seen,
@@ -706,7 +714,7 @@ pub fn run_scan(
         },
         entries: report_entries,
     };
-    write_link_report(&out_path, &report)?;
+    try_write_link_report(&out_path, &report);
 
     if let Some(err) = strict_link_error {
         return Err(err);
@@ -1068,6 +1076,43 @@ mod tests {
             "applied"
         );
 
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn run_scan_report_write_failure_is_non_fatal() {
+        if running_as_root() {
+            return;
+        }
+        let root = unique_temp_dir("report_write_failure");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        let report_dir = root.join("readonly_report");
+        let report_path = report_dir.join("report.json");
+        let src = downloads.join("movie.mkv");
+        let tgt = media.join("movie.mkv");
+        write_file(&src, b"same-content");
+        write_file(&tgt, b"same-content");
+        fs::create_dir_all(&report_dir).expect("create report dir");
+        let mut perms = fs::metadata(&report_dir)
+            .expect("report dir metadata")
+            .permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&report_dir, perms).expect("make report dir readonly");
+        let config = make_config(&downloads, &media, 0);
+
+        let result = run_scan(&config, false, false, Some(&report_path));
+        assert!(result.is_ok());
+        let src_meta = fs::metadata(&src).expect("src metadata");
+        let tgt_meta = fs::metadata(&tgt).expect("tgt metadata");
+        assert_eq!(src_meta.ino(), tgt_meta.ino());
+        assert_eq!(src_meta.dev(), tgt_meta.dev());
+
+        let mut reset = fs::metadata(&report_dir)
+            .expect("report dir metadata")
+            .permissions();
+        reset.set_mode(0o755);
+        fs::set_permissions(&report_dir, reset).expect("reset perms");
         fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
