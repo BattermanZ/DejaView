@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -28,6 +30,17 @@ pub enum Overlay {
     JsonPreview(String),
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum JobKind {
+    Scan,
+    Link,
+}
+
+struct RunningJob {
+    kind: JobKind,
+    receiver: Receiver<Result<RunReport>>,
+}
+
 pub struct App {
     pub strict: bool,
     pub focus: FocusPane,
@@ -39,6 +52,7 @@ pub struct App {
     media: Option<PathBuf>,
     min_age: Option<u64>,
     threads: Option<usize>,
+    running_job: Option<RunningJob>,
     should_quit: bool,
 }
 
@@ -57,6 +71,7 @@ impl App {
             media: config.media.clone(),
             min_age: config.min_age,
             threads: config.threads,
+            running_job: None,
             should_quit: false,
         }
     }
@@ -72,7 +87,7 @@ impl App {
     pub fn step(&mut self) -> Result<()> {
         let event = events::next_event(self.tick_rate())?;
         match event {
-            Event::Tick => {}
+            Event::Tick => self.poll_running_job(),
             Event::Key(key) => {
                 if key.kind == KeyEventKind::Press {
                     self.handle_key(key.code, key.modifiers)?;
@@ -83,6 +98,12 @@ impl App {
     }
 
     pub fn mode_label(&self) -> &str {
+        if let Some(job) = &self.running_job {
+            return match job.kind {
+                JobKind::Scan => "Scanning",
+                JobKind::Link => "Linking",
+            };
+        }
         match &self.report {
             Some(report) if report.mode == "link" => "Link",
             Some(_) => "Scan",
@@ -224,10 +245,18 @@ impl App {
             KeyCode::BackTab => self.focus = prev_focus(self.focus),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::Char('S') | KeyCode::Char('s') => self.run_scan()?,
-            KeyCode::Char('L') | KeyCode::Char('l') => self.run_link()?,
-            KeyCode::Char('R') | KeyCode::Char('r') => self.save_report()?,
-            KeyCode::Char('J') => self.open_json_overlay()?,
+            KeyCode::Char('S') | KeyCode::Char('s') => self.start_scan_job(),
+            KeyCode::Char('L') | KeyCode::Char('l') => self.start_link_job(),
+            KeyCode::Char('R') | KeyCode::Char('r') => {
+                if let Err(err) = self.save_report() {
+                    self.push_log(format!("Save report failed: {err}"));
+                }
+            }
+            KeyCode::Char('J') => {
+                if let Err(err) = self.open_json_overlay() {
+                    self.push_log(format!("Open JSON preview failed: {err}"));
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -246,36 +275,78 @@ impl App {
         self.selected_row = next as usize;
     }
 
-    fn run_scan(&mut self) -> Result<()> {
-        self.push_log("Running scan...".to_string());
-        match actions::run_scan(self.strict) {
-            Ok(report) => {
-                let planned = report.planned_actions;
-                self.selected_row = 0;
-                self.report = Some(report);
-                self.push_log(format!("Scan finished. Planned actions: {planned}"));
-                Ok(())
-            }
-            Err(err) => {
-                self.push_log(format!("Scan failed: {err}"));
-                Ok(())
-            }
+    fn start_scan_job(&mut self) {
+        if self.running_job.is_some() {
+            self.push_log("A run is already in progress.".to_string());
+            return;
         }
+        self.push_log("Running scan...".to_string());
+        let strict = self.strict;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(actions::run_scan(strict));
+        });
+        self.running_job = Some(RunningJob {
+            kind: JobKind::Scan,
+            receiver: rx,
+        });
     }
 
-    fn run_link(&mut self) -> Result<()> {
+    fn start_link_job(&mut self) {
+        if self.running_job.is_some() {
+            self.push_log("A run is already in progress.".to_string());
+            return;
+        }
         self.push_log("Running link...".to_string());
-        match actions::run_link(self.strict) {
-            Ok(report) => {
-                let applied = report.applied_actions;
-                self.selected_row = 0;
-                self.report = Some(report);
-                self.push_log(format!("Link finished. Applied actions: {applied}"));
-                Ok(())
+        let strict = self.strict;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(actions::run_link(strict));
+        });
+        self.running_job = Some(RunningJob {
+            kind: JobKind::Link,
+            receiver: rx,
+        });
+    }
+
+    fn poll_running_job(&mut self) {
+        let completion = if let Some(job) = self.running_job.as_mut() {
+            match job.receiver.try_recv() {
+                Ok(result) => Some((job.kind, result)),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some((
+                    job.kind,
+                    Err(anyhow::anyhow!("worker thread disconnected unexpectedly")),
+                )),
             }
-            Err(err) => {
-                self.push_log(format!("Link failed: {err}"));
-                Ok(())
+        } else {
+            None
+        };
+
+        if let Some((kind, result)) = completion {
+            self.running_job = None;
+            match result {
+                Ok(report) => {
+                    let planned = report.planned_actions;
+                    let applied = report.applied_actions;
+                    self.selected_row = 0;
+                    self.report = Some(report);
+                    match kind {
+                        JobKind::Scan => {
+                            self.push_log(format!("Scan finished. Planned actions: {planned}"))
+                        }
+                        JobKind::Link => {
+                            self.push_log(format!("Link finished. Applied actions: {applied}"))
+                        }
+                    }
+                }
+                Err(err) => {
+                    let label = match kind {
+                        JobKind::Scan => "Scan",
+                        JobKind::Link => "Link",
+                    };
+                    self.push_log(format!("{label} failed: {err}"));
+                }
             }
         }
     }
@@ -336,7 +407,44 @@ fn prev_focus(pane: FocusPane) -> FocusPane {
 
 #[cfg(test)]
 mod tests {
+    use super::super::model::{RunReport, WarningSummary};
     use super::*;
+    use crossterm::event::KeyCode;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_path(prefix: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "dejaview_tui_{prefix}_{}_{}",
+            std::process::id(),
+            ts
+        ))
+    }
+
+    fn sample_report() -> RunReport {
+        RunReport {
+            mode: "scan".to_string(),
+            dry_run: true,
+            strict: false,
+            files_considered: 2,
+            planned_actions: 1,
+            applied_actions: 0,
+            total_saved_bytes: 1024,
+            skipped_by_min_age: 0,
+            warnings: WarningSummary {
+                walk_errors: 0,
+                metadata_errors: 0,
+                sample_hash_errors: 0,
+                full_hash_errors: 0,
+                link_errors: 0,
+            },
+            entries: vec![],
+        }
+    }
 
     #[test]
     fn focus_cycles_forward() {
@@ -350,5 +458,64 @@ mod tests {
     fn focus_cycles_backward() {
         assert_eq!(prev_focus(FocusPane::Left), FocusPane::Bottom);
         assert_eq!(prev_focus(FocusPane::Bottom), FocusPane::Right);
+    }
+
+    #[test]
+    fn save_report_error_does_not_abort_ui() {
+        let temp_file = unique_temp_path("report_parent_file");
+        fs::write(&temp_file, b"not a directory").expect("create temp file");
+
+        let config = Config {
+            downloads: Some(temp_file.clone()),
+            ..Config::default()
+        };
+        let mut app = App::new(&config, false);
+        app.report = Some(sample_report());
+
+        app.handle_main_key(KeyCode::Char('r'))
+            .expect("key handling should not fail");
+        assert!(!app.should_quit());
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.starts_with("Save report failed:")));
+
+        fs::remove_file(temp_file).expect("cleanup temp file");
+    }
+
+    #[test]
+    fn prevents_parallel_runs_when_job_already_active() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+
+        let (_tx, rx) = mpsc::channel();
+        app.running_job = Some(RunningJob {
+            kind: JobKind::Scan,
+            receiver: rx,
+        });
+
+        app.start_link_job();
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "A run is already in progress."));
+    }
+
+    #[test]
+    fn poll_running_job_applies_result() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+
+        let (tx, rx) = mpsc::channel();
+        app.running_job = Some(RunningJob {
+            kind: JobKind::Scan,
+            receiver: rx,
+        });
+        tx.send(Ok(sample_report())).expect("send result");
+
+        app.poll_running_job();
+        assert!(app.running_job.is_none());
+        assert_eq!(app.files_considered(), 2);
+        assert!(app.logs.iter().any(|line| line.contains("Scan finished")));
     }
 }
