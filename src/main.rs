@@ -18,9 +18,17 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Scan for duplicates (dry run)
-    Scan,
+    Scan {
+        /// Fail if any scan/hash/link errors occur
+        #[arg(long)]
+        strict: bool,
+    },
     /// Replace duplicates with symlinks
-    Link,
+    Link {
+        /// Fail if any scan/hash/link errors occur
+        #[arg(long)]
+        strict: bool,
+    },
     /// Manage the configuration
     Config(ConfigArgs),
     /// Manage the cache
@@ -68,8 +76,8 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Scan => engine::run_scan(&config, true)?,
-        Commands::Link => engine::run_scan(&config, false)?,
+        Commands::Scan { strict } => engine::run_scan(&config, true, strict)?,
+        Commands::Link { strict } => engine::run_scan(&config, false, strict)?,
         Commands::Config(args) => match args.command {
             ConfigCommands::SetDownloads { path } => {
                 config.downloads = Some(path);
@@ -99,4 +107,49 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_scan_command() {
+        let cli = Cli::try_parse_from(["dejaview", "scan", "--strict"]).expect("parse scan");
+        match cli.command {
+            Commands::Scan { strict } => assert!(strict),
+            _ => panic!("expected scan command"),
+        }
+    }
+
+    #[test]
+    fn parses_link_command() {
+        let cli = Cli::try_parse_from(["dejaview", "link"]).expect("parse link");
+        match cli.command {
+            Commands::Link { strict } => assert!(!strict),
+            _ => panic!("expected link command"),
+        }
+    }
+
+    #[test]
+    fn parses_config_show_command() {
+        let cli = Cli::try_parse_from(["dejaview", "config", "show"]).expect("parse config show");
+        match cli.command {
+            Commands::Config(ConfigArgs {
+                command: ConfigCommands::Show,
+            }) => {}
+            _ => panic!("expected config show command"),
+        }
+    }
+
+    #[test]
+    fn parses_cache_info_command() {
+        let cli = Cli::try_parse_from(["dejaview", "cache", "info"]).expect("parse cache info");
+        match cli.command {
+            Commands::Cache(CacheArgs {
+                command: CacheCommands::Info,
+            }) => {}
+            _ => panic!("expected cache info command"),
+        }
+    }
 }
