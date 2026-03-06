@@ -13,6 +13,7 @@
 *   **Concurrency**: Utilises Rayon to parallelise hashing across multiple CPU cores.
 *   **Progress UI**: Combines `indicatif` spinners and bars for a responsive terminal experience.
 *   **Table output**: Renders a dynamic, wrapped table of planned replacements using `comfy_table` and ANSI colours.
+*   **Interactive TUI mode**: Keyboard-first dashboard powered by `ratatui` for scan/review/link workflows.
 *   **Space saved calculation**: Reports the total disk space that would be saved by linking duplicates.
 
 ---
@@ -115,6 +116,30 @@ DejaView uses a cache to speed up subsequent runs. You can manage it with these 
     cargo run -- cache info
     ```
 
+### 5. Interactive TUI
+
+Launch the terminal dashboard:
+
+```bash
+cargo run -- tui
+```
+
+Use strict mode for in-TUI scan/link actions:
+
+```bash
+cargo run -- tui --strict
+```
+
+Default keybinds:
+*   `S`: run scan
+*   `L`: run link
+*   `j` / `k` or arrows: move result selection
+*   `tab`: cycle focused pane
+*   `R`: save current report JSON
+*   `J`: open report JSON overlay
+*   `?`: help
+*   `q`: quit
+
 ---
 
 ## Output and Progress Modes
@@ -141,7 +166,7 @@ When `--json` is enabled, progress UI is automatically disabled so stdout remain
     *   **Phase 2 (Full Hash):** Only if multiple files share the same sample hash, a full BLAKE3 digest is computed for each of them to confirm true duplication. This significantly reduces the number of full file reads.
 4.  **Cache update**: Writes updated `(path, size, mtime, hash)` entries to `.dejaview_cache.json` in the download root.
 5.  **Duplicate resolution**: Builds a table of `(download path, media path)` pairs for identical files.
-6.  **Symlink replacement**: (Only for `link` command) Deletes download copies and creates relative symlinks to the media library.
+6.  **Link replacement**: (Only for `link` command) Replaces download duplicates with hardlinks when possible, and falls back to relative symlinks when required.
 
 ---
 

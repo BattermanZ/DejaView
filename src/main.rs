@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 mod config;
 mod engine;
+mod tui;
 
 use config::{load_config, save_config};
 use std::fs;
@@ -42,6 +43,12 @@ enum Commands {
     Config(ConfigArgs),
     /// Manage the cache
     Cache(CacheArgs),
+    /// Open interactive terminal UI
+    Tui {
+        /// Use strict mode for scan/link actions triggered from the TUI
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -205,6 +212,9 @@ fn main() -> Result<()> {
                 println!("Cached entries: {}", entries);
             }
         },
+        Commands::Tui { strict } => {
+            tui::run(&config, strict)?;
+        }
     }
 
     Ok(())
@@ -404,6 +414,15 @@ mod tests {
                 command: CacheCommands::Info,
             }) => {}
             _ => panic!("expected cache info command"),
+        }
+    }
+
+    #[test]
+    fn parses_tui_command() {
+        let cli = Cli::try_parse_from(["dejaview", "tui", "--strict"]).expect("parse tui");
+        match cli.command {
+            Commands::Tui { strict } => assert!(strict),
+            _ => panic!("expected tui command"),
         }
     }
 }
