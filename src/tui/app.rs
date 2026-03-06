@@ -6,14 +6,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::style::Style;
 
 use crate::config::{load_config, save_config, validate_runtime_paths, Config};
 
 use super::actions;
 use super::events::{self, Event};
 use super::model::{LinkReportEntry, RunReport};
-use super::theme::Theme;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FocusPane {
@@ -229,14 +227,6 @@ impl App {
 
     pub fn log_lines(&self) -> Vec<String> {
         self.logs.iter().cloned().collect()
-    }
-
-    pub fn focus_style(&self, pane: FocusPane) -> Style {
-        if self.focus == pane {
-            Theme::accent()
-        } else {
-            Theme::base()
-        }
     }
 
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<()> {
