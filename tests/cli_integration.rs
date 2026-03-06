@@ -188,3 +188,114 @@ fn link_command_prefers_hardlink_and_writes_report() {
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+#[test]
+fn scan_json_writes_machine_readable_stdout_and_report() {
+    let root = unique_temp_dir("scan_json_report");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    fs::create_dir_all(&downloads).expect("create downloads");
+    fs::create_dir_all(&media).expect("create media");
+
+    let src = downloads.join("movie.mkv");
+    let tgt = media.join("movie.mkv");
+    fs::write(&src, b"same-content").expect("write src");
+    fs::write(&tgt, b"same-content").expect("write tgt");
+
+    run_ok(
+        &root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        &root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+    set_min_age_zero(&root);
+
+    let report = root.join("scan_report.json");
+    let out = run_cmd(
+        &root,
+        &[
+            "scan",
+            "--json",
+            "--no-progress",
+            "--report",
+            report.to_str().expect("report path str"),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout_json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("parse scan stdout json");
+    assert_eq!(stdout_json["mode"], "scan");
+    assert_eq!(stdout_json["dry_run"], true);
+    assert_eq!(stdout_json["planned_actions"], 1);
+    assert_eq!(stdout_json["applied_actions"], 0);
+    assert!(stdout_json["entries"].is_array());
+
+    let report_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report).expect("read report"))
+            .expect("parse report json");
+    assert_eq!(report_json["mode"], "scan");
+    assert_eq!(report_json["planned_actions"], 1);
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn link_json_reports_applied_actions() {
+    let root = unique_temp_dir("link_json");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    fs::create_dir_all(&downloads).expect("create downloads");
+    fs::create_dir_all(&media).expect("create media");
+
+    let src = downloads.join("movie.mkv");
+    let tgt = media.join("movie.mkv");
+    fs::write(&src, b"same-content").expect("write src");
+    fs::write(&tgt, b"same-content").expect("write tgt");
+
+    run_ok(
+        &root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        &root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+    set_min_age_zero(&root);
+
+    let out = run_cmd(&root, &["link", "--json", "--no-progress"]);
+    assert!(
+        out.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout_json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("parse link stdout json");
+    assert_eq!(stdout_json["mode"], "link");
+    assert_eq!(stdout_json["dry_run"], false);
+    assert_eq!(stdout_json["planned_actions"], 1);
+    assert_eq!(stdout_json["applied_actions"], 1);
+    assert!(
+        stdout_json["entries"][0]["method"] == "hardlink"
+            || stdout_json["entries"][0]["method"] == "symlink"
+    );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}

@@ -75,13 +75,24 @@ struct LinkReportEntry {
 }
 
 #[derive(Serialize)]
-struct LinkReport {
+struct RunReport {
+    mode: String,
+    dry_run: bool,
     strict: bool,
     files_considered: usize,
     planned_actions: usize,
     applied_actions: usize,
+    total_saved_bytes: u64,
     warnings: WarningSummary,
     entries: Vec<LinkReportEntry>,
+}
+
+pub struct ScanRunOptions<'a> {
+    pub dry_run: bool,
+    pub strict: bool,
+    pub report_path: Option<&'a Path>,
+    pub json_output: bool,
+    pub show_progress: bool,
 }
 
 fn is_regular(entry: &DirEntry) -> bool {
@@ -412,7 +423,7 @@ fn warning_total(warnings: &RunWarnings) -> u64 {
         + warnings.link_errors
 }
 
-fn write_link_report(path: &Path, report: &LinkReport) -> Result<()> {
+fn write_run_report(path: &Path, report: &RunReport) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -421,8 +432,8 @@ fn write_link_report(path: &Path, report: &LinkReport) -> Result<()> {
     Ok(())
 }
 
-fn try_write_link_report(path: &Path, report: &LinkReport) {
-    if let Err(err) = write_link_report(path, report) {
+fn try_write_run_report(path: &Path, report: &RunReport) {
+    if let Err(err) = write_run_report(path, report) {
         eprintln!(
             "{} Failed to write link report at {}: {}",
             "⚠".yellow(),
@@ -432,12 +443,7 @@ fn try_write_link_report(path: &Path, report: &LinkReport) {
     }
 }
 
-pub fn run_scan(
-    config: &Config,
-    dry_run: bool,
-    strict: bool,
-    report_path: Option<&Path>,
-) -> Result<()> {
+pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     let downloads = config
         .downloads
         .as_ref()
@@ -448,30 +454,37 @@ pub fn run_scan(
         .ok_or_else(|| anyhow!("Media path not set"))?;
     let min_age = Duration::from_secs(config.min_age.unwrap_or(300));
 
-    let mp = MultiProgress::new();
-    let spinner = mp.add(ProgressBar::new_spinner());
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner} {msg}")
-            .unwrap(),
-    );
-    spinner.enable_steady_tick(Duration::from_millis(120));
-    spinner.set_message("Collecting files…".cyan().bold().to_string());
+    let spinner = if options.show_progress {
+        let mp = MultiProgress::new();
+        let spinner = mp.add(ProgressBar::new_spinner());
+        spinner.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner} {msg}")
+                .unwrap(),
+        );
+        spinner.enable_steady_tick(Duration::from_millis(120));
+        spinner.set_message("Collecting files…".cyan().bold().to_string());
+        Some(spinner)
+    } else {
+        None
+    };
 
     let mut warnings = RunWarnings::default();
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
 
-    let mut files = collect_files(downloads, true, min_age, strict, &mut warnings)?;
+    let mut files = collect_files(downloads, true, min_age, options.strict, &mut warnings)?;
     for f in &files {
         seen.insert((f.dev, f.inode));
     }
 
-    let mut media_files = collect_files(media, false, min_age, strict, &mut warnings)?;
+    let mut media_files = collect_files(media, false, min_age, options.strict, &mut warnings)?;
     media_files.retain(|f| !seen.contains(&(f.dev, f.inode)));
     files.extend(media_files);
     let files_seen = files.len();
 
-    spinner.finish_with_message("File list complete ✔".green().bold().to_string());
+    if let Some(spinner) = spinner {
+        spinner.finish_with_message("File list complete ✔".green().bold().to_string());
+    }
 
     let cache_path = cache_path(config)?;
     let cache = Arc::new(Mutex::new(load_cache(&cache_path)));
@@ -483,12 +496,17 @@ pub fn run_scan(
     }
 
     let mut groups: Vec<Vec<FileInfo>> = size_map.into_values().filter(|v| v.len() > 1).collect();
-    let bar = mp.add(ProgressBar::new(groups.len() as u64));
-    bar.set_style(
-        ProgressStyle::with_template("{msg} {pos}/{len} [{wide_bar:.cyan/blue}] {elapsed}")
-            .unwrap(),
-    );
-    bar.set_message("Hashing groups".bold().to_string());
+    let bar = if options.show_progress {
+        let bar = ProgressBar::new(groups.len() as u64);
+        bar.set_style(
+            ProgressStyle::with_template("{msg} {pos}/{len} [{wide_bar:.cyan/blue}] {elapsed}")
+                .unwrap(),
+        );
+        bar.set_message("Hashing groups".bold().to_string());
+        Some(bar)
+    } else {
+        None
+    };
 
     let sample_hash_errors = Arc::new(AtomicU64::new(0));
     let full_hash_errors = Arc::new(AtomicU64::new(0));
@@ -504,7 +522,7 @@ pub fn run_scan(
                 }
                 Err(err) => {
                     sample_counter.fetch_add(1, Ordering::Relaxed);
-                    if strict {
+                    if options.strict {
                         return Err(anyhow!(
                             "sample hash error for {}: {}",
                             fi.path.display(),
@@ -552,7 +570,7 @@ pub fn run_scan(
                     }
                     Err(err) => {
                         full_counter.fetch_add(1, Ordering::Relaxed);
-                        if strict {
+                        if options.strict {
                             return Err(anyhow!(
                                 "full hash error for {}: {}",
                                 fi.path.display(),
@@ -563,12 +581,16 @@ pub fn run_scan(
                 }
             }
         }
-        bar_for_threads.inc(1);
+        if let Some(bar) = &bar_for_threads {
+            bar.inc(1);
+        }
         Ok(())
     })?;
     warnings.sample_hash_errors += sample_hash_errors.load(Ordering::Relaxed);
     warnings.full_hash_errors += full_hash_errors.load(Ordering::Relaxed);
-    bar.finish_with_message("Hashing complete ✔".green().bold().to_string());
+    if let Some(bar) = bar {
+        bar.finish_with_message("Hashing complete ✔".green().bold().to_string());
+    }
 
     if let Ok(c) = Arc::try_unwrap(cache) {
         save_cache(&cache_path, &c.into_inner().unwrap())?;
@@ -605,12 +627,18 @@ pub fn run_scan(
         }
     }
 
-    println!("\n{} Found duplicates:", "▶".cyan());
-    println!("{}", table);
-    print_run_summary(files_seen, actions.len(), 0, &warnings);
-    let out_path = report_path
-        .map(PathBuf::from)
-        .unwrap_or_else(|| downloads.join(".dejaview_link_report.json"));
+    if !options.json_output {
+        println!("\n{} Found duplicates:", "▶".cyan());
+        println!("{}", table);
+        print_run_summary(files_seen, actions.len(), 0, &warnings);
+    }
+    let out_path = options.report_path.map(PathBuf::from).or_else(|| {
+        if options.dry_run {
+            None
+        } else {
+            Some(downloads.join(".dejaview_link_report.json"))
+        }
+    });
     let mut report_entries: Vec<LinkReportEntry> = actions
         .iter()
         .map(|action| LinkReportEntry {
@@ -622,90 +650,78 @@ pub fn run_scan(
             error: None,
         })
         .collect();
-    if actions.is_empty() {
-        if !dry_run {
-            let report = LinkReport {
-                strict,
-                files_considered: files_seen,
-                planned_actions: 0,
-                applied_actions: 0,
-                warnings: WarningSummary {
-                    walk_errors: warnings.walk_errors,
-                    metadata_errors: warnings.metadata_errors,
-                    sample_hash_errors: warnings.sample_hash_errors,
-                    full_hash_errors: warnings.full_hash_errors,
-                    link_errors: warnings.link_errors,
-                },
-                entries: Vec::new(),
-            };
-            try_write_link_report(&out_path, &report);
+    if !options.json_output {
+        if actions.is_empty() {
+            println!("{} No actions needed.", "✔".green());
+        } else {
+            println!(
+                "{} Potential space saved: {}",
+                "💾".cyan(),
+                format_size(total_saved_space)
+            );
         }
-        if strict && warning_total(&warnings) > 0 {
-            return Err(anyhow!("strict mode failed due to scan/hash warnings"));
-        }
-        println!("{} No actions needed.", "✔".green());
-        return Ok(());
     }
 
-    println!(
-        "{} Potential space saved: {}",
-        "💾".cyan(),
-        format_size(total_saved_space)
-    );
-
-    if dry_run {
-        println!("{} Dry-run; no changes.", "ℹ".yellow());
-        if strict && warning_total(&warnings) > 0 {
-            return Err(anyhow!("strict mode failed due to scan/hash warnings"));
-        }
-        return Ok(());
-    }
-
-    println!("{} Applying…", "▶".cyan());
     let mut applied_actions = 0usize;
     let planned_actions = actions.len();
     let mut strict_link_error: Option<anyhow::Error> = None;
-    for (index, action) in actions.into_iter().enumerate() {
-        let apply_result = (|| -> Result<()> {
-            ensure_target_within_media_root(media, &action.tgt)?;
-            let (method, fallback_reason) = replace_file_with_best_link(&action.src, &action.tgt)?;
-            report_entries[index].method = Some(method);
-            report_entries[index].fallback_reason = fallback_reason;
-            report_entries[index].status = "applied".to_string();
-            Ok(())
-        })();
-        if let Err(err) = apply_result {
-            warnings.link_errors += 1;
-            report_entries[index].status = "failed".to_string();
-            report_entries[index].error = Some(err.to_string());
-            if strict {
-                strict_link_error = Some(anyhow!(
-                    "strict mode link failure for {} -> {}: {}",
-                    action.src.display(),
-                    action.tgt.display(),
-                    err
-                ));
-                break;
-            } else {
-                eprintln!(
-                    "{} Failed to apply {} -> {}: {}",
-                    "⚠".yellow(),
-                    action.src.display(),
-                    action.tgt.display(),
-                    err
-                );
-                continue;
-            }
+    if !options.dry_run && !actions.is_empty() {
+        if !options.json_output {
+            println!("{} Applying…", "▶".cyan());
         }
-        applied_actions += 1;
+        for (index, action) in actions.into_iter().enumerate() {
+            let apply_result = (|| -> Result<()> {
+                ensure_target_within_media_root(media, &action.tgt)?;
+                let (method, fallback_reason) =
+                    replace_file_with_best_link(&action.src, &action.tgt)?;
+                report_entries[index].method = Some(method);
+                report_entries[index].fallback_reason = fallback_reason;
+                report_entries[index].status = "applied".to_string();
+                Ok(())
+            })();
+            if let Err(err) = apply_result {
+                warnings.link_errors += 1;
+                report_entries[index].status = "failed".to_string();
+                report_entries[index].error = Some(err.to_string());
+                if options.strict {
+                    strict_link_error = Some(anyhow!(
+                        "strict mode link failure for {} -> {}: {}",
+                        action.src.display(),
+                        action.tgt.display(),
+                        err
+                    ));
+                    break;
+                } else {
+                    eprintln!(
+                        "{} Failed to apply {} -> {}: {}",
+                        "⚠".yellow(),
+                        action.src.display(),
+                        action.tgt.display(),
+                        err
+                    );
+                    continue;
+                }
+            }
+            applied_actions += 1;
+        }
     }
-    print_run_summary(files_seen, planned_actions, applied_actions, &warnings);
 
-    let report = LinkReport {
-        strict,
+    if !options.json_output {
+        print_run_summary(files_seen, planned_actions, applied_actions, &warnings);
+    }
+
+    let report = RunReport {
+        mode: if options.dry_run {
+            "scan".to_string()
+        } else {
+            "link".to_string()
+        },
+        dry_run: options.dry_run,
+        strict: options.strict,
         files_considered: files_seen,
         planned_actions,
         applied_actions,
+        total_saved_bytes: total_saved_space,
         warnings: WarningSummary {
             walk_errors: warnings.walk_errors,
             metadata_errors: warnings.metadata_errors,
@@ -715,12 +731,25 @@ pub fn run_scan(
         },
         entries: report_entries,
     };
-    try_write_link_report(&out_path, &report);
+    if let Some(path) = out_path.as_deref() {
+        try_write_run_report(path, &report);
+    }
+    if options.json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if options.dry_run {
+        println!("{} Dry-run; no changes.", "ℹ".yellow());
+    }
+
+    if options.strict && warning_total(&warnings) > 0 {
+        return Err(anyhow!("strict mode failed due to scan/hash warnings"));
+    }
 
     if let Some(err) = strict_link_error {
         return Err(err);
     }
-    println!("{} Done.", "✔".green());
+    if !options.json_output {
+        println!("{} Done.", "✔".green());
+    }
     Ok(())
 }
 
@@ -751,6 +780,20 @@ mod tests {
     fn write_file(path: &Path, content: &[u8]) {
         fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
         fs::write(path, content).expect("write file");
+    }
+
+    fn run_scan(config: &Config, dry_run: bool, strict: bool, report_path: Option<&Path>) {
+        run_scan_with_options(
+            config,
+            ScanRunOptions {
+                dry_run,
+                strict,
+                report_path,
+                json_output: false,
+                show_progress: false,
+            },
+        )
+        .expect("run scan");
     }
 
     fn running_as_root() -> bool {
@@ -1004,7 +1047,7 @@ mod tests {
         write_file(&tgt, b"same-content");
         let config = make_config(&downloads, &media, 0);
 
-        run_scan(&config, true, false, None).expect("dry run scan");
+        run_scan(&config, true, false, None);
 
         let meta = fs::symlink_metadata(&src).expect("source metadata");
         assert!(meta.file_type().is_file());
@@ -1022,7 +1065,7 @@ mod tests {
         write_file(&tgt, b"same-content");
         let config = make_config(&downloads, &media, 0);
 
-        run_scan(&config, false, false, None).expect("apply scan");
+        run_scan(&config, false, false, None);
 
         let src_meta = fs::metadata(&src).expect("source metadata");
         let tgt_meta = fs::metadata(&tgt).expect("target metadata");
@@ -1047,7 +1090,7 @@ mod tests {
         write_file(&tgt, b"same-content");
         let config = make_config(&downloads, &media, 0);
 
-        run_scan(&config, false, false, Some(&report)).expect("apply scan");
+        run_scan(&config, false, false, Some(&report));
 
         let report_json = fs::read_to_string(&report).expect("read report");
         let report_value: serde_json::Value =
@@ -1102,8 +1145,7 @@ mod tests {
         fs::set_permissions(&report_dir, perms).expect("make report dir readonly");
         let config = make_config(&downloads, &media, 0);
 
-        let result = run_scan(&config, false, false, Some(&report_path));
-        assert!(result.is_ok());
+        run_scan(&config, false, false, Some(&report_path));
         let src_meta = fs::metadata(&src).expect("src metadata");
         let tgt_meta = fs::metadata(&tgt).expect("tgt metadata");
         assert_eq!(src_meta.ino(), tgt_meta.ino());
@@ -1128,7 +1170,7 @@ mod tests {
         write_file(&tgt, b"same-content");
         let config = make_config(&downloads, &media, 3600);
 
-        run_scan(&config, false, false, None).expect("apply scan");
+        run_scan(&config, false, false, None);
 
         let meta = fs::symlink_metadata(&src).expect("source metadata");
         assert!(meta.file_type().is_file());
@@ -1152,9 +1194,27 @@ mod tests {
         fs::set_permissions(&src, perms).expect("make unreadable");
         let config = make_config(&downloads, &media, 0);
 
-        let strict_result = run_scan(&config, true, true, None);
+        let strict_result = run_scan_with_options(
+            &config,
+            ScanRunOptions {
+                dry_run: true,
+                strict: true,
+                report_path: None,
+                json_output: false,
+                show_progress: false,
+            },
+        );
         assert!(strict_result.is_err());
-        let non_strict_result = run_scan(&config, true, false, None);
+        let non_strict_result = run_scan_with_options(
+            &config,
+            ScanRunOptions {
+                dry_run: true,
+                strict: false,
+                report_path: None,
+                json_output: false,
+                show_progress: false,
+            },
+        );
         assert!(non_strict_result.is_ok());
 
         let mut reset = fs::metadata(&src).expect("src metadata").permissions();
@@ -1183,7 +1243,16 @@ mod tests {
         fs::set_permissions(&src_dir, dir_perms).expect("make dir readonly");
         let config = make_config(&downloads, &media, 0);
 
-        let result = run_scan(&config, false, false, None);
+        let result = run_scan_with_options(
+            &config,
+            ScanRunOptions {
+                dry_run: false,
+                strict: false,
+                report_path: None,
+                json_output: false,
+                show_progress: false,
+            },
+        );
         assert!(result.is_ok());
         let meta = fs::symlink_metadata(&src).expect("source metadata");
         assert!(meta.file_type().is_file());
@@ -1216,7 +1285,16 @@ mod tests {
         fs::set_permissions(&src_dir, dir_perms).expect("make dir readonly");
         let config = make_config(&downloads, &media, 0);
 
-        let result = run_scan(&config, false, true, None);
+        let result = run_scan_with_options(
+            &config,
+            ScanRunOptions {
+                dry_run: false,
+                strict: true,
+                report_path: None,
+                json_output: false,
+                show_progress: false,
+            },
+        );
         assert!(result.is_err());
 
         let mut reset = fs::metadata(&src_dir)
@@ -1238,13 +1316,13 @@ mod tests {
         write_file(&tgt, b"same-content");
         let config = make_config(&downloads, &media, 0);
 
-        run_scan(&config, true, false, None).expect("first dry run");
+        run_scan(&config, true, false, None);
         let cache_file = downloads.join(".dejaview_cache.json");
         assert!(cache_file.exists());
         let first_cache = load_cache(&cache_file);
         assert!(!first_cache.is_empty());
 
-        run_scan(&config, true, false, None).expect("second dry run");
+        run_scan(&config, true, false, None);
         let second_cache = load_cache(&cache_file);
         assert_eq!(second_cache.len(), first_cache.len());
 

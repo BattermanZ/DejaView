@@ -60,12 +60,24 @@ This command will scan your configured directories for duplicates and report the
 cargo run -- scan
 ```
 
+Machine-readable scan output for automation:
+
+```bash
+cargo run -- scan --json --no-progress --report /tmp/dejaview-scan.json
+```
+
 ### 3. Linking Duplicates
 
 This command will perform the actual file operations: deleting duplicates in your downloads folder and replacing them with symbolic links to the media folder.
 
 ```bash
 cargo run -- link
+```
+
+Machine-readable link output for automation:
+
+```bash
+cargo run -- link --json --no-progress --report /tmp/dejaview-link.json
 ```
 
 ### 4. Cache Management
@@ -81,6 +93,19 @@ DejaView uses a cache to speed up subsequent runs. You can manage it with these 
     ```bash
     cargo run -- cache info
     ```
+
+---
+
+## Output and Progress Modes
+
+`scan` and `link` support the same output controls:
+
+*   `--json`: print a machine-readable JSON run summary to stdout.
+*   `--report <path>`: write the same run summary JSON to a file.
+*   `--progress <auto|on|off>`: control progress UI behaviour (default `auto`).
+*   `--no-progress`: shortcut for `--progress off` (useful for scripts/CI).
+
+When `--json` is enabled, progress UI is automatically disabled so stdout remains parseable JSON.
 
 ---
 
