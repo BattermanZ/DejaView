@@ -11,7 +11,8 @@ use super::cache::{clear_cache_file, load_cache, save_cache};
 use super::collect::collect_files;
 use super::linking::{
     apply_actions, ensure_target_within_media_root, plan_group_actions,
-    replace_file_with_best_link_with, replace_file_with_relative_symlink,
+    replace_file_with_best_link_with, replace_file_with_hardlink_and_rename_with,
+    replace_file_with_relative_symlink,
 };
 use crate::protocol::LinkReportEntry;
 use super::types::{Cache, CacheEntry, FileInfo, RunMetrics, RunWarnings};
@@ -196,6 +197,45 @@ fn replace_file_with_best_link_falls_back_to_symlink_on_hardlink_error() {
     let meta = fs::symlink_metadata(&src).expect("source metadata");
     assert!(meta.file_type().is_symlink());
     assert_eq!(fs::read(&src).expect("read through symlink"), b"new");
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn hardlink_replace_cleans_up_temp_name_that_survives_rename() {
+    let root = unique_temp_dir("leftover_temp_hardlink");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    fs::create_dir_all(&downloads).expect("create downloads dir");
+    fs::create_dir_all(&media).expect("create media dir");
+
+    let src = downloads.join("duplicate.mkv");
+    let tgt = media.join("canonical.mkv");
+    fs::write(&src, b"old").expect("write source");
+    fs::write(&tgt, b"new").expect("write target");
+
+    let result = replace_file_with_hardlink_and_rename_with(
+        &src,
+        &tgt,
+        |from, to| fs::hard_link(from, to),
+        |from, to| {
+            fs::copy(from, to)?;
+            Ok(())
+        },
+    );
+
+    result.expect("leftover temp link should be cleaned up");
+    let leftovers = fs::read_dir(&downloads)
+        .expect("read downloads dir")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".dejaview_hardlink.tmp.")
+        })
+        .count();
+    assert_eq!(leftovers, 0);
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

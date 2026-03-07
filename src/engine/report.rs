@@ -3,6 +3,7 @@ use colored::*;
 use std::path::{Path, PathBuf};
 
 use crate::fsutil::safe_write_bytes;
+use crate::logger;
 use crate::protocol::{LinkReportEntry, RunReport, WarningSummary};
 
 use super::types::{LinkAction, RunMetrics, RunWarnings, ScanRunOptions};
@@ -94,11 +95,16 @@ pub(super) fn warning_total(warnings: &RunWarnings) -> u64 {
 fn write_run_report(path: &Path, report: &RunReport) -> Result<()> {
     let json = serde_json::to_vec_pretty(report)?;
     safe_write_bytes(path, &json)?;
+    logger::info("report", format!("wrote run report to {}", path.display()));
     Ok(())
 }
 
 pub(super) fn try_write_run_report(path: &Path, report: &RunReport) {
     if let Err(err) = write_run_report(path, report) {
+        logger::error(
+            "report",
+            format!("failed to write run report {}: {}", path.display(), err),
+        );
         eprintln!(
             "{} Failed to write link report at {}: {}",
             "⚠".yellow(),

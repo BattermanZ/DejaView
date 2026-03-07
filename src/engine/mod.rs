@@ -25,6 +25,7 @@ use report::{
 use types::{RunMetrics, RunWarnings};
 
 use crate::config::{Config, cache_path};
+use crate::logger;
 
 pub fn cache_info(config: &Config) -> Result<(std::path::PathBuf, usize)> {
     cache::cache_info(config)
@@ -49,6 +50,17 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         .ok_or_else(|| anyhow!("Media path not set"))?;
     let min_age = std::time::Duration::from_secs(config.min_age.unwrap_or(0));
     let machine_output = options.json_output || options.tui_events;
+    logger::info(
+        "run",
+        format!(
+            "starting mode={} downloads={} media={} dry_run={} strict={}",
+            if options.dry_run { "scan" } else { "link" },
+            downloads.display(),
+            media.display(),
+            options.dry_run,
+            options.strict
+        ),
+    );
 
     let mut warnings = RunWarnings::default();
     let mut metrics = RunMetrics::default();
@@ -73,6 +85,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         &mut metrics,
     )?;
     let files_seen = files.len();
+    logger::info("run", format!("collected {} candidate files", files_seen));
     if options.tui_events {
         let _ = types::emit_tui_event(&TuiEvent::Count {
             files_seen: Some(files_seen),
@@ -91,6 +104,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
     }
 
     let cache_path = cache_path(config)?;
+    logger::info("run", format!("using cache path {}", cache_path.display()));
     let cache = Arc::new(Mutex::new(load_cache(&cache_path)));
     let inode_hash: Arc<Mutex<HashMap<(u64, u64), String>>> = Arc::new(Mutex::new(HashMap::new()));
 
@@ -111,6 +125,13 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
 
     let (table, actions, total_saved_space) = plan_actions_and_table(&groups);
     let planned_actions = actions.len();
+    logger::info(
+        "run",
+        format!(
+            "planned {} action(s), potential_saved_bytes={}",
+            planned_actions, total_saved_space
+        ),
+    );
     if options.tui_events {
         let _ = types::emit_tui_event(&TuiEvent::Phase {
             phase: "planning".to_string(),
@@ -153,6 +174,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
             });
         }
         maybe_confirm_apply(options.require_confirm, planned_actions)?;
+        logger::info("run", "starting apply phase");
         apply_actions(
             &actions,
             media,
@@ -187,6 +209,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         },
     );
     if let Some(path) = out_path.as_deref() {
+        logger::info("run", format!("writing report to {}", path.display()));
         try_write_run_report(path, &report);
     }
 
@@ -199,6 +222,11 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         return Err(err);
     }
 
+    let finished_mode = report.mode.clone();
+    let finished_planned = report.planned_actions;
+    let finished_applied = report.applied_actions;
+    let finished_warnings = report.warning_total();
+
     if options.json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if options.tui_events {
@@ -210,6 +238,13 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
     if !machine_output {
         println!("{} Done.", "✔".green());
     }
+    logger::info(
+        "run",
+        format!(
+            "finished mode={} planned={} applied={} warnings={}",
+            finished_mode, finished_planned, finished_applied, finished_warnings
+        ),
+    );
     Ok(())
 }
 

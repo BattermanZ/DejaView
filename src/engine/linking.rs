@@ -8,6 +8,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::protocol::TuiEvent;
+use crate::logger;
 
 use crate::protocol::LinkReportEntry;
 
@@ -81,7 +82,39 @@ fn ensure_snapshot_matches(path: &Path, expected: &FileSnapshot, label: &str) ->
     Ok(())
 }
 
+fn finalize_tmp_swap_with<G>(tmp_link: &Path, src: &Path, rename_fn: G) -> Result<()>
+where
+    G: Fn(&Path, &Path) -> std::io::Result<()>,
+{
+    rename_fn(tmp_link, src).with_context(|| format!("mv {:?} {:?}", tmp_link.display(), src.display()))?;
+    if tmp_link.exists() {
+        logger::warn(
+            "link",
+            format!(
+                "temp link remained after rename, cleaning up {}",
+                tmp_link.display()
+            ),
+        );
+        fs::remove_file(tmp_link)
+            .with_context(|| format!("remove leftover temp link {}", tmp_link.display()))?;
+        if tmp_link.exists() {
+            return Err(anyhow!(
+                "leftover temp link remained after rename: {}",
+                tmp_link.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn replace_file_with_relative_symlink(src: &Path, tgt: &Path) -> Result<()> {
+    replace_file_with_relative_symlink_with(src, tgt, |from, to| fs::rename(from, to))
+}
+
+fn replace_file_with_relative_symlink_with<G>(src: &Path, tgt: &Path, rename_fn: G) -> Result<()>
+where
+    G: Fn(&Path, &Path) -> std::io::Result<()>,
+{
     let parent = src
         .parent()
         .ok_or_else(|| anyhow!("source path has no parent: {}", src.display()))?;
@@ -96,10 +129,13 @@ pub(super) fn replace_file_with_relative_symlink(src: &Path, tgt: &Path) -> Resu
     ));
 
     let link_result = (|| -> Result<()> {
+        logger::info(
+            "link",
+            format!("creating temp symlink {} -> {}", tmp_link.display(), tgt.display()),
+        );
         symlink(&rel, &tmp_link)
             .with_context(|| format!("ln -s {:?} {:?}", rel, tmp_link.display()))?;
-        fs::rename(&tmp_link, src)
-            .with_context(|| format!("mv {:?} {:?}", tmp_link.display(), src.display()))?;
+        finalize_tmp_swap_with(&tmp_link, src, rename_fn)?;
         Ok(())
     })();
 
@@ -114,6 +150,21 @@ fn replace_file_with_hardlink_with<F>(src: &Path, tgt: &Path, hard_link_fn: F) -
 where
     F: Fn(&Path, &Path) -> std::io::Result<()>,
 {
+    replace_file_with_hardlink_and_rename_with(src, tgt, hard_link_fn, |from, to| {
+        fs::rename(from, to)
+    })
+}
+
+pub(super) fn replace_file_with_hardlink_and_rename_with<F, G>(
+    src: &Path,
+    tgt: &Path,
+    hard_link_fn: F,
+    rename_fn: G,
+) -> Result<()>
+where
+    F: Fn(&Path, &Path) -> std::io::Result<()>,
+    G: Fn(&Path, &Path) -> std::io::Result<()>,
+{
     let parent = src
         .parent()
         .ok_or_else(|| anyhow!("source path has no parent: {}", src.display()))?;
@@ -127,10 +178,13 @@ where
     ));
 
     let link_result = (|| -> Result<()> {
+        logger::info(
+            "link",
+            format!("creating temp hardlink {} -> {}", tmp_link.display(), tgt.display()),
+        );
         hard_link_fn(tgt, &tmp_link)
             .with_context(|| format!("ln {:?} {:?}", tgt.display(), tmp_link.display()))?;
-        fs::rename(&tmp_link, src)
-            .with_context(|| format!("mv {:?} {:?}", tmp_link.display(), src.display()))?;
+        finalize_tmp_swap_with(&tmp_link, src, rename_fn)?;
         Ok(())
     })();
 
@@ -162,9 +216,28 @@ where
     let fallback_reason = if src_dev == tgt_dev {
         match replace_file_with_hardlink_with(src, tgt, hard_link_fn) {
             Ok(()) => return Ok(("hardlink".to_string(), None)),
-            Err(err) => Some(format!("hardlink failed: {err}")),
+            Err(err) => {
+                logger::warn(
+                    "link",
+                    format!(
+                        "hardlink failed for {} -> {}: {}",
+                        src.display(),
+                        tgt.display(),
+                        err
+                    ),
+                );
+                Some(format!("hardlink failed: {err}"))
+            }
         }
     } else {
+        logger::info(
+            "link",
+            format!(
+                "cross-device link fallback for {} -> {}",
+                src.display(),
+                tgt.display()
+            ),
+        );
         Some("cross-device; hardlink not possible".to_string())
     };
 
@@ -277,6 +350,10 @@ pub(super) fn apply_actions(
             });
         }
         let apply_result = (|| -> Result<()> {
+            logger::info(
+                "link",
+                format!("applying {} -> {}", action.src.display(), action.tgt.display()),
+            );
             ensure_snapshot_matches(&action.src, &action.src_snapshot, "source")?;
             ensure_target_within_media_root(media, &action.tgt)?;
             ensure_snapshot_matches(&action.tgt, &action.tgt_snapshot, "target")?;
@@ -291,6 +368,15 @@ pub(super) fn apply_actions(
             warnings.link_errors += 1;
             report_entries[index].status = "failed".to_string();
             report_entries[index].error = Some(err.to_string());
+            logger::error(
+                "link",
+                format!(
+                    "failed {} -> {}: {}",
+                    action.src.display(),
+                    action.tgt.display(),
+                    err
+                ),
+            );
             if tui_events {
                 let _ = emit_tui_event(&TuiEvent::Log {
                     message: format!(
@@ -321,6 +407,15 @@ pub(super) fn apply_actions(
             }
         }
         applied_actions += 1;
+        logger::info(
+            "link",
+            format!(
+                "applied {} -> {} via {}",
+                action.src.display(),
+                action.tgt.display(),
+                report_entries[index].method.as_deref().unwrap_or("unknown")
+            ),
+        );
         if tui_events {
             let _ = emit_tui_event(&TuiEvent::Count {
                 files_seen: None,

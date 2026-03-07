@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod config;
 mod engine;
 mod fsutil;
+mod logger;
 mod protocol;
 mod tui;
 
@@ -133,7 +134,13 @@ enum CacheCommands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let command_name = command_name(&cli.command);
+    let log_path = logger::init(command_name)?;
     let mut config = load_config()?;
+    logger::info(
+        "main",
+        format!("logger initialized at {}", log_path.display()),
+    );
 
     if let Some(threads) = config.threads {
         rayon::ThreadPoolBuilder::new()
@@ -234,7 +241,19 @@ fn main() -> Result<()> {
         }
     }
 
+    logger::shutdown();
     Ok(())
+}
+
+fn command_name(command: &Commands) -> &'static str {
+    match command {
+        Commands::Scan { .. } => "scan",
+        Commands::Link { .. } => "link",
+        Commands::Config(_) => "config",
+        Commands::Cache(_) => "cache",
+        Commands::Tui { .. } => "tui",
+        Commands::TuiLogoPreview => "tui-logo-preview",
+    }
 }
 
 fn ensure_required_paths(config: &config::Config) -> Result<()> {

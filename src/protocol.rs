@@ -72,7 +72,6 @@ pub enum TuiEvent {
     },
 }
 
-#[cfg(test)]
 impl RunReport {
     pub fn warning_total(&self) -> u64 {
         self.warnings.walk_errors
