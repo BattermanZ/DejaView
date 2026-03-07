@@ -131,14 +131,14 @@ pub(super) fn build_report_entries(actions: &[LinkAction]) -> Vec<LinkReportEntr
             status: "planned".to_string(),
             method: Some(
                 if action.src_snapshot.dev == action.tgt_snapshot.dev {
-                    "hardlink"
+                    "try-hardlink"
                 } else {
                     "symlink"
                 }
                 .to_string(),
             ),
             fallback_reason: if action.src_snapshot.dev == action.tgt_snapshot.dev {
-                None
+                Some("tries hardlink first; may fall back to symlink".to_string())
             } else {
                 Some("cross-device; hardlink not possible".to_string())
             },

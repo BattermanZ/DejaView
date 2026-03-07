@@ -1171,8 +1171,8 @@ mod tests {
                 target: "/media/a.mkv".to_string(),
                 size: 10,
                 status: "planned".to_string(),
-                method: Some("hardlink".to_string()),
-                fallback_reason: None,
+                method: Some("try-hardlink".to_string()),
+                fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
                 error: None,
             }],
         }))
@@ -1185,7 +1185,7 @@ mod tests {
         assert_eq!(app.potential_saved_bytes(), 10);
         assert_eq!(
             app.selected_entry().and_then(|entry| entry.method.as_deref()),
-            Some("hardlink")
+            Some("try-hardlink")
         );
     }
 

@@ -231,6 +231,7 @@ fn empty_results_lines() -> Vec<Line<'static>> {
 
 fn outcome_label(row: &LinkReportEntry) -> String {
     match row.method.as_deref() {
+        Some("try-hardlink") => "TRY HARDLINK".to_string(),
         Some("hardlink") => "HARDLINK".to_string(),
         Some("symlink") => "SYMLINK".to_string(),
         Some(other) => other.to_uppercase(),
@@ -827,6 +828,22 @@ mod tests {
             error: None,
         };
 
+        assert_eq!(status_chip_style(&row, false), Theme::chip_warning());
+    }
+
+    #[test]
+    fn try_hardlink_rows_render_non_misleading_outcome() {
+        let row = LinkReportEntry {
+            source: "a".to_string(),
+            target: "b".to_string(),
+            size: 42,
+            status: "planned".to_string(),
+            method: Some("try-hardlink".to_string()),
+            fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
+            error: None,
+        };
+
+        assert_eq!(outcome_label(&row), "TRY HARDLINK");
         assert_eq!(status_chip_style(&row, false), Theme::chip_warning());
     }
 

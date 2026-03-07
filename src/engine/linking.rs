@@ -200,17 +200,23 @@ pub(super) fn plan_group_actions(group: &[&FileInfo]) -> Vec<LinkAction> {
     actions
 }
 
-pub(super) fn plan_actions_and_table(groups: &[Vec<FileInfo>]) -> (Table, Vec<LinkAction>, u64) {
+pub(super) fn plan_hashed_group_actions(group: &[FileInfo]) -> Vec<LinkAction> {
     let mut hash_map: std::collections::HashMap<String, Vec<&FileInfo>> =
         std::collections::HashMap::new();
-    for group in groups {
-        for fi in group {
-            if let Some(ref h) = fi.hash {
-                hash_map.entry(h.clone()).or_default().push(fi);
-            }
+    for file in group {
+        if let Some(hash) = &file.hash {
+            hash_map.entry(hash.clone()).or_default().push(file);
         }
     }
 
+    let mut actions = Vec::new();
+    for hashed_group in hash_map.values() {
+        actions.extend(plan_group_actions(hashed_group));
+    }
+    actions
+}
+
+pub(super) fn plan_actions_and_table(groups: &[Vec<FileInfo>]) -> (Table, Vec<LinkAction>, u64) {
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL)
@@ -220,8 +226,8 @@ pub(super) fn plan_actions_and_table(groups: &[Vec<FileInfo>]) -> (Table, Vec<Li
 
     let mut actions = Vec::new();
     let mut total_saved_space: u64 = 0;
-    for group in hash_map.values() {
-        let planned = plan_group_actions(group);
+    for group in groups {
+        let planned = plan_hashed_group_actions(group);
         for action in planned {
             table.add_row(vec![
                 action.src.to_string_lossy().to_string(),
