@@ -9,10 +9,10 @@ pub enum Event {
 }
 
 pub fn next_event(tick_rate: Duration) -> Result<Event> {
-    if event::poll(tick_rate)? {
-        if let CEvent::Key(key) = event::read()? {
-            return Ok(Event::Key(key));
-        }
+    if event::poll(tick_rate)?
+        && let CEvent::Key(key) = event::read()?
+    {
+        return Ok(Event::Key(key));
     }
     Ok(Event::Tick)
 }

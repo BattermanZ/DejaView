@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use blake3::Hasher;
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -176,31 +176,31 @@ pub(super) fn hash_groups_and_update_cache(
             for idx in indices {
                 let file = &mut group[idx];
 
-                if let Ok(inode_map) = inode_hash_for_threads.lock() {
-                    if let Some(hash) = inode_map.get(&(file.dev, file.inode)) {
-                        file.hash = Some(hash.clone());
-                        let done = full_done_for_threads.fetch_add(1, Ordering::Relaxed) + 1;
-                        emit_hash_progress(done as usize, total_full_files, tui_events);
-                        if let Some(progress_bar) = &bar {
-                            progress_bar.inc(1);
-                        }
-                        continue;
+                if let Ok(inode_map) = inode_hash_for_threads.lock()
+                    && let Some(hash) = inode_map.get(&(file.dev, file.inode))
+                {
+                    file.hash = Some(hash.clone());
+                    let done = full_done_for_threads.fetch_add(1, Ordering::Relaxed) + 1;
+                    emit_hash_progress(done as usize, total_full_files, tui_events);
+                    if let Some(progress_bar) = &bar {
+                        progress_bar.inc(1);
                     }
+                    continue;
                 }
 
                 let key = file.path.to_string_lossy().into_owned();
-                if let Ok(cache_map) = cache_for_threads.lock() {
-                    if let Some(entry) = cache_map.get(&key) {
-                        if entry.size == file.size && entry.mtime == file.mtime_secs {
-                            file.hash = Some(entry.hash.clone());
-                            let done = full_done_for_threads.fetch_add(1, Ordering::Relaxed) + 1;
-                            emit_hash_progress(done as usize, total_full_files, tui_events);
-                            if let Some(progress_bar) = &bar {
-                                progress_bar.inc(1);
-                            }
-                            continue;
-                        }
+                if let Ok(cache_map) = cache_for_threads.lock()
+                    && let Some(entry) = cache_map.get(&key)
+                    && entry.size == file.size
+                    && entry.mtime == file.mtime_secs
+                {
+                    file.hash = Some(entry.hash.clone());
+                    let done = full_done_for_threads.fetch_add(1, Ordering::Relaxed) + 1;
+                    emit_hash_progress(done as usize, total_full_files, tui_events);
+                    if let Some(progress_bar) = &bar {
+                        progress_bar.inc(1);
                     }
+                    continue;
                 }
 
                 emit_worker_activity(

@@ -140,10 +140,12 @@ fn replace_file_with_best_link_falls_back_to_symlink_on_hardlink_error() {
     .expect("replace with fallback");
 
     assert_eq!(result.0, "symlink");
-    assert!(result
-        .1
-        .expect("fallback reason")
-        .contains("hardlink failed"));
+    assert!(
+        result
+            .1
+            .expect("fallback reason")
+            .contains("hardlink failed")
+    );
     let meta = fs::symlink_metadata(&src).expect("source metadata");
     assert!(meta.file_type().is_symlink());
     assert_eq!(fs::read(&src).expect("read through symlink"), b"new");

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use colored::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,17 +14,17 @@ pub use types::ScanRunOptions;
 
 use crate::protocol::TuiEvent;
 use cache::{load_cache, save_cache};
-use collect::{collect_run_files, group_files_by_size, CollectOptions};
+use collect::{CollectOptions, collect_run_files, group_files_by_size};
 use hashing::hash_groups_and_update_cache;
 use linking::{apply_actions, plan_actions_and_table};
 use report::{
-    build_report_entries, build_run_report, maybe_confirm_apply, maybe_return_strict_errors,
-    print_run_summary, print_space_summary, resolve_report_path, try_write_run_report,
-    RunReportInput,
+    RunReportInput, build_report_entries, build_run_report, maybe_confirm_apply,
+    maybe_return_strict_errors, print_run_summary, print_space_summary, resolve_report_path,
+    try_write_run_report,
 };
 use types::{RunMetrics, RunWarnings};
 
-use crate::config::{cache_path, Config};
+use crate::config::{Config, cache_path};
 
 pub fn cache_info(config: &Config) -> Result<(std::path::PathBuf, usize)> {
     cache::cache_info(config)

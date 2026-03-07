@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
-use crate::config::{load_config, save_config, validate_runtime_paths, Config};
+use crate::config::{Config, load_config, save_config, validate_runtime_paths};
 
 use super::actions;
 use super::events::{self, Event};
@@ -246,12 +246,11 @@ impl App {
                     _ => format!("{done} / {total} files hashed"),
                 };
             }
-            if matches!(self.current_phase.as_deref(), Some("applying")) {
-                if let (Some(applied), Some(planned)) =
+            if matches!(self.current_phase.as_deref(), Some("applying"))
+                && let (Some(applied), Some(planned)) =
                     (self.live_applied_actions, self.live_planned_actions)
-                {
-                    return format!("{applied} / {planned} actions applied");
-                }
+            {
+                return format!("{applied} / {planned} actions applied");
             }
             let mut parts = Vec::new();
             if let Some(files) = self.live_files_seen {
@@ -637,18 +636,19 @@ impl App {
             }
         }
 
-        if let Some(kind) = disconnected_kind {
-            if !saw_done && self.running_job.is_some() {
-                self.running_job = None;
-                self.finish_live_run();
-                let label = match kind {
-                    JobKind::Scan => "Scan",
-                    JobKind::Link => "Link",
-                };
-                self.push_log(format!(
-                    "{label} failed: worker thread disconnected unexpectedly"
-                ));
-            }
+        if let Some(kind) = disconnected_kind
+            && !saw_done
+            && self.running_job.is_some()
+        {
+            self.running_job = None;
+            self.finish_live_run();
+            let label = match kind {
+                JobKind::Scan => "Scan",
+                JobKind::Link => "Link",
+            };
+            self.push_log(format!(
+                "{label} failed: worker thread disconnected unexpectedly"
+            ));
         }
     }
 
@@ -732,19 +732,17 @@ impl App {
                 if matches!(
                     self.current_phase.as_deref(),
                     Some("hashing_sample") | Some("hashing_full")
-                ) {
-                    if let (Some(done), Some(total)) =
-                        (self.hash_progress_done, self.hash_progress_total)
-                    {
-                        self.latest_activity_message = Some(match self.current_phase.as_deref() {
-                            Some("hashing_full") => {
-                                format!("Verifying duplicate files: {done} / {total}")
-                            }
-                            _ => format!("Hashing files: {done} / {total}"),
-                        });
-                        if done == 1 || done == total || done % 10 == 0 {
-                            self.push_log(self.latest_activity_message.clone().unwrap_or_default());
+                ) && let (Some(done), Some(total)) =
+                    (self.hash_progress_done, self.hash_progress_total)
+                {
+                    self.latest_activity_message = Some(match self.current_phase.as_deref() {
+                        Some("hashing_full") => {
+                            format!("Verifying duplicate files: {done} / {total}")
                         }
+                        _ => format!("Hashing files: {done} / {total}"),
+                    });
+                    if done == 1 || done == total || done % 10 == 0 {
+                        self.push_log(self.latest_activity_message.clone().unwrap_or_default());
                     }
                 }
                 false
@@ -939,10 +937,11 @@ mod tests {
         app.handle_main_key(KeyCode::Char('r'))
             .expect("key handling should not fail");
         assert!(!app.should_quit());
-        assert!(app
-            .logs
-            .iter()
-            .any(|line| line.starts_with("Save report failed:")));
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line.starts_with("Save report failed:"))
+        );
 
         fs::remove_file(temp_file).expect("cleanup temp file");
     }
@@ -959,10 +958,11 @@ mod tests {
         });
 
         app.start_link_job();
-        assert!(app
-            .logs
-            .iter()
-            .any(|line| line == "A run is already in progress."));
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line == "A run is already in progress.")
+        );
     }
 
     #[test]
@@ -1108,10 +1108,11 @@ mod tests {
 
         assert!(!app.should_quit());
         assert!(matches!(app.overlay, Overlay::BlockingNotice(_)));
-        assert!(app
-            .logs
-            .iter()
-            .any(|line| line == "Quit blocked while a run is active."));
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line == "Quit blocked while a run is active.")
+        );
     }
 
     #[test]
@@ -1285,11 +1286,13 @@ mod tests {
         .expect("save flow should not hard fail");
 
         let editor = app.config_editor().expect("editor should stay open");
-        assert!(editor
-            .error
-            .as_ref()
-            .expect("save error")
-            .contains("Failed to save config"));
+        assert!(
+            editor
+                .error
+                .as_ref()
+                .expect("save error")
+                .contains("Failed to save config")
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
