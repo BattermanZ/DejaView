@@ -237,7 +237,7 @@ impl App {
     }
 
     pub fn min_age_secs(&self) -> u64 {
-        self.min_age.unwrap_or(300)
+        self.min_age.unwrap_or(0)
     }
 
     pub fn threads_label(&self) -> String {

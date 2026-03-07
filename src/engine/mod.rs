@@ -47,7 +47,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         .media
         .as_ref()
         .ok_or_else(|| anyhow!("Media path not set"))?;
-    let min_age = std::time::Duration::from_secs(config.min_age.unwrap_or(300));
+    let min_age = std::time::Duration::from_secs(config.min_age.unwrap_or(0));
     let machine_output = options.json_output || options.tui_events;
 
     let mut warnings = RunWarnings::default();

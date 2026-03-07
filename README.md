@@ -159,7 +159,7 @@ When `--json` is enabled, progress UI is automatically disabled so stdout remain
 
 ## How it works
 
-1.  **File collection**: Recursively scans both the configured download and media directories, skipping symlinks and files younger than the `min-age` setting (default: 300 seconds). For first-run testing on freshly created files, use `config set-min-age 0`.
+1.  **File collection**: Recursively scans both the configured download and media directories, skipping symlinks and files younger than the `min-age` setting (default: 0 seconds).
 2.  **Duplicate grouping**: Buckets files by size; only buckets with more than one file enter the hashing phase.
 3.  **Two-phase Hashing**: 
     *   **Phase 1 (Sample Hash):** For files in a group, a fast BLAKE3 hash is computed using only the first and last megabyte of the file.
