@@ -74,7 +74,7 @@ fn row_style(row: &LinkReportEntry, is_selected: bool) -> Style {
         };
     }
     if is_selected {
-        Theme::accent()
+        Theme::result_row_selected().fg(Theme::accent().fg.unwrap_or(Color::Reset))
     } else {
         Theme::base()
     }
@@ -734,6 +734,20 @@ mod tests {
         };
 
         assert_eq!(status_chip_style(&row, false), Theme::chip_warning());
+    }
+
+    #[test]
+    fn selected_success_rows_keep_selected_background() {
+        let row = LinkReportEntry {
+            source: "a".to_string(),
+            target: "b".to_string(),
+            status: "applied".to_string(),
+            method: Some("hardlink".to_string()),
+            fallback_reason: None,
+            error: None,
+        };
+
+        assert_eq!(row_style(&row, true).bg, Theme::result_row_selected().bg);
     }
 
     #[test]
