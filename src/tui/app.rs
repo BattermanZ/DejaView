@@ -848,6 +848,7 @@ impl App {
             TuiEvent::Done { report } => {
                 let planned = report.planned_actions;
                 let applied = report.applied_actions;
+                let link_failures = report.warnings.link_errors;
                 self.selected_row = 0;
                 self.live_files_seen = Some(report.files_considered);
                 self.live_planned_actions = Some(report.planned_actions);
@@ -867,6 +868,11 @@ impl App {
                     JobKind::Link => {
                         self.push_log(format!("Link finished. Applied actions: {applied}"))
                     }
+                }
+                if kind == JobKind::Link && link_failures > 0 {
+                    self.push_log(format!(
+                        "Link run had {link_failures} failure(s). Review failed rows for details."
+                    ));
                 }
                 true
             }
@@ -1135,6 +1141,31 @@ mod tests {
         assert!(app.running_job.is_none());
         assert_eq!(app.files_considered(), 2);
         assert!(app.logs.iter().any(|line| line.contains("Scan finished")));
+    }
+
+    #[test]
+    fn link_done_with_failures_logs_summary() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+
+        let (tx, rx) = mpsc::channel();
+        app.running_job = Some(RunningJob {
+            kind: JobKind::Link,
+            receiver: rx,
+        });
+        let mut report = sample_report();
+        report.mode = "link".to_string();
+        report.warnings.link_errors = 2;
+        tx.send(Ok(TuiEvent::Done { report })).expect("send result");
+
+        app.poll_running_job();
+
+        assert!(app.logs.iter().any(|line| line == "Link finished. Applied actions: 0"));
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line == "Link run had 2 failure(s). Review failed rows for details.")
+        );
     }
 
     #[test]

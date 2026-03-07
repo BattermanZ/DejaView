@@ -15,6 +15,19 @@ use super::types::emit_tui_event;
 use super::types::{FileInfo, FileSnapshot, LinkAction, RunWarnings};
 
 pub(super) fn ensure_target_within_media_root(media_root: &Path, target: &Path) -> Result<()> {
+    let target_meta =
+        fs::symlink_metadata(target).with_context(|| format!("metadata {}", target.display()))?;
+    if target_meta.file_type().is_symlink() {
+        return Err(anyhow!(
+            "refusing to link to symlink target: {}",
+            target.display()
+        ));
+    }
+
+    if target.starts_with(media_root) {
+        return Ok(());
+    }
+
     let canonical_media = fs::canonicalize(media_root)
         .with_context(|| format!("canonicalize {}", media_root.display()))?;
     let canonical_target =
@@ -23,16 +36,11 @@ pub(super) fn ensure_target_within_media_root(media_root: &Path, target: &Path) 
     if !canonical_target.starts_with(&canonical_media) {
         return Err(anyhow!(
             "refusing to link to target outside media root: {}",
-            canonical_target.display()
+            target.display()
         ));
     }
 
     Ok(())
-}
-
-fn resolve_verified_target(media_root: &Path, target: &Path) -> Result<std::path::PathBuf> {
-    ensure_target_within_media_root(media_root, target)?;
-    fs::canonicalize(target).with_context(|| format!("canonicalize {}", target.display()))
 }
 
 fn snapshot_from_file_info(file: &FileInfo) -> FileSnapshot {
@@ -270,10 +278,10 @@ pub(super) fn apply_actions(
         }
         let apply_result = (|| -> Result<()> {
             ensure_snapshot_matches(&action.src, &action.src_snapshot, "source")?;
-            let resolved_target = resolve_verified_target(media, &action.tgt)?;
-            ensure_snapshot_matches(&resolved_target, &action.tgt_snapshot, "target")?;
+            ensure_target_within_media_root(media, &action.tgt)?;
+            ensure_snapshot_matches(&action.tgt, &action.tgt_snapshot, "target")?;
             let (method, fallback_reason) =
-                replace_file_with_best_link(&action.src, &resolved_target)?;
+                replace_file_with_best_link(&action.src, &action.tgt)?;
             report_entries[index].method = Some(method);
             report_entries[index].fallback_reason = fallback_reason;
             report_entries[index].status = "applied".to_string();
@@ -283,6 +291,16 @@ pub(super) fn apply_actions(
             warnings.link_errors += 1;
             report_entries[index].status = "failed".to_string();
             report_entries[index].error = Some(err.to_string());
+            if tui_events {
+                let _ = emit_tui_event(&TuiEvent::Log {
+                    message: format!(
+                        "Failed to apply {} -> {}: {}",
+                        action.src.display(),
+                        action.tgt.display(),
+                        err
+                    ),
+                });
+            }
             if strict {
                 strict_link_error = Some(anyhow!(
                     "strict mode link failure for {} -> {}: {}",

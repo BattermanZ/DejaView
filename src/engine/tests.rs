@@ -107,6 +107,39 @@ fn rejects_target_outside_media_root() {
 }
 
 #[test]
+fn rejects_symlink_target_inside_media_root() {
+    #[cfg(not(unix))]
+    {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("symlink_target");
+        let media = root.join("media");
+        let real = root.join("real");
+        let target = media.join("movie.mkv");
+        fs::create_dir_all(&media).expect("create media dir");
+        fs::create_dir_all(&real).expect("create real dir");
+        fs::write(real.join("movie.mkv"), b"content").expect("write real target");
+        symlink(real.join("movie.mkv"), &target).expect("create target symlink");
+
+        let result = ensure_target_within_media_root(&media, &target);
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("symlink target should fail")
+                .to_string()
+                .contains("refusing to link to symlink target")
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+}
+
+#[test]
 fn replaces_file_with_relative_symlink_atomically() {
     let root = unique_temp_dir("replace");
     let downloads = root.join("downloads");
