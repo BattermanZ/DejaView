@@ -79,12 +79,14 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
             groups_found: None,
             planned_actions: None,
             applied_actions: None,
+            hash_progress_done: None,
+            hash_progress_total: None,
         });
         let _ = types::emit_tui_event(&TuiEvent::Phase {
-            phase: "hashing".to_string(),
+            phase: "hashing_sample".to_string(),
         });
         let _ = types::emit_tui_event(&TuiEvent::Log {
-            message: "Hashing duplicate candidates".to_string(),
+            message: "Hashing files to identify duplicate candidates".to_string(),
         });
     }
 
@@ -118,6 +120,8 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
             groups_found: Some(groups.len()),
             planned_actions: Some(planned_actions),
             applied_actions: Some(0),
+            hash_progress_done: None,
+            hash_progress_total: None,
         });
         let _ = types::emit_tui_event(&TuiEvent::Log {
             message: format!("Planning complete. {planned_actions} action(s) queued."),

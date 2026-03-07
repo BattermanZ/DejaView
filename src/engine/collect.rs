@@ -97,6 +97,8 @@ pub(super) fn collect_files(
                     groups_found: None,
                     planned_actions: None,
                     applied_actions: None,
+                    hash_progress_done: None,
+                    hash_progress_total: None,
                 });
             }
         }

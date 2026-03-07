@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -66,6 +66,9 @@ pub struct App {
     live_groups_found: Option<usize>,
     live_planned_actions: Option<usize>,
     live_applied_actions: Option<usize>,
+    hash_progress_done: Option<usize>,
+    hash_progress_total: Option<usize>,
+    active_workers: BTreeMap<usize, String>,
     job_started_at: Option<Instant>,
     last_run_duration: Option<Duration>,
     running_job: Option<RunningJob>,
@@ -94,6 +97,9 @@ impl App {
             live_groups_found: None,
             live_planned_actions: None,
             live_applied_actions: None,
+            hash_progress_done: None,
+            hash_progress_total: None,
+            active_workers: BTreeMap::new(),
             job_started_at: None,
             last_run_duration: None,
             running_job: None,
@@ -234,9 +240,22 @@ impl App {
 
     pub fn throughput_label(&self) -> String {
         if self.running_job.is_some() {
+            if let (Some(done), Some(total)) = (self.hash_progress_done, self.hash_progress_total) {
+                return match self.current_phase.as_deref() {
+                    Some("hashing_full") => format!("{done} / {total} duplicate files verified"),
+                    _ => format!("{done} / {total} files hashed"),
+                };
+            }
+            if matches!(self.current_phase.as_deref(), Some("applying")) {
+                if let (Some(applied), Some(planned)) =
+                    (self.live_applied_actions, self.live_planned_actions)
+                {
+                    return format!("{applied} / {planned} actions applied");
+                }
+            }
             let mut parts = Vec::new();
             if let Some(files) = self.live_files_seen {
-                parts.push(format!("{files} files"));
+                parts.push(format!("{files} files found"));
             }
             if let Some(groups) = self.live_groups_found {
                 parts.push(format!("{groups} groups"));
@@ -278,10 +297,14 @@ impl App {
     }
 
     pub fn current_path_label(&self) -> &'static str {
-        match self.current_phase.as_deref() {
-            Some("hashing") => "recent",
-            _ => "current",
-        }
+        "current"
+    }
+
+    pub fn active_worker_paths(&self) -> Vec<(usize, &str)> {
+        self.active_workers
+            .iter()
+            .map(|(worker, path)| (*worker, path.as_str()))
+            .collect()
     }
 
     pub fn elapsed_label(&self) -> String {
@@ -633,9 +656,32 @@ impl App {
         match event {
             TuiEvent::Phase { phase } => {
                 self.current_phase = Some(phase.clone());
+                if phase.starts_with("hashing_") {
+                    self.active_workers.clear();
+                } else {
+                    self.active_workers.clear();
+                    self.hash_progress_done = None;
+                    self.hash_progress_total = None;
+                }
                 let message = format!("Phase: {}", display_phase(&phase));
                 self.latest_activity_message = Some(message.clone());
                 self.push_log(message);
+                false
+            }
+            TuiEvent::WorkerActivity {
+                phase,
+                worker,
+                path,
+            } => {
+                self.current_phase = Some(phase);
+                match path {
+                    Some(path) => {
+                        self.active_workers.insert(worker, path);
+                    }
+                    None => {
+                        self.active_workers.remove(&worker);
+                    }
+                }
                 false
             }
             TuiEvent::File { phase, path } => {
@@ -643,10 +689,7 @@ impl App {
                     self.current_phase = Some(phase);
                 }
                 self.current_path = Some(path.clone());
-                self.latest_activity_message = Some(match self.current_phase.as_deref() {
-                    Some("hashing") => format!("Recent hash worker update: {path}"),
-                    _ => format!("Working on {path}"),
-                });
+                self.latest_activity_message = Some(format!("Working on {path}"));
                 false
             }
             TuiEvent::Count {
@@ -654,9 +697,16 @@ impl App {
                 groups_found,
                 planned_actions,
                 applied_actions,
+                hash_progress_done,
+                hash_progress_total,
             } => {
                 if let Some(files_seen) = files_seen {
                     self.live_files_seen = Some(files_seen);
+                    if matches!(self.current_phase.as_deref(), Some("collecting"))
+                        && (files_seen == 1 || files_seen % 25 == 0)
+                    {
+                        self.push_log(format!("Collected {files_seen} file(s)"));
+                    }
                 }
                 if let Some(groups_found) = groups_found {
                     self.live_groups_found = Some(groups_found);
@@ -666,6 +716,34 @@ impl App {
                 }
                 if let Some(applied_actions) = applied_actions {
                     self.live_applied_actions = Some(applied_actions);
+                    if matches!(self.current_phase.as_deref(), Some("applying")) {
+                        let planned = self.live_planned_actions.unwrap_or(applied_actions);
+                        self.push_log(format!("Applied {applied_actions} / {planned} action(s)"));
+                    }
+                }
+                if let Some(done) = hash_progress_done {
+                    self.hash_progress_done = Some(done);
+                }
+                if let Some(total) = hash_progress_total {
+                    self.hash_progress_total = Some(total);
+                }
+                if matches!(
+                    self.current_phase.as_deref(),
+                    Some("hashing_sample") | Some("hashing_full")
+                ) {
+                    if let (Some(done), Some(total)) =
+                        (self.hash_progress_done, self.hash_progress_total)
+                    {
+                        self.latest_activity_message = Some(match self.current_phase.as_deref() {
+                            Some("hashing_full") => {
+                                format!("Verifying duplicate files: {done} / {total}")
+                            }
+                            _ => format!("Hashing files: {done} / {total}"),
+                        });
+                        if done == 1 || done == total || done % 10 == 0 {
+                            self.push_log(self.latest_activity_message.clone().unwrap_or_default());
+                        }
+                    }
                 }
                 false
             }
@@ -692,6 +770,9 @@ impl App {
                 self.live_planned_actions = Some(report.planned_actions);
                 self.live_applied_actions = Some(report.applied_actions);
                 self.current_path = None;
+                self.active_workers.clear();
+                self.hash_progress_done = None;
+                self.hash_progress_total = None;
                 self.report = Some(report);
                 self.running_job = None;
                 self.finish_live_run();
@@ -751,6 +832,9 @@ impl App {
         self.live_groups_found = None;
         self.live_planned_actions = None;
         self.live_applied_actions = None;
+        self.hash_progress_done = None;
+        self.hash_progress_total = None;
+        self.active_workers.clear();
         self.last_run_duration = None;
         self.job_started_at = None;
     }
@@ -761,6 +845,18 @@ impl App {
         }
         self.current_phase = None;
         self.current_path = None;
+        self.active_workers.clear();
+    }
+}
+
+#[cfg(test)]
+impl App {
+    pub(crate) fn set_hash_activity_for_test(&mut self, phase: &str, workers: &[(usize, &str)]) {
+        self.current_phase = Some(phase.to_string());
+        self.active_workers = workers
+            .iter()
+            .map(|(worker, path)| (*worker, (*path).to_string()))
+            .collect();
     }
 }
 
@@ -774,7 +870,8 @@ fn format_duration(duration: Duration) -> String {
 fn display_phase(phase: &str) -> &'static str {
     match phase {
         "collecting" => "COLLECTING FILES",
-        "hashing" => "HASHING DUPLICATES",
+        "hashing_sample" => "HASHING FILES",
+        "hashing_full" => "VERIFYING DUPLICATES",
         "planning" => "PLANNING ACTIONS",
         "applying" => "APPLYING LINKS",
         _ => "PROCESSING",
@@ -900,19 +997,22 @@ mod tests {
         app.job_started_at = Some(Instant::now());
 
         tx.send(Ok(TuiEvent::Phase {
-            phase: "hashing".to_string(),
+            phase: "hashing_sample".to_string(),
         }))
         .expect("send phase");
-        tx.send(Ok(TuiEvent::File {
-            phase: Some("hashing".to_string()),
-            path: "/downloads/movie.mkv".to_string(),
+        tx.send(Ok(TuiEvent::WorkerActivity {
+            phase: "hashing_sample".to_string(),
+            worker: 2,
+            path: Some("/downloads/movie.mkv".to_string()),
         }))
-        .expect("send file");
+        .expect("send worker");
         tx.send(Ok(TuiEvent::Count {
             files_seen: Some(42),
             groups_found: Some(3),
             planned_actions: Some(2),
             applied_actions: Some(0),
+            hash_progress_done: Some(23),
+            hash_progress_total: Some(42),
         }))
         .expect("send count");
 
@@ -920,8 +1020,9 @@ mod tests {
 
         assert_eq!(app.files_considered(), 42);
         assert_eq!(app.planned_actions(), 2);
-        assert_eq!(app.current_path(), Some("/downloads/movie.mkv"));
-        assert_eq!(app.activity_phase(), "HASHING DUPLICATES");
+        assert_eq!(app.activity_phase(), "HASHING FILES");
+        assert_eq!(app.active_worker_paths(), vec![(2, "/downloads/movie.mkv")]);
+        assert_eq!(app.throughput_label(), "23 / 42 files hashed");
     }
 
     #[test]
@@ -963,12 +1064,12 @@ mod tests {
     }
 
     #[test]
-    fn hashing_phase_uses_recent_path_label() {
+    fn current_path_label_is_current() {
         let config = Config::default();
         let mut app = App::new(&config, false);
-        app.current_phase = Some("hashing".to_string());
+        app.current_phase = Some("hashing_sample".to_string());
 
-        assert_eq!(app.current_path_label(), "recent");
+        assert_eq!(app.current_path_label(), "current");
     }
 
     #[test]

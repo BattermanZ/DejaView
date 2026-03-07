@@ -315,7 +315,17 @@ fn header_activity_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             Theme::dim(),
         )),
     ];
-    if let Some(path) = app.current_path() {
+    if !app.active_worker_paths().is_empty() {
+        for (worker, path) in app.active_worker_paths().into_iter().take(3) {
+            lines.push(Line::from(vec![
+                Span::styled(format!("worker {worker} ",), Theme::dim()),
+                Span::styled(
+                    display_path(path, usize::from(line_width).max(12), app.expand_paths()),
+                    Theme::base(),
+                ),
+            ]));
+        }
+    } else if let Some(path) = app.current_path() {
         lines.push(Line::from(vec![
             Span::styled(format!("{} ", app.current_path_label()), Theme::dim()),
             Span::styled(
@@ -845,6 +855,24 @@ mod tests {
             .join(" ");
         assert!(combined.contains("IDLE"));
         assert!(combined.contains("READY TO SCAN"));
+    }
+
+    #[test]
+    fn header_activity_lines_show_worker_paths() {
+        let mut app = App::new(&crate::config::Config::default(), false);
+        app.set_hash_activity_for_test(
+            "hashing_sample",
+            &[(2, "/downloads/alpha.mkv"), (4, "/downloads/beta.mkv")],
+        );
+
+        let combined = header_activity_lines(&app, 120)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(combined.contains("worker 2"));
+        assert!(combined.contains("worker 4"));
+        assert!(combined.contains("alpha.mkv"));
     }
 
     #[test]

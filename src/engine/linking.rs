@@ -252,6 +252,8 @@ pub(super) fn apply_actions(
                 groups_found: None,
                 planned_actions: Some(actions.len()),
                 applied_actions: Some(applied_actions),
+                hash_progress_done: None,
+                hash_progress_total: None,
             });
         }
     }

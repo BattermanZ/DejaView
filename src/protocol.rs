@@ -39,6 +39,11 @@ pub enum TuiEvent {
     Phase {
         phase: String,
     },
+    WorkerActivity {
+        phase: String,
+        worker: usize,
+        path: Option<String>,
+    },
     File {
         phase: Option<String>,
         path: String,
@@ -48,6 +53,8 @@ pub enum TuiEvent {
         groups_found: Option<usize>,
         planned_actions: Option<usize>,
         applied_actions: Option<usize>,
+        hash_progress_done: Option<usize>,
+        hash_progress_total: Option<usize>,
     },
     Log {
         message: String,

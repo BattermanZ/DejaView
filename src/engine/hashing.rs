@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use blake3::Hasher;
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::current_thread_index;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -42,6 +43,33 @@ fn full_digest(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+fn worker_id() -> usize {
+    current_thread_index().map_or(1, |idx| idx + 1)
+}
+
+fn emit_worker_activity(phase: &str, worker: usize, path: Option<String>, tui_events: bool) {
+    if tui_events {
+        let _ = emit_tui_event(&TuiEvent::WorkerActivity {
+            phase: phase.to_string(),
+            worker,
+            path,
+        });
+    }
+}
+
+fn emit_hash_progress(done: usize, total: usize, tui_events: bool) {
+    if tui_events {
+        let _ = emit_tui_event(&TuiEvent::Count {
+            files_seen: None,
+            groups_found: None,
+            planned_actions: None,
+            applied_actions: None,
+            hash_progress_done: Some(done),
+            hash_progress_total: Some(total),
+        });
+    }
+}
+
 pub(super) fn hash_groups_and_update_cache(
     groups: &mut [Vec<FileInfo>],
     cache: &Arc<Mutex<Cache>>,
@@ -51,13 +79,14 @@ pub(super) fn hash_groups_and_update_cache(
     tui_events: bool,
     warnings: &mut RunWarnings,
 ) -> Result<()> {
+    let total_sample_files = groups.iter().map(Vec::len).sum::<usize>();
     let bar = if show_progress {
-        let bar = ProgressBar::new(groups.len() as u64);
+        let bar = ProgressBar::new(total_sample_files as u64);
         bar.set_style(
             ProgressStyle::with_template("{msg} {pos}/{len} [{wide_bar:.cyan/blue}] {elapsed}")
                 .unwrap(),
         );
-        bar.set_message("Hashing groups".bold().to_string());
+        bar.set_message("Hashing files".bold().to_string());
         Some(bar)
     } else {
         None
@@ -65,97 +94,144 @@ pub(super) fn hash_groups_and_update_cache(
 
     let sample_hash_errors = Arc::new(AtomicU64::new(0));
     let full_hash_errors = Arc::new(AtomicU64::new(0));
-    let bar_for_threads = bar.clone();
-    let sample_counter = Arc::clone(&sample_hash_errors);
-    let full_counter = Arc::clone(&full_hash_errors);
+    let sample_done = Arc::new(AtomicU64::new(0));
+    let full_done = Arc::new(AtomicU64::new(0));
+    let bar_for_samples = bar.clone();
+    let sample_errors = Arc::clone(&sample_hash_errors);
+    let full_errors = Arc::clone(&full_hash_errors);
+    let sample_done_for_threads = Arc::clone(&sample_done);
     let cache_for_threads = Arc::clone(cache);
     let inode_hash_for_threads = Arc::clone(inode_hash);
-    groups.par_iter_mut().try_for_each(|group| -> Result<()> {
-        let mut sample_hashes: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
-        for (i, fi) in group.iter().enumerate() {
-            if tui_events {
-                let _ = emit_tui_event(&TuiEvent::File {
-                    phase: Some("hashing".to_string()),
-                    path: fi.path.display().to_string(),
-                });
-            }
-            match sample_digest(&fi.path, fi.size) {
-                Ok(h) => {
-                    sample_hashes.entry(h).or_default().push(i);
-                }
-                Err(err) => {
-                    sample_counter.fetch_add(1, Ordering::Relaxed);
-                    if strict {
-                        return Err(anyhow!(
-                            "sample hash error for {}: {}",
-                            fi.path.display(),
-                            err
-                        ));
-                    }
-                }
-            }
-        }
 
-        for indices in sample_hashes.values().filter(|v| v.len() > 1) {
-            for &i in indices {
-                let fi = &mut group[i];
-                if let Ok(ih) = inode_hash_for_threads.lock() {
-                    if let Some(h) = ih.get(&(fi.dev, fi.inode)) {
-                        fi.hash = Some(h.clone());
-                        continue;
-                    }
+    let full_candidates = groups
+        .par_iter_mut()
+        .map(|group| -> Result<Vec<usize>> {
+            let worker = worker_id();
+            let mut sample_hashes: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
+            for (idx, file) in group.iter().enumerate() {
+                emit_worker_activity(
+                    "hashing_sample",
+                    worker,
+                    Some(file.path.display().to_string()),
+                    tui_events,
+                );
+
+                let digest_result = sample_digest(&file.path, file.size);
+                let done = sample_done_for_threads.fetch_add(1, Ordering::Relaxed) + 1;
+                emit_hash_progress(done as usize, total_sample_files, tui_events);
+                if let Some(progress_bar) = &bar_for_samples {
+                    progress_bar.inc(1);
                 }
-                let key = fi.path.to_string_lossy().into_owned();
-                if let Ok(c) = cache_for_threads.lock() {
-                    if let Some(e) = c.get(&key) {
-                        if e.size == fi.size && e.mtime == fi.mtime_secs {
-                            fi.hash = Some(e.hash.clone());
-                            continue;
-                        }
-                    }
-                }
-                if tui_events {
-                    let _ = emit_tui_event(&TuiEvent::File {
-                        phase: Some("hashing".to_string()),
-                        path: fi.path.display().to_string(),
-                    });
-                }
-                match full_digest(&fi.path) {
-                    Ok(h) => {
-                        if let Ok(mut ih) = inode_hash_for_threads.lock() {
-                            ih.insert((fi.dev, fi.inode), h.clone());
-                        }
-                        fi.hash = Some(h.clone());
-                        if let Ok(mut c) = cache_for_threads.lock() {
-                            c.insert(
-                                key,
-                                CacheEntry {
-                                    size: fi.size,
-                                    mtime: fi.mtime_secs,
-                                    hash: h,
-                                },
-                            );
-                        }
+                emit_worker_activity("hashing_sample", worker, None, tui_events);
+
+                match digest_result {
+                    Ok(digest) => {
+                        sample_hashes.entry(digest).or_default().push(idx);
                     }
                     Err(err) => {
-                        full_counter.fetch_add(1, Ordering::Relaxed);
+                        sample_errors.fetch_add(1, Ordering::Relaxed);
                         if strict {
                             return Err(anyhow!(
-                                "full hash error for {}: {}",
-                                fi.path.display(),
+                                "sample hash error for {}: {}",
+                                file.path.display(),
                                 err
                             ));
                         }
                     }
                 }
             }
-        }
 
-        if let Some(bar) = &bar_for_threads {
-            bar.inc(1);
-        }
-        Ok(())
-    })?;
+            Ok(sample_hashes
+                .values()
+                .filter(|indices| indices.len() > 1)
+                .flat_map(|indices| indices.iter().copied())
+                .collect())
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let total_full_files = full_candidates.iter().map(Vec::len).sum::<usize>();
+    if tui_events && total_full_files > 0 {
+        let _ = emit_tui_event(&TuiEvent::Phase {
+            phase: "hashing_full".to_string(),
+        });
+        let _ = emit_tui_event(&TuiEvent::Log {
+            message: format!("Verifying {total_full_files} duplicate candidate file(s)"),
+        });
+        emit_hash_progress(0, total_full_files, true);
+    }
+
+    let full_done_for_threads = Arc::clone(&full_done);
+    groups
+        .par_iter_mut()
+        .zip(full_candidates.into_par_iter())
+        .try_for_each(|(group, indices)| -> Result<()> {
+            let worker = worker_id();
+            for idx in indices {
+                let file = &mut group[idx];
+
+                if let Ok(inode_map) = inode_hash_for_threads.lock() {
+                    if let Some(hash) = inode_map.get(&(file.dev, file.inode)) {
+                        file.hash = Some(hash.clone());
+                        let done = full_done_for_threads.fetch_add(1, Ordering::Relaxed) + 1;
+                        emit_hash_progress(done as usize, total_full_files, tui_events);
+                        continue;
+                    }
+                }
+
+                let key = file.path.to_string_lossy().into_owned();
+                if let Ok(cache_map) = cache_for_threads.lock() {
+                    if let Some(entry) = cache_map.get(&key) {
+                        if entry.size == file.size && entry.mtime == file.mtime_secs {
+                            file.hash = Some(entry.hash.clone());
+                            let done = full_done_for_threads.fetch_add(1, Ordering::Relaxed) + 1;
+                            emit_hash_progress(done as usize, total_full_files, tui_events);
+                            continue;
+                        }
+                    }
+                }
+
+                emit_worker_activity(
+                    "hashing_full",
+                    worker,
+                    Some(file.path.display().to_string()),
+                    tui_events,
+                );
+                let digest_result = full_digest(&file.path);
+                let done = full_done_for_threads.fetch_add(1, Ordering::Relaxed) + 1;
+                emit_hash_progress(done as usize, total_full_files, tui_events);
+                emit_worker_activity("hashing_full", worker, None, tui_events);
+
+                match digest_result {
+                    Ok(hash) => {
+                        if let Ok(mut inode_map) = inode_hash_for_threads.lock() {
+                            inode_map.insert((file.dev, file.inode), hash.clone());
+                        }
+                        file.hash = Some(hash.clone());
+                        if let Ok(mut cache_map) = cache_for_threads.lock() {
+                            cache_map.insert(
+                                key,
+                                CacheEntry {
+                                    size: file.size,
+                                    mtime: file.mtime_secs,
+                                    hash,
+                                },
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        full_errors.fetch_add(1, Ordering::Relaxed);
+                        if strict {
+                            return Err(anyhow!(
+                                "full hash error for {}: {}",
+                                file.path.display(),
+                                err
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?;
 
     warnings.sample_hash_errors += sample_hash_errors.load(Ordering::Relaxed);
     warnings.full_hash_errors += full_hash_errors.load(Ordering::Relaxed);
