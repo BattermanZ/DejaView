@@ -75,17 +75,15 @@ fn outline_logo_lines() -> Vec<Line<'static>> {
         )),
         Line::from(Span::styled(
             "╶┄┄┄ technical linework / lower visual weight ╴",
-            Theme::wordmark_shadow(),
+            Theme::dim(),
         )),
     ]
 }
 
 fn hybrid_logo_lines() -> Vec<Line<'static>> {
     let rows = wordmark::filled_block_rows();
-    let mut lines = Vec::with_capacity(rows.len() * 2);
+    let mut lines = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
-        let shadow = format!("  {}", row.replace('█', "▓"));
-        lines.push(Line::from(Span::styled(shadow, Theme::wordmark_shadow())));
         let style = if index == 1 || index == 2 {
             Theme::wordmark_highlight()
         } else {
@@ -306,6 +304,8 @@ mod tests {
 
         assert!(filled.contains("███"));
         assert!(outline.contains("┌──┐"));
-        assert!(hybrid.contains("▓"));
+        assert!(hybrid.contains("███"));
+        assert_ne!(filled, outline);
+        assert_ne!(outline, hybrid);
     }
 }
