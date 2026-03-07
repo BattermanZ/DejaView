@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::fsutil::{normalize_runtime_dir, safe_write_bytes};
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Config {
     pub downloads: Option<PathBuf>,
@@ -37,12 +39,8 @@ fn load_config_from_path(path: &Path) -> Result<Config> {
 }
 
 fn save_config_to_path(path: &Path, config: &Config) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("config path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent)?;
     let s = serde_json::to_string_pretty(config)?;
-    fs::write(path, s)?;
+    safe_write_bytes(path, s.as_bytes())?;
     Ok(())
 }
 
@@ -93,6 +91,22 @@ pub fn validate_runtime_paths(config: &Config) -> Result<()> {
         return Err(anyhow!(
             "media path is not a directory: {}",
             media.display()
+        ));
+    }
+
+    let normalized_downloads = normalize_runtime_dir(downloads)?;
+    let normalized_media = normalize_runtime_dir(media)?;
+
+    if !normalized_downloads.is_absolute() {
+        return Err(anyhow!(
+            "downloads path must be absolute: {}",
+            normalized_downloads.display()
+        ));
+    }
+    if !normalized_media.is_absolute() {
+        return Err(anyhow!(
+            "media path must be absolute: {}",
+            normalized_media.display()
         ));
     }
 

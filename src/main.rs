@@ -6,10 +6,12 @@ use std::path::PathBuf;
 
 mod config;
 mod engine;
+mod fsutil;
 mod protocol;
 mod tui;
 
 use config::{load_config, save_config};
+use fsutil::normalize_runtime_dir;
 use std::fs;
 
 #[derive(Parser, Debug)]
@@ -184,12 +186,12 @@ fn main() -> Result<()> {
         }
         Commands::Config(args) => match args.command {
             ConfigCommands::SetDownloads { path } => {
-                config.downloads = Some(path);
+                config.downloads = Some(normalize_runtime_dir(&path)?);
                 save_config(&config)?;
                 println!("{} Downloads path set.", "✔".green());
             }
             ConfigCommands::SetMedia { path } => {
-                config.media = Some(path);
+                config.media = Some(normalize_runtime_dir(&path)?);
                 save_config(&config)?;
                 println!("{} Media path set.", "✔".green());
             }
@@ -234,41 +236,7 @@ fn main() -> Result<()> {
 }
 
 fn ensure_required_paths(config: &config::Config) -> Result<()> {
-    let downloads = config.downloads.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "downloads path not set; run: DejaView config set-downloads /path/to/downloads"
-        )
-    })?;
-    let media = config.media.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("media path not set; run: DejaView config set-media /path/to/media")
-    })?;
-
-    if !downloads.exists() {
-        return Err(anyhow::anyhow!(
-            "downloads path does not exist: {}. Update it with: DejaView config set-downloads <path>",
-            downloads.display()
-        ));
-    }
-    if !media.exists() {
-        return Err(anyhow::anyhow!(
-            "media path does not exist: {}. Update it with: DejaView config set-media <path>",
-            media.display()
-        ));
-    }
-    if !downloads.is_dir() {
-        return Err(anyhow::anyhow!(
-            "downloads path is not a directory: {}",
-            downloads.display()
-        ));
-    }
-    if !media.is_dir() {
-        return Err(anyhow::anyhow!(
-            "media path is not a directory: {}",
-            media.display()
-        ));
-    }
-
-    Ok(())
+    config::validate_runtime_paths(config)
 }
 
 fn validate_config(config: &config::Config) -> Result<()> {

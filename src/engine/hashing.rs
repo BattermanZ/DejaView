@@ -29,20 +29,6 @@ fn sample_digest(path: &Path, size: u64) -> Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-fn full_digest(path: &Path) -> Result<String> {
-    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut hasher = Hasher::new();
-    let mut buf = [0u8; 1 << 20];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hasher.finalize().to_hex().to_string())
-}
-
 fn worker_id() -> usize {
     current_thread_index().map_or(1, |idx| idx + 1)
 }
@@ -68,6 +54,20 @@ fn emit_hash_progress(done: usize, total: usize, tui_events: bool) {
             hash_progress_total: Some(total),
         });
     }
+}
+
+pub(super) fn full_digest(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = Hasher::new();
+    let mut buf = [0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub(super) fn hash_groups_and_update_cache(
@@ -192,7 +192,10 @@ pub(super) fn hash_groups_and_update_cache(
                 if let Ok(cache_map) = cache_for_threads.lock()
                     && let Some(entry) = cache_map.get(&key)
                     && entry.size == file.size
-                    && entry.mtime == file.mtime_secs
+                    && entry.mtime_ns == file.mtime_ns
+                    && entry.ctime_ns == file.ctime_ns
+                    && entry.dev == file.dev
+                    && entry.inode == file.inode
                 {
                     file.hash = Some(entry.hash.clone());
                     let done = full_done_for_threads.fetch_add(1, Ordering::Relaxed) + 1;
@@ -228,7 +231,10 @@ pub(super) fn hash_groups_and_update_cache(
                                 key,
                                 CacheEntry {
                                     size: file.size,
-                                    mtime: file.mtime_secs,
+                                    mtime_ns: file.mtime_ns,
+                                    ctime_ns: file.ctime_ns,
+                                    dev: file.dev,
+                                    inode: file.inode,
                                     hash,
                                 },
                             );

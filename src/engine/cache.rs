@@ -1,11 +1,10 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use std::fs;
 use std::io::ErrorKind;
-use std::io::Write;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{Config, cache_path};
+use crate::fsutil::safe_write_bytes;
 
 use super::types::Cache;
 
@@ -17,34 +16,8 @@ pub(super) fn load_cache(path: &Path) -> Cache {
 }
 
 pub(super) fn save_cache(path: &Path, cache: &Cache) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("cache path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent)?;
-
-    let tmp_path = parent.join(format!(
-        ".dejaview_cache.tmp.{}.{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
     let json = serde_json::to_vec(cache)?;
-
-    let write_result = (|| -> Result<()> {
-        let mut file = fs::File::create(&tmp_path)?;
-        file.write_all(&json)?;
-        file.sync_all()?;
-        fs::rename(&tmp_path, path)?;
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-
-    write_result
+    safe_write_bytes(path, &json)
 }
 
 pub(super) fn clear_cache_file(path: &Path) -> Result<()> {

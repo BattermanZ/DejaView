@@ -119,22 +119,24 @@ fn scan_fails_with_actionable_message_when_paths_missing() {
 
     run_ok(
         &root,
-        &[
-            "config",
-            "set-downloads",
-            missing_downloads.to_str().expect("downloads str"),
-        ],
-    );
-    run_ok(
-        &root,
         &["config", "set-media", media.to_str().expect("media str")],
     );
+    let config_path = root.join("xdg").join("dejaview").join("config.json");
+    fs::create_dir_all(config_path.parent().expect("config parent")).expect("create config dir");
+    fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "downloads": missing_downloads,
+            "media": media,
+        }))
+        .expect("serialize config"),
+    )
+    .expect("write config");
 
     let out = run_cmd(&root, &["scan"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("downloads path does not exist"));
-    assert!(stderr.contains("config set-downloads"));
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

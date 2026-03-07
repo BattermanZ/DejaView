@@ -8,6 +8,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::config::{Config, load_config, save_config, validate_runtime_paths};
+use crate::fsutil::normalize_runtime_dir;
 
 use super::actions;
 use super::events::{self, Event};
@@ -603,8 +604,12 @@ impl App {
         L: FnOnce() -> Result<Config>,
     {
         let mut config = load_fn()?;
-        config.downloads = Some(std::fs::canonicalize(editor.downloads.trim())?);
-        config.media = Some(std::fs::canonicalize(editor.media.trim())?);
+        config.downloads = Some(normalize_runtime_dir(std::path::Path::new(
+            editor.downloads.trim(),
+        ))?);
+        config.media = Some(normalize_runtime_dir(std::path::Path::new(
+            editor.media.trim(),
+        ))?);
         validate_runtime_paths(&config)?;
         Ok(config)
     }

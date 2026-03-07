@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow};
 use colored::*;
-use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::fsutil::safe_write_bytes;
 use crate::protocol::{LinkReportEntry, RunReport, WarningSummary};
 
 use super::types::{LinkAction, RunMetrics, RunWarnings, ScanRunOptions};
@@ -92,11 +92,8 @@ pub(super) fn warning_total(warnings: &RunWarnings) -> u64 {
 }
 
 fn write_run_report(path: &Path, report: &RunReport) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_vec_pretty(report)?;
-    fs::write(path, json)?;
+    safe_write_bytes(path, &json)?;
     Ok(())
 }
 

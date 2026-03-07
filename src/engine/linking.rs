@@ -11,6 +11,7 @@ use crate::protocol::TuiEvent;
 
 use crate::protocol::LinkReportEntry;
 
+use super::hashing::full_digest;
 use super::types::emit_tui_event;
 use super::types::{FileInfo, LinkAction, RunWarnings};
 
@@ -27,6 +28,24 @@ pub(super) fn ensure_target_within_media_root(media_root: &Path, target: &Path) 
         ));
     }
 
+    Ok(())
+}
+
+fn resolve_verified_target(media_root: &Path, target: &Path) -> Result<std::path::PathBuf> {
+    ensure_target_within_media_root(media_root, target)?;
+    fs::canonicalize(target).with_context(|| format!("canonicalize {}", target.display()))
+}
+
+fn verify_matching_content(src: &Path, tgt: &Path) -> Result<()> {
+    let src_hash = full_digest(src).with_context(|| format!("verify source {}", src.display()))?;
+    let tgt_hash = full_digest(tgt).with_context(|| format!("verify target {}", tgt.display()))?;
+    if src_hash != tgt_hash {
+        return Err(anyhow!(
+            "refusing to link non-identical files after final verification: {} -> {}",
+            src.display(),
+            tgt.display()
+        ));
+    }
     Ok(())
 }
 
@@ -215,8 +234,10 @@ pub(super) fn apply_actions(
             });
         }
         let apply_result = (|| -> Result<()> {
-            ensure_target_within_media_root(media, &action.tgt)?;
-            let (method, fallback_reason) = replace_file_with_best_link(&action.src, &action.tgt)?;
+            let resolved_target = resolve_verified_target(media, &action.tgt)?;
+            verify_matching_content(&action.src, &resolved_target)?;
+            let (method, fallback_reason) =
+                replace_file_with_best_link(&action.src, &resolved_target)?;
             report_entries[index].method = Some(method);
             report_entries[index].fallback_reason = fallback_reason;
             report_entries[index].status = "applied".to_string();

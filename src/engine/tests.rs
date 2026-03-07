@@ -37,6 +37,27 @@ fn write_file(path: &Path, content: &[u8]) {
     fs::write(path, content).expect("write file");
 }
 
+fn write_three_meg_with_middle(path: &Path, middle: u8) {
+    let mut data = vec![b'A'; 3 * 1024 * 1024];
+    for byte in &mut data[1024 * 1024..2 * 1024 * 1024] {
+        *byte = middle;
+    }
+    write_file(path, &data);
+}
+
+fn sample_file_info(path: &str, dev: u64, inode: u64, in_downloads: bool) -> FileInfo {
+    FileInfo {
+        path: PathBuf::from(path),
+        size: 10,
+        mtime_ns: 0,
+        ctime_ns: 0,
+        dev,
+        inode,
+        hash: Some("h".into()),
+        in_downloads,
+    }
+}
+
 fn run_scan(config: &Config, dry_run: bool, strict: bool, report_path: Option<&Path>) {
     run_scan_with_options(
         config,
@@ -177,7 +198,10 @@ fn save_cache_writes_json() {
         "foo".into(),
         CacheEntry {
             size: 42,
-            mtime: 123,
+            mtime_ns: 123,
+            ctime_ns: 456,
+            dev: 7,
+            inode: 8,
             hash: "abc".into(),
         },
     );
@@ -192,42 +216,10 @@ fn save_cache_writes_json() {
 
 #[test]
 fn plan_group_actions_is_deterministic() {
-    let later_media = FileInfo {
-        path: PathBuf::from("/media/z-last.mkv"),
-        size: 10,
-        mtime_secs: 0,
-        dev: 1,
-        inode: 2,
-        hash: Some("h".into()),
-        in_downloads: false,
-    };
-    let first_media = FileInfo {
-        path: PathBuf::from("/media/a-first.mkv"),
-        size: 10,
-        mtime_secs: 0,
-        dev: 1,
-        inode: 3,
-        hash: Some("h".into()),
-        in_downloads: false,
-    };
-    let download_b = FileInfo {
-        path: PathBuf::from("/downloads/b.mkv"),
-        size: 10,
-        mtime_secs: 0,
-        dev: 2,
-        inode: 4,
-        hash: Some("h".into()),
-        in_downloads: true,
-    };
-    let download_a = FileInfo {
-        path: PathBuf::from("/downloads/a.mkv"),
-        size: 10,
-        mtime_secs: 0,
-        dev: 2,
-        inode: 5,
-        hash: Some("h".into()),
-        in_downloads: true,
-    };
+    let later_media = sample_file_info("/media/z-last.mkv", 1, 2, false);
+    let first_media = sample_file_info("/media/a-first.mkv", 1, 3, false);
+    let download_b = sample_file_info("/downloads/b.mkv", 2, 4, true);
+    let download_a = sample_file_info("/downloads/a.mkv", 2, 5, true);
     let group = vec![&later_media, &download_b, &first_media, &download_a];
 
     let actions = plan_group_actions(&group);
@@ -240,48 +232,16 @@ fn plan_group_actions_is_deterministic() {
 
 #[test]
 fn plan_group_actions_skips_already_hardlinked_source() {
-    let media = FileInfo {
-        path: PathBuf::from("/media/a.mkv"),
-        size: 10,
-        mtime_secs: 0,
-        dev: 1,
-        inode: 111,
-        hash: Some("h".into()),
-        in_downloads: false,
-    };
-    let download = FileInfo {
-        path: PathBuf::from("/downloads/a.mkv"),
-        size: 10,
-        mtime_secs: 0,
-        dev: 1,
-        inode: 111,
-        hash: Some("h".into()),
-        in_downloads: true,
-    };
+    let media = sample_file_info("/media/a.mkv", 1, 111, false);
+    let download = sample_file_info("/downloads/a.mkv", 1, 111, true);
     let actions = plan_group_actions(&[&media, &download]);
     assert!(actions.is_empty());
 }
 
 #[test]
 fn plan_group_actions_requires_both_sides() {
-    let media_only = FileInfo {
-        path: PathBuf::from("/media/a.mkv"),
-        size: 10,
-        mtime_secs: 0,
-        dev: 1,
-        inode: 1,
-        hash: Some("h".into()),
-        in_downloads: false,
-    };
-    let downloads_only = FileInfo {
-        path: PathBuf::from("/downloads/a.mkv"),
-        size: 10,
-        mtime_secs: 0,
-        dev: 2,
-        inode: 2,
-        hash: Some("h".into()),
-        in_downloads: true,
-    };
+    let media_only = sample_file_info("/media/a.mkv", 1, 1, false);
+    let downloads_only = sample_file_info("/downloads/a.mkv", 2, 2, true);
     assert!(plan_group_actions(&[&media_only]).is_empty());
     assert!(plan_group_actions(&[&downloads_only]).is_empty());
 }
@@ -389,6 +349,67 @@ fn run_scan_writes_link_report_manifest() {
     );
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn run_scan_does_not_reuse_stale_cached_hash_for_mutated_file() {
+    let root = unique_temp_dir("stale_cache");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let src = downloads.join("movie.mkv");
+    let tgt = media.join("movie.mkv");
+    write_three_meg_with_middle(&src, b'B');
+    write_three_meg_with_middle(&tgt, b'B');
+    let config = make_config(&downloads, &media, 0);
+
+    run_scan(&config, true, false, None);
+
+    write_three_meg_with_middle(&src, b'C');
+    run_scan(&config, false, false, None);
+
+    let meta = fs::symlink_metadata(&src).expect("source metadata");
+    assert!(meta.file_type().is_file());
+    assert_ne!(
+        fs::read(&src).expect("read source"),
+        fs::read(&tgt).expect("read target")
+    );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn run_scan_report_write_refuses_symlink_target() {
+    #[cfg(not(unix))]
+    {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("report_symlink");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        let src = downloads.join("movie.mkv");
+        let tgt = media.join("movie.mkv");
+        let victim = root.join("victim.json");
+        write_file(&src, b"same-content");
+        write_file(&tgt, b"same-content");
+        write_file(&victim, b"keep");
+        fs::create_dir_all(&downloads).expect("create downloads");
+        symlink(&victim, downloads.join(".dejaview_link_report.json")).expect("symlink report");
+        let config = make_config(&downloads, &media, 0);
+
+        run_scan(&config, false, false, None);
+
+        assert_eq!(fs::read(&victim).expect("read victim"), b"keep");
+        let src_meta = fs::metadata(&src).expect("src metadata");
+        let tgt_meta = fs::metadata(&tgt).expect("tgt metadata");
+        assert_eq!(src_meta.ino(), tgt_meta.ino());
+
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
 }
 
 #[test]
@@ -627,7 +648,10 @@ fn save_cache_failure_cleans_up_temp_file() {
         "k".into(),
         CacheEntry {
             size: 1,
-            mtime: 1,
+            mtime_ns: 1,
+            ctime_ns: 2,
+            dev: 3,
+            inode: 4,
             hash: "h".into(),
         },
     );
@@ -640,7 +664,7 @@ fn save_cache_failure_cleans_up_temp_file() {
         .filter(|e| {
             e.file_name()
                 .to_string_lossy()
-                .starts_with(".dejaview_cache.tmp.")
+                .starts_with(".dejaview_write.tmp.")
         })
         .count();
     assert_eq!(entries, 0);

@@ -62,10 +62,10 @@ pub(super) fn collect_files(
             }
         };
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        let mtime_secs = mtime
+        let mtime_ns = mtime
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_nanos();
         if mtime > deadline {
             metrics.skipped_by_min_age += 1;
             continue;
@@ -73,7 +73,8 @@ pub(super) fn collect_files(
         files.push(FileInfo {
             path: entry.into_path(),
             size: meta.len(),
-            mtime_secs,
+            mtime_ns,
+            ctime_ns: (meta.ctime() as i128 * 1_000_000_000) + meta.ctime_nsec() as i128,
             dev: meta.dev(),
             inode: meta.ino(),
             hash: None,

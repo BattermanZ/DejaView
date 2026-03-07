@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 pub(super) struct FileInfo {
     pub(super) path: PathBuf,
     pub(super) size: u64,
-    pub(super) mtime_secs: u64,
+    pub(super) mtime_ns: u128,
+    pub(super) ctime_ns: i128,
     pub(super) dev: u64,
     pub(super) inode: u64,
     pub(super) hash: Option<String>,
@@ -19,7 +20,10 @@ pub(super) struct FileInfo {
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct CacheEntry {
     pub(super) size: u64,
-    pub(super) mtime: u64,
+    pub(super) mtime_ns: u128,
+    pub(super) ctime_ns: i128,
+    pub(super) dev: u64,
+    pub(super) inode: u64,
     pub(super) hash: String,
 }
 
