@@ -3,6 +3,7 @@ use colored::*;
 use comfy_table::{ContentArrangement, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
 use pathdiff::diff_paths;
 use std::fs;
+use std::io::ErrorKind;
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,6 +45,17 @@ fn verify_matching_content(src: &Path, tgt: &Path) -> Result<()> {
             "refusing to link non-identical files after final verification: {} -> {}",
             src.display(),
             tgt.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_hash_matches(path: &Path, expected_hash: &str) -> Result<()> {
+    let actual_hash = full_digest(path).with_context(|| format!("verify linked {}", path.display()))?;
+    if actual_hash != expected_hash {
+        return Err(anyhow!(
+            "linked file no longer matches verified target content: {}",
+            path.display()
         ));
     }
     Ok(())
@@ -117,8 +129,11 @@ pub(super) fn replace_file_with_best_link_with<F>(
 where
     F: Fn(&Path, &Path) -> std::io::Result<()>,
 {
-    let src_dev = fs::metadata(src)
-        .with_context(|| format!("metadata {}", src.display()))?
+    let parent = src
+        .parent()
+        .ok_or_else(|| anyhow!("source path has no parent: {}", src.display()))?;
+    let src_dev = fs::metadata(parent)
+        .with_context(|| format!("metadata {}", parent.display()))?
         .dev();
     let tgt_dev = fs::metadata(tgt)
         .with_context(|| format!("metadata {}", tgt.display()))?
@@ -142,6 +157,58 @@ pub(super) fn replace_file_with_best_link(
     tgt: &Path,
 ) -> Result<(String, Option<String>)> {
     replace_file_with_best_link_with(src, tgt, |from, to| fs::hard_link(from, to))
+}
+
+fn replace_file_with_verified_link(
+    src: &Path,
+    tgt: &Path,
+    expected_hash: &str,
+) -> Result<(String, Option<String>)> {
+    let parent = src
+        .parent()
+        .ok_or_else(|| anyhow!("source path has no parent: {}", src.display()))?;
+    let backup = parent.join(format!(
+        ".dejaview_restore.tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+
+    fs::rename(src, &backup)
+        .with_context(|| format!("mv {:?} {:?}", src.display(), backup.display()))?;
+
+    let link_result = (|| -> Result<(String, Option<String>)> {
+        let result = replace_file_with_best_link(src, tgt)?;
+        verify_hash_matches(src, expected_hash)?;
+        Ok(result)
+    })();
+
+    match link_result {
+        Ok(result) => {
+            fs::remove_file(&backup)
+                .with_context(|| format!("remove backup {}", backup.display()))?;
+            Ok(result)
+        }
+        Err(err) => {
+            match fs::remove_file(src) {
+                Ok(()) => {}
+                Err(remove_err) if remove_err.kind() == ErrorKind::NotFound => {}
+                Err(remove_err) => {
+                    let _ = fs::rename(&backup, src);
+                    return Err(anyhow!(
+                        "{err}; additionally failed to remove invalid link at {}: {}",
+                        src.display(),
+                        remove_err
+                    ));
+                }
+            }
+            fs::rename(&backup, src)
+                .with_context(|| format!("restore {:?} {:?}", backup.display(), src.display()))?;
+            Err(err)
+        }
+    }
 }
 
 pub(super) fn plan_group_actions(group: &[&FileInfo]) -> Vec<LinkAction> {
@@ -235,9 +302,11 @@ pub(super) fn apply_actions(
         }
         let apply_result = (|| -> Result<()> {
             let resolved_target = resolve_verified_target(media, &action.tgt)?;
+            let expected_hash = full_digest(&resolved_target)
+                .with_context(|| format!("hash verified target {}", resolved_target.display()))?;
             verify_matching_content(&action.src, &resolved_target)?;
             let (method, fallback_reason) =
-                replace_file_with_best_link(&action.src, &resolved_target)?;
+                replace_file_with_verified_link(&action.src, &resolved_target, &expected_hash)?;
             report_entries[index].method = Some(method);
             report_entries[index].fallback_reason = fallback_reason;
             report_entries[index].status = "applied".to_string();

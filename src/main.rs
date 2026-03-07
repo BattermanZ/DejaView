@@ -2,7 +2,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::*;
 use std::io::IsTerminal;
+use std::io::Write;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 mod config;
 mod engine;
@@ -252,10 +254,8 @@ fn validate_config(config: &config::Config) -> Result<()> {
                     path.display()
                 ));
             } else {
-                let probe = path.join(format!(".dejaview_validate_{}", std::process::id()));
-                match fs::File::create(&probe) {
+                match probe_directory_writable(path) {
                     Ok(_) => {
-                        let _ = fs::remove_file(&probe);
                     }
                     Err(err) => failures.push(format!(
                         "downloads path is not writable (needed for cache/link ops): {} ({err})",
@@ -298,9 +298,45 @@ fn validate_config(config: &config::Config) -> Result<()> {
     }
 }
 
+fn probe_directory_writable(path: &std::path::Path) -> Result<()> {
+    let probe = path.join(format!(
+        ".dejaview_validate_{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)?;
+    file.write_all(b"probe")?;
+    file.sync_all()?;
+    fs::remove_file(&probe)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "dejaview_main_{prefix}_{}_{}",
+            std::process::id(),
+            ts
+        ))
+    }
 
     #[test]
     fn parses_scan_command() {
@@ -416,6 +452,35 @@ mod tests {
         match cli.command {
             Commands::TuiLogoPreview => {}
             _ => panic!("expected logo preview command"),
+        }
+    }
+
+    #[test]
+    fn probe_directory_writable_does_not_follow_existing_symlink() {
+        #[cfg(not(unix))]
+        {
+            return;
+        }
+
+        #[cfg(unix)]
+        {
+            let root = unique_temp_dir("probe_symlink");
+            fs::create_dir_all(&root).expect("create root");
+            let victim = root.join("victim");
+            fs::write(&victim, b"keep").expect("write victim");
+            let link = root.join(format!(
+                ".dejaview_validate_{}.{}",
+                std::process::id(),
+                1u8
+            ));
+            symlink(&victim, &link).expect("create symlink");
+
+            for _ in 0..16 {
+                probe_directory_writable(&root).expect("probe should succeed");
+            }
+
+            assert_eq!(fs::read(&victim).expect("read victim"), b"keep");
+            let _ = fs::remove_dir_all(&root);
         }
     }
 }

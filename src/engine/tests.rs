@@ -175,6 +175,27 @@ fn replace_file_with_best_link_falls_back_to_symlink_on_hardlink_error() {
 }
 
 #[test]
+fn replace_file_with_best_link_works_when_source_path_is_absent() {
+    let root = unique_temp_dir("link_missing_src");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    fs::create_dir_all(&downloads).expect("create downloads dir");
+    fs::create_dir_all(&media).expect("create media dir");
+
+    let src = downloads.join("duplicate.mkv");
+    let tgt = media.join("canonical.mkv");
+    fs::write(&tgt, b"new").expect("write target");
+
+    let result = replace_file_with_best_link_with(&src, &tgt, |from, to| fs::hard_link(from, to))
+        .expect("replace with missing source");
+
+    assert_eq!(result.0, "hardlink");
+    assert_eq!(fs::read(&src).expect("read through hardlink"), b"new");
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
 fn clear_cache_file_is_idempotent() {
     let root = unique_temp_dir("cache_clear");
     fs::create_dir_all(&root).expect("create temp dir");
