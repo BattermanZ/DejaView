@@ -14,7 +14,7 @@ pub use types::ScanRunOptions;
 
 use crate::protocol::TuiEvent;
 use cache::{load_cache, save_cache};
-use collect::{collect_run_files, group_files_by_size};
+use collect::{collect_run_files, group_files_by_size, CollectOptions};
 use hashing::hash_groups_and_update_cache;
 use linking::{apply_actions, plan_actions_and_table};
 use report::{
@@ -64,9 +64,11 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         downloads,
         media,
         min_age,
-        options.strict,
-        options.show_progress,
-        options.tui_events,
+        CollectOptions {
+            strict: options.strict,
+            show_progress: options.show_progress,
+            tui_events: options.tui_events,
+        },
         &mut warnings,
         &mut metrics,
     )?;

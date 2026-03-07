@@ -11,6 +11,13 @@ use super::types::emit_tui_event;
 use super::types::{FileInfo, RunMetrics, RunWarnings};
 use crate::protocol::TuiEvent;
 
+#[derive(Copy, Clone)]
+pub(super) struct CollectOptions {
+    pub strict: bool,
+    pub show_progress: bool,
+    pub tui_events: bool,
+}
+
 fn is_regular(entry: &DirEntry) -> bool {
     entry.file_type().is_file() && !entry.path_is_symlink()
 }
@@ -101,13 +108,11 @@ pub(super) fn collect_run_files(
     downloads: &Path,
     media: &Path,
     min_age: Duration,
-    strict: bool,
-    show_progress: bool,
-    tui_events: bool,
+    options: CollectOptions,
     warnings: &mut RunWarnings,
     metrics: &mut RunMetrics,
 ) -> Result<Vec<FileInfo>> {
-    let spinner = if show_progress {
+    let spinner = if options.show_progress {
         let mp = MultiProgress::new();
         let spinner = mp.add(ProgressBar::new_spinner());
         spinner.set_style(
@@ -124,14 +129,27 @@ pub(super) fn collect_run_files(
 
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
     let mut files = collect_files(
-        downloads, true, min_age, strict, tui_events, warnings, metrics,
+        downloads,
+        true,
+        min_age,
+        options.strict,
+        options.tui_events,
+        warnings,
+        metrics,
     )?;
     for f in &files {
         seen.insert((f.dev, f.inode));
     }
 
-    let mut media_files =
-        collect_files(media, false, min_age, strict, tui_events, warnings, metrics)?;
+    let mut media_files = collect_files(
+        media,
+        false,
+        min_age,
+        options.strict,
+        options.tui_events,
+        warnings,
+        metrics,
+    )?;
     media_files.retain(|f| !seen.contains(&(f.dev, f.inode)));
     files.extend(media_files);
 
