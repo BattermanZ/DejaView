@@ -286,6 +286,14 @@ impl App {
     }
 
     pub fn activity_message(&self) -> String {
+        if self.running_job.is_some()
+            && matches!(
+                self.current_phase.as_deref(),
+                Some("hashing_sample") | Some("hashing_full") | Some("applying")
+            )
+        {
+            return String::new();
+        }
         self.latest_activity_message
             .clone()
             .unwrap_or_else(|| self.last_log_line())
@@ -857,6 +865,19 @@ impl App {
             .iter()
             .map(|(worker, path)| (*worker, (*path).to_string()))
             .collect();
+    }
+
+    pub(crate) fn set_hash_progress_for_test(&mut self, done: usize, total: usize) {
+        self.hash_progress_done = Some(done);
+        self.hash_progress_total = Some(total);
+    }
+
+    pub(crate) fn set_running_scan_for_test(&mut self) {
+        let (_tx, rx) = mpsc::channel();
+        self.running_job = Some(RunningJob {
+            kind: JobKind::Scan,
+            receiver: rx,
+        });
     }
 }
 

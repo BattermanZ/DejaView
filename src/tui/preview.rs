@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use super::theme::Theme;
+use super::wordmark;
 
 type PreviewTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -54,59 +55,8 @@ impl Default for PreviewApp {
     }
 }
 
-const GLYPH_HEIGHT: usize = 5;
-
-type Glyph = [&'static str; GLYPH_HEIGHT];
-
-const D_GLYPH: Glyph = ["████ ", "█   █", "█   █", "█   █", "████ "];
-const E_GLYPH: Glyph = ["█████", "█    ", "████ ", "█    ", "█████"];
-const J_GLYPH: Glyph = ["█████", "   █ ", "   █ ", "█  █ ", " ██  "];
-const A_GLYPH: Glyph = [" ███ ", "█   █", "█████", "█   █", "█   █"];
-const V_GLYPH: Glyph = ["█   █", "█   █", "█   █", " █ █ ", "  █  "];
-const I_GLYPH: Glyph = ["█████", "  █  ", "  █  ", "  █  ", "█████"];
-const W_GLYPH: Glyph = ["█   █", "█   █", "█ █ █", "██ ██", "█   █"];
-
-fn glyph_for(ch: char) -> Glyph {
-    match ch {
-        'D' => D_GLYPH,
-        'E' => E_GLYPH,
-        'J' => J_GLYPH,
-        'A' => A_GLYPH,
-        'V' => V_GLYPH,
-        'I' => I_GLYPH,
-        'W' => W_GLYPH,
-        _ => ["    ", "    ", "    ", "    ", "    "],
-    }
-}
-
-fn compose_word_rows(word: &str) -> [String; GLYPH_HEIGHT] {
-    let mut rows = std::array::from_fn(|_| String::new());
-    for (index, ch) in word.chars().enumerate() {
-        let glyph = glyph_for(ch);
-        for row in 0..GLYPH_HEIGHT {
-            rows[row].push_str(glyph[row]);
-            if index + 1 < word.chars().count() {
-                rows[row].push(' ');
-            }
-        }
-    }
-    rows
-}
-
 fn filled_logo_lines() -> Vec<Line<'static>> {
-    let rows = compose_word_rows("DEJAVIEW");
-    let mut lines = Vec::with_capacity(GLYPH_HEIGHT + 1);
-    for (index, row) in rows.iter().enumerate() {
-        let style = if index == 2 {
-            Theme::wordmark_highlight()
-        } else {
-            Theme::wordmark()
-        };
-        lines.push(Line::from(Span::styled(row.clone(), style)));
-    }
-    let shadow = format!("  {}", rows[GLYPH_HEIGHT - 1].replace('█', "░"));
-    lines.push(Line::from(Span::styled(shadow, Theme::wordmark_shadow())));
-    lines
+    wordmark::filled_block_lines()
 }
 
 fn outline_logo_lines() -> Vec<Line<'static>> {
@@ -131,8 +81,8 @@ fn outline_logo_lines() -> Vec<Line<'static>> {
 }
 
 fn hybrid_logo_lines() -> Vec<Line<'static>> {
-    let rows = compose_word_rows("DEJAVIEW");
-    let mut lines = Vec::with_capacity(GLYPH_HEIGHT * 2);
+    let rows = wordmark::filled_block_rows();
+    let mut lines = Vec::with_capacity(rows.len() * 2);
     for (index, row) in rows.iter().enumerate() {
         let shadow = format!("  {}", row.replace('█', "▓"));
         lines.push(Line::from(Span::styled(shadow, Theme::wordmark_shadow())));
@@ -330,8 +280,8 @@ mod tests {
 
     #[test]
     fn shared_glyphs_compose_the_full_name() {
-        let rows = compose_word_rows("DEJAVIEW");
-        assert_eq!(rows.len(), GLYPH_HEIGHT);
+        let rows = wordmark::filled_block_rows();
+        assert_eq!(rows.len(), 5);
         assert!(rows[0].contains("███"));
         assert!(rows[0].chars().count() > 32);
     }

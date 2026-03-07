@@ -6,6 +6,7 @@ mod model;
 mod preview;
 mod theme;
 mod view;
+mod wordmark;
 
 use anyhow::Result;
 use crossterm::event::DisableMouseCapture;

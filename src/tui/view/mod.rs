@@ -6,6 +6,7 @@ use crate::tui::app::{App, ConfigEditor, ConfigField, Overlay};
 use crate::tui::layout;
 use crate::tui::model::LinkReportEntry;
 use crate::tui::theme::Theme;
+use crate::tui::wordmark;
 
 fn format_bytes(bytes: u64) -> String {
     let units = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
@@ -310,15 +311,18 @@ fn header_activity_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             Span::styled(format!("elapsed {}", app.elapsed_label()), Theme::muted()),
         ]),
         Line::from(Span::styled(app.throughput_label(), Theme::muted())),
-        Line::from(Span::styled(
-            trim_to_width(&app.activity_message(), line_width),
-            Theme::dim(),
-        )),
     ];
+    let message = app.activity_message();
+    if !message.is_empty() {
+        lines.push(Line::from(Span::styled(
+            trim_to_width(&message, line_width),
+            Theme::dim(),
+        )));
+    }
     if !app.active_worker_paths().is_empty() {
         for (worker, path) in app.active_worker_paths().into_iter().take(3) {
             lines.push(Line::from(vec![
-                Span::styled(format!("worker {worker} ",), Theme::dim()),
+                Span::styled(format!("worker {worker}: "), Theme::dim()),
                 Span::styled(
                     display_path(path, usize::from(line_width).max(12), app.expand_paths()),
                     Theme::base(),
@@ -370,7 +374,7 @@ enum WordmarkVariant {
 }
 
 fn wordmark_variant(width: u16) -> WordmarkVariant {
-    if width >= 40 {
+    if width >= 56 {
         WordmarkVariant::Large
     } else if width >= 24 {
         WordmarkVariant::Compact
@@ -380,46 +384,7 @@ fn wordmark_variant(width: u16) -> WordmarkVariant {
 }
 
 fn large_wordmark_lines() -> Vec<Line<'static>> {
-    vec![
-        Line::from(vec![
-            Span::styled(
-                " ____  ____  _  _   __   _  _  _  ____  _    _ ",
-                Theme::wordmark(),
-            ),
-            Span::styled(
-                "  ____  ____  _  _   __   _  _  _ ",
-                Theme::wordmark_shadow(),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "|  _ \\| ___|| || | / _\\ | || || ||  _ \\| |  | |",
-                Theme::wordmark(),
-            ),
-            Span::styled(" |  _ \\| ___|| || | / _\\ ", Theme::wordmark_shadow()),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "| | | | _|  | || |/ /_\\ \\| || || || | | | |  | |",
-                Theme::wordmark_highlight(),
-            ),
-            Span::styled(" | | | | _|  | || |/ /_\\ \\", Theme::wordmark_shadow()),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "| |_| | |___| || /  _  \\ \\ V  V /| |_| | |__| |",
-                Theme::wordmark(),
-            ),
-            Span::styled(" | |_| | |___| || /  _  \\", Theme::wordmark_shadow()),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "|____/|_____||_||_| |_|  \\_/\\_/ |____/ \\____/ ",
-                Theme::wordmark(),
-            ),
-            Span::styled(" |____/|_____||_||_| |_| ", Theme::wordmark_shadow()),
-        ]),
-    ]
+    wordmark::filled_block_lines()
 }
 
 fn compact_wordmark_lines() -> Vec<Line<'static>> {
@@ -502,10 +467,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-    let brand_width = area.width.saturating_sub(40).clamp(24, 46);
+    let brand_width = area.width.saturating_sub(38).clamp(28, 60);
     let split = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(brand_width), Constraint::Min(40)])
+        .constraints([Constraint::Length(brand_width), Constraint::Min(38)])
         .split(area);
 
     let brand = Layout::default()
@@ -957,20 +922,38 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(combined.contains("worker 2"));
-        assert!(combined.contains("worker 4"));
+        assert!(combined.contains("worker 2:"));
+        assert!(combined.contains("worker 4:"));
         assert!(combined.contains("alpha.mkv"));
     }
 
     #[test]
-    fn wordmark_uses_large_variant_for_wide_headers() {
-        let combined = wordmark_lines(44)
+    fn header_activity_lines_do_not_repeat_hashing_copy() {
+        let mut app = App::new(&crate::config::Config::default(), false);
+        app.set_running_scan_for_test();
+        app.set_hash_activity_for_test("hashing_full", &[(3, "/downloads/dupe.mkv")]);
+        app.set_hash_progress_for_test(10, 12);
+
+        let combined = header_activity_lines(&app, 120)
             .iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(matches!(wordmark_variant(44), WordmarkVariant::Large));
-        assert!(combined.contains("____"));
+
+        assert!(combined.contains("VERIFYING DUPLICATES"));
+        assert!(combined.contains("10 / 12 duplicate files verified"));
+        assert!(!combined.contains("Verifying duplicate files: 10 / 12"));
+    }
+
+    #[test]
+    fn wordmark_uses_large_variant_for_wide_headers() {
+        let combined = wordmark_lines(60)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(matches!(wordmark_variant(60), WordmarkVariant::Large));
+        assert!(combined.contains("████"));
     }
 
     #[test]
