@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::engine::LinkMode;
 use crate::fsutil::{normalize_runtime_dir, safe_write_bytes};
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -11,6 +12,7 @@ pub struct Config {
     pub media: Option<PathBuf>,
     pub min_age: Option<u64>,
     pub threads: Option<usize>,
+    pub link_mode: Option<LinkMode>,
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -139,6 +141,7 @@ mod tests {
             media: Some(root.join("media")),
             min_age: Some(60),
             threads: Some(4),
+            link_mode: Some(LinkMode::SymlinkOnly),
         };
 
         save_config_to_path(&path, &config).expect("save config");
@@ -147,6 +150,7 @@ mod tests {
         assert_eq!(loaded.media, config.media);
         assert_eq!(loaded.min_age, config.min_age);
         assert_eq!(loaded.threads, config.threads);
+        assert_eq!(loaded.link_mode, config.link_mode);
 
         fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
@@ -184,6 +188,7 @@ mod tests {
             media: Some(media),
             min_age: None,
             threads: None,
+            link_mode: None,
         };
 
         validate_runtime_paths(&config).expect("paths should validate");
@@ -201,6 +206,7 @@ mod tests {
             media: Some(root.join("missing-media")),
             min_age: None,
             threads: None,
+            link_mode: None,
         };
 
         let result = validate_runtime_paths(&config);
@@ -221,6 +227,7 @@ mod tests {
             media: Some(PathBuf::from("media")),
             min_age: None,
             threads: None,
+            link_mode: None,
         };
 
         let result = validate_runtime_paths(&config);

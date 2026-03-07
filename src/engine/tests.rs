@@ -15,7 +15,7 @@ use super::linking::{
     replace_file_with_relative_symlink,
 };
 use crate::protocol::LinkReportEntry;
-use super::types::{Cache, CacheEntry, FileInfo, RunMetrics, RunWarnings};
+use super::types::{Cache, CacheEntry, FileInfo, LinkMode, RunMetrics, RunWarnings};
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     let ts = SystemTime::now()
@@ -31,6 +31,7 @@ fn make_config(downloads: &Path, media: &Path, min_age: u64) -> Config {
         media: Some(media.to_path_buf()),
         min_age: Some(min_age),
         threads: None,
+        link_mode: Some(LinkMode::Best),
     }
 }
 
@@ -63,6 +64,7 @@ fn run_scan(config: &Config, dry_run: bool, strict: bool, report_path: Option<&P
             show_progress: false,
             require_confirm: false,
             tui_events: false,
+            link_mode: LinkMode::Best,
         },
     )
     .expect("run scan");
@@ -184,7 +186,7 @@ fn replace_file_with_best_link_falls_back_to_symlink_on_hardlink_error() {
             std::io::ErrorKind::PermissionDenied,
             "simulated hardlink failure",
         ))
-    })
+    }, LinkMode::Best)
     .expect("replace with fallback");
 
     assert_eq!(result.0, "symlink");
@@ -481,6 +483,7 @@ fn apply_actions_rejects_source_metadata_change_after_planning() {
         false,
         true,
         false,
+        LinkMode::Best,
         &mut warnings,
         &mut report_entries,
     );
@@ -553,6 +556,7 @@ fn apply_actions_rejects_target_metadata_change_after_planning() {
         false,
         true,
         false,
+        LinkMode::Best,
         &mut warnings,
         &mut report_entries,
     );
@@ -690,6 +694,7 @@ fn run_scan_strict_fails_on_sample_hash_error() {
             show_progress: false,
             require_confirm: false,
             tui_events: false,
+            link_mode: LinkMode::Best,
         },
     );
     assert!(strict_result.is_err());
@@ -703,6 +708,7 @@ fn run_scan_strict_fails_on_sample_hash_error() {
             show_progress: false,
             require_confirm: false,
             tui_events: false,
+            link_mode: LinkMode::Best,
         },
     );
     assert!(non_strict_result.is_ok());
@@ -743,6 +749,7 @@ fn run_scan_non_strict_link_failure_continues() {
             show_progress: false,
             require_confirm: false,
             tui_events: false,
+            link_mode: LinkMode::Best,
         },
     );
     assert!(result.is_ok());
@@ -787,6 +794,7 @@ fn run_scan_strict_link_failure_returns_error() {
             show_progress: false,
             require_confirm: false,
             tui_events: false,
+            link_mode: LinkMode::Best,
         },
     );
     assert!(result.is_err());

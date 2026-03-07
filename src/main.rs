@@ -14,6 +14,7 @@ mod protocol;
 mod tui;
 
 use config::{load_config, save_config};
+use engine::LinkMode;
 use fsutil::normalize_runtime_dir;
 use std::fs;
 
@@ -31,6 +32,9 @@ enum Commands {
         /// Fail if any scan/hash/link errors occur
         #[arg(long)]
         strict: bool,
+        /// Force symlink creation and never attempt hardlinks
+        #[arg(long)]
+        symlink_only: bool,
         #[command(flatten)]
         output: RunOutputArgs,
     },
@@ -42,6 +46,9 @@ enum Commands {
         /// Ask for confirmation before applying changes (interactive terminals only)
         #[arg(long)]
         confirm: bool,
+        /// Force symlink creation and never attempt hardlinks
+        #[arg(long)]
+        symlink_only: bool,
         #[command(flatten)]
         output: RunOutputArgs,
     },
@@ -114,6 +121,8 @@ enum ConfigCommands {
     SetMinAge { seconds: u64 },
     /// Set worker thread count for hashing
     SetThreads { count: usize },
+    /// Set link mode
+    SetLinkMode { mode: LinkModeArg },
     /// Validate configured paths and permissions
     Validate,
 }
@@ -130,6 +139,25 @@ enum CacheCommands {
     Clear,
     /// Show cache info
     Info,
+    /// List DejaView temp artifacts left in the downloads tree
+    AuditTemp,
+    /// Remove DejaView temp artifacts left in the downloads tree
+    CleanupTemp,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum LinkModeArg {
+    Best,
+    SymlinkOnly,
+}
+
+impl From<LinkModeArg> for LinkMode {
+    fn from(value: LinkModeArg) -> Self {
+        match value {
+            LinkModeArg::Best => LinkMode::Best,
+            LinkModeArg::SymlinkOnly => LinkMode::SymlinkOnly,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -149,7 +177,11 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Scan { strict, output } => {
+        Commands::Scan {
+            strict,
+            symlink_only,
+            output,
+        } => {
             ensure_required_paths(&config)?;
             engine::run_scan_with_options(
                 &config,
@@ -166,12 +198,14 @@ fn main() -> Result<()> {
                     ),
                     require_confirm: false,
                     tui_events: output.tui_events,
+                    link_mode: effective_link_mode(&config, symlink_only),
                 },
             )?
         }
         Commands::Link {
             strict,
             confirm,
+            symlink_only,
             output,
         } => {
             ensure_required_paths(&config)?;
@@ -190,6 +224,7 @@ fn main() -> Result<()> {
                     ),
                     require_confirm: confirm,
                     tui_events: output.tui_events,
+                    link_mode: effective_link_mode(&config, symlink_only),
                 },
             )?
         }
@@ -220,6 +255,11 @@ fn main() -> Result<()> {
                 save_config(&config)?;
                 println!("{} threads set to {}.", "✔".green(), count);
             }
+            ConfigCommands::SetLinkMode { mode } => {
+                config.link_mode = Some(mode.into());
+                save_config(&config)?;
+                println!("{} link mode set.", "✔".green());
+            }
             ConfigCommands::Validate => validate_config(&config)?,
         },
         Commands::Cache(args) => match args.command {
@@ -231,6 +271,20 @@ fn main() -> Result<()> {
                 let (path, entries) = engine::cache_info(&config)?;
                 println!("Cache location: {}", path.display());
                 println!("Cached entries: {}", entries);
+            }
+            CacheCommands::AuditTemp => {
+                let paths = engine::audit_temp_artifacts(&config)?;
+                println!("Temp artifacts: {}", paths.len());
+                for path in paths {
+                    println!("{}", path.display());
+                }
+            }
+            CacheCommands::CleanupTemp => {
+                let paths = engine::cleanup_temp_artifacts(&config)?;
+                println!("Removed temp artifacts: {}", paths.len());
+                for path in paths {
+                    println!("{}", path.display());
+                }
             }
         },
         Commands::Tui { strict } => {
@@ -251,6 +305,14 @@ fn command_name(command: &Commands) -> &'static str {
         Commands::Cache(_) => "cache",
         Commands::Tui { .. } => "tui",
         Commands::TuiLogoPreview => "tui-logo-preview",
+    }
+}
+
+fn effective_link_mode(config: &config::Config, symlink_only: bool) -> LinkMode {
+    if symlink_only {
+        LinkMode::SymlinkOnly
+    } else {
+        config.link_mode.unwrap_or(LinkMode::Best)
     }
 }
 
@@ -359,8 +421,13 @@ mod tests {
     fn parses_scan_command() {
         let cli = Cli::try_parse_from(["dejaview", "scan", "--strict"]).expect("parse scan");
         match cli.command {
-            Commands::Scan { strict, output } => {
+            Commands::Scan {
+                strict,
+                symlink_only,
+                output,
+            } => {
                 assert!(strict);
+                assert!(!symlink_only);
                 assert!(!output.json);
                 assert_eq!(output.report, None);
                 assert_eq!(output.progress, ProgressMode::Auto);
@@ -386,10 +453,12 @@ mod tests {
             Commands::Link {
                 strict,
                 confirm,
+                symlink_only,
                 output,
             } => {
                 assert!(!strict);
                 assert!(!confirm);
+                assert!(!symlink_only);
                 assert!(output.json);
                 assert_eq!(output.report, Some(PathBuf::from("/tmp/report.json")));
                 assert_eq!(output.progress, ProgressMode::Auto);
@@ -450,6 +519,30 @@ mod tests {
                 command: CacheCommands::Info,
             }) => {}
             _ => panic!("expected cache info command"),
+        }
+    }
+
+    #[test]
+    fn parses_config_set_link_mode_command() {
+        let cli = Cli::try_parse_from(["dejaview", "config", "set-link-mode", "symlink-only"])
+            .expect("parse config set-link-mode");
+        match cli.command {
+            Commands::Config(ConfigArgs {
+                command: ConfigCommands::SetLinkMode { mode },
+            }) => assert_eq!(mode, LinkModeArg::SymlinkOnly),
+            _ => panic!("expected config set-link-mode command"),
+        }
+    }
+
+    #[test]
+    fn parses_cache_cleanup_temp_command() {
+        let cli = Cli::try_parse_from(["dejaview", "cache", "cleanup-temp"])
+            .expect("parse cache cleanup-temp");
+        match cli.command {
+            Commands::Cache(CacheArgs {
+                command: CacheCommands::CleanupTemp,
+            }) => {}
+            _ => panic!("expected cache cleanup-temp command"),
         }
     }
 

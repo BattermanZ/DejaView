@@ -11,6 +11,7 @@ mod report;
 mod types;
 
 pub use types::ScanRunOptions;
+pub use types::LinkMode;
 
 use crate::protocol::TuiEvent;
 use cache::{load_cache, save_cache};
@@ -33,6 +34,14 @@ pub fn cache_info(config: &Config) -> Result<(std::path::PathBuf, usize)> {
 
 pub fn clear_cache(config: &Config) -> Result<()> {
     cache::clear_cache(config)
+}
+
+pub fn audit_temp_artifacts(config: &Config) -> Result<Vec<std::path::PathBuf>> {
+    cache::audit_temp_artifacts(config)
+}
+
+pub fn cleanup_temp_artifacts(config: &Config) -> Result<Vec<std::path::PathBuf>> {
+    cache::cleanup_temp_artifacts(config)
 }
 
 pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
@@ -116,6 +125,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         options.strict,
         options.show_progress,
         options.tui_events,
+        options.link_mode,
         &mut warnings,
     )?;
 
@@ -155,7 +165,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         print_space_summary(actions.is_empty(), total_saved_space);
     }
     let out_path = resolve_report_path(downloads, &options);
-    let mut report_entries = build_report_entries(&actions);
+    let mut report_entries = build_report_entries(&actions, options.link_mode);
 
     let (applied_actions, strict_link_error) = if options.dry_run {
         (0usize, None)
@@ -181,6 +191,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
             options.strict,
             options.json_output,
             options.tui_events,
+            options.link_mode,
             &mut warnings,
             &mut report_entries,
         )

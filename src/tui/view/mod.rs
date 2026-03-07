@@ -204,6 +204,11 @@ fn sidebar_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             Span::raw("    "),
             Span::styled(app.threads_label(), Theme::base()),
         ]),
+        Line::from(vec![
+            Span::styled("Link mode", Theme::dim()),
+            Span::raw("  "),
+            Span::styled(app.link_mode_label(), Theme::base()),
+        ]),
         Line::raw(""),
         Line::from(Span::styled(" ACTIONS", Theme::title(false))),
         key_hint("e", "edit paths", true),

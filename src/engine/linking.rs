@@ -13,7 +13,7 @@ use crate::logger;
 use crate::protocol::LinkReportEntry;
 
 use super::types::emit_tui_event;
-use super::types::{FileInfo, FileSnapshot, LinkAction, RunWarnings};
+use super::types::{FileInfo, FileSnapshot, LinkAction, LinkMode, RunWarnings};
 
 pub(super) fn ensure_target_within_media_root(media_root: &Path, target: &Path) -> Result<()> {
     let target_meta =
@@ -199,10 +199,26 @@ pub(super) fn replace_file_with_best_link_with<F>(
     src: &Path,
     tgt: &Path,
     hard_link_fn: F,
+    link_mode: LinkMode,
 ) -> Result<(String, Option<String>)>
 where
     F: Fn(&Path, &Path) -> std::io::Result<()>,
 {
+    if link_mode == LinkMode::SymlinkOnly {
+        logger::info(
+            "link",
+            format!(
+                "symlink-only mode active for {} -> {}",
+                src.display(),
+                tgt.display()
+            ),
+        );
+        replace_file_with_relative_symlink(src, tgt)?;
+        return Ok((
+            "symlink".to_string(),
+            Some("symlink-only mode enabled".to_string()),
+        ));
+    }
     let parent = src
         .parent()
         .ok_or_else(|| anyhow!("source path has no parent: {}", src.display()))?;
@@ -248,8 +264,9 @@ where
 pub(super) fn replace_file_with_best_link(
     src: &Path,
     tgt: &Path,
+    link_mode: LinkMode,
 ) -> Result<(String, Option<String>)> {
-    replace_file_with_best_link_with(src, tgt, |from, to| fs::hard_link(from, to))
+    replace_file_with_best_link_with(src, tgt, |from, to| fs::hard_link(from, to), link_mode)
 }
 
 pub(super) fn plan_group_actions(group: &[&FileInfo]) -> Vec<LinkAction> {
@@ -328,6 +345,7 @@ pub(super) fn apply_actions(
     strict: bool,
     json_output: bool,
     tui_events: bool,
+    link_mode: LinkMode,
     warnings: &mut RunWarnings,
     report_entries: &mut [LinkReportEntry],
 ) -> (usize, Option<anyhow::Error>) {
@@ -358,7 +376,7 @@ pub(super) fn apply_actions(
             ensure_target_within_media_root(media, &action.tgt)?;
             ensure_snapshot_matches(&action.tgt, &action.tgt_snapshot, "target")?;
             let (method, fallback_reason) =
-                replace_file_with_best_link(&action.src, &action.tgt)?;
+                replace_file_with_best_link(&action.src, &action.tgt, link_mode)?;
             report_entries[index].method = Some(method);
             report_entries[index].fallback_reason = fallback_reason;
             report_entries[index].status = "applied".to_string();

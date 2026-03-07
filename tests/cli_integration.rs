@@ -47,6 +47,10 @@ fn set_min_age_zero(root: &Path) {
     .expect("write config");
 }
 
+fn set_link_mode(root: &Path, mode: &str) {
+    run_ok(root, &["config", "set-link-mode", mode]);
+}
+
 #[test]
 fn config_and_cache_commands_work_end_to_end() {
     let root = unique_temp_dir("config_cache");
@@ -182,6 +186,92 @@ fn link_command_prefers_hardlink_and_writes_report() {
     assert_eq!(src_meta.ino(), tgt_meta.ino());
     assert_eq!(src_meta.dev(), tgt_meta.dev());
     assert!(report.exists());
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn link_command_honors_symlink_only_mode() {
+    let root = unique_temp_dir("link_symlink_only");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    fs::create_dir_all(&downloads).expect("create downloads");
+    fs::create_dir_all(&media).expect("create media");
+
+    let src = downloads.join("movie.mkv");
+    let tgt = media.join("movie.mkv");
+    fs::write(&src, b"same-content").expect("write src");
+    fs::write(&tgt, b"same-content").expect("write tgt");
+
+    run_ok(
+        &root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        &root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+    set_min_age_zero(&root);
+    set_link_mode(&root, "symlink-only");
+
+    let out = run_cmd(&root, &["link", "--json", "--no-progress"]);
+    assert!(
+        out.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout_json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("parse link stdout json");
+    assert_eq!(stdout_json["entries"][0]["method"], "symlink");
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn cache_audit_and_cleanup_temp_commands_work() {
+    let root = unique_temp_dir("cache_temp_cleanup");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let nested = downloads.join("nested");
+    fs::create_dir_all(&nested).expect("create nested downloads");
+    fs::create_dir_all(&media).expect("create media");
+    fs::write(
+        downloads.join(".dejaview_hardlink.tmp.1"),
+        b"temp-artifact",
+    )
+    .expect("write temp artifact");
+    fs::write(nested.join(".dejaview_link.tmp.2"), b"temp-artifact").expect("write nested temp");
+
+    run_ok(
+        &root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        &root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+
+    let out = run_cmd(&root, &["cache", "audit-temp"]);
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Temp artifacts: 2"));
+
+    let out = run_cmd(&root, &["cache", "cleanup-temp"]);
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Removed temp artifacts: 2"));
+    assert!(!downloads.join(".dejaview_hardlink.tmp.1").exists());
+    assert!(!nested.join(".dejaview_link.tmp.2").exists());
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

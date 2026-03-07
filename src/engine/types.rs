@@ -5,6 +5,19 @@ use std::path::{Path, PathBuf};
 use crate::protocol::TuiEvent;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinkMode {
+    Best,
+    SymlinkOnly,
+}
+
+impl Default for LinkMode {
+    fn default() -> Self {
+        Self::Best
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct FileInfo {
     pub(super) path: PathBuf,
@@ -69,6 +82,7 @@ pub struct ScanRunOptions<'a> {
     pub show_progress: bool,
     pub require_confirm: bool,
     pub tui_events: bool,
+    pub link_mode: LinkMode,
 }
 
 pub(super) fn emit_tui_event(event: &TuiEvent) -> io::Result<()> {

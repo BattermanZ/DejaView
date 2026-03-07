@@ -6,7 +6,7 @@ use crate::fsutil::safe_write_bytes;
 use crate::logger;
 use crate::protocol::{LinkReportEntry, RunReport, WarningSummary};
 
-use super::types::{LinkAction, RunMetrics, RunWarnings, ScanRunOptions};
+use super::types::{LinkAction, LinkMode, RunMetrics, RunWarnings, ScanRunOptions};
 
 fn format_size(bytes: u64) -> String {
     let units = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
@@ -127,7 +127,7 @@ pub(super) fn resolve_report_path(
     })
 }
 
-pub(super) fn build_report_entries(actions: &[LinkAction]) -> Vec<LinkReportEntry> {
+pub(super) fn build_report_entries(actions: &[LinkAction], link_mode: LinkMode) -> Vec<LinkReportEntry> {
     actions
         .iter()
         .map(|action| LinkReportEntry {
@@ -136,14 +136,18 @@ pub(super) fn build_report_entries(actions: &[LinkAction]) -> Vec<LinkReportEntr
             size: action.size,
             status: "planned".to_string(),
             method: Some(
-                if action.src_snapshot.dev == action.tgt_snapshot.dev {
+                if link_mode == LinkMode::SymlinkOnly {
+                    "symlink"
+                } else if action.src_snapshot.dev == action.tgt_snapshot.dev {
                     "try-hardlink"
                 } else {
                     "symlink"
                 }
                 .to_string(),
             ),
-            fallback_reason: if action.src_snapshot.dev == action.tgt_snapshot.dev {
+            fallback_reason: if link_mode == LinkMode::SymlinkOnly {
+                Some("symlink-only mode enabled".to_string())
+            } else if action.src_snapshot.dev == action.tgt_snapshot.dev {
                 Some("tries hardlink first; may fall back to symlink".to_string())
             } else {
                 Some("cross-device; hardlink not possible".to_string())

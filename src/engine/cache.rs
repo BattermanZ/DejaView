@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
+use walkdir::WalkDir;
 
 use crate::config::{Config, cache_path};
 use crate::fsutil::safe_write_bytes;
@@ -49,4 +50,57 @@ pub(super) fn clear_cache(config: &Config) -> Result<()> {
     let path = cache_path(config)?;
     logger::info("cache", format!("clearing cache at {}", path.display()));
     clear_cache_file(&path)
+}
+
+fn is_temp_artifact_name(name: &str) -> bool {
+    name.starts_with(".dejaview_hardlink.tmp.")
+        || name.starts_with(".dejaview_link.tmp.")
+        || name.starts_with(".dejaview_write.tmp.")
+}
+
+pub(super) fn audit_temp_artifacts(config: &Config) -> Result<Vec<std::path::PathBuf>> {
+    let downloads = config
+        .downloads
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Downloads path not set"))?;
+    let mut matches = Vec::new();
+    for entry in WalkDir::new(downloads).follow_links(false).into_iter() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str() else {
+            continue;
+        };
+        if is_temp_artifact_name(name) {
+            matches.push(entry.path().to_path_buf());
+        }
+    }
+    logger::info(
+        "cache",
+        format!(
+            "audited temp artifacts under {}: {} found",
+            downloads.display(),
+            matches.len()
+        ),
+    );
+    Ok(matches)
+}
+
+pub(super) fn cleanup_temp_artifacts(config: &Config) -> Result<Vec<std::path::PathBuf>> {
+    let matches = audit_temp_artifacts(config)?;
+    let mut removed = Vec::new();
+    for path in matches {
+        fs::remove_file(&path)
+            .with_context(|| format!("remove temp artifact {}", path.display()))?;
+        removed.push(path);
+    }
+    logger::info(
+        "cache",
+        format!("removed {} temp artifact(s)", removed.len()),
+    );
+    Ok(removed)
 }

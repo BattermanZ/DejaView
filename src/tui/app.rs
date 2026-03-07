@@ -8,6 +8,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::config::{Config, load_config, save_config, validate_runtime_paths};
+use crate::engine::LinkMode;
 use crate::fsutil::normalize_runtime_dir;
 
 use super::actions;
@@ -60,6 +61,7 @@ pub struct App {
     media: Option<PathBuf>,
     min_age: Option<u64>,
     threads: Option<usize>,
+    link_mode: LinkMode,
     expand_paths: bool,
     current_phase: Option<String>,
     current_path: Option<String>,
@@ -92,6 +94,7 @@ impl App {
             media: config.media.clone(),
             min_age: config.min_age,
             threads: config.threads,
+            link_mode: config.link_mode.unwrap_or(LinkMode::Best),
             expand_paths: false,
             current_phase: None,
             current_path: None,
@@ -242,6 +245,13 @@ impl App {
         self.threads
             .map(|t| t.to_string())
             .unwrap_or_else(|| "auto".to_string())
+    }
+
+    pub fn link_mode_label(&self) -> &'static str {
+        match self.link_mode {
+            LinkMode::Best => "best",
+            LinkMode::SymlinkOnly => "symlink-only",
+        }
     }
 
     pub fn rows(&self) -> &[LinkReportEntry] {
@@ -618,6 +628,7 @@ impl App {
 
         self.downloads = config.downloads.clone();
         self.media = config.media.clone();
+        self.link_mode = config.link_mode.unwrap_or(LinkMode::Best);
         self.overlay = Overlay::None;
         self.push_log("Saved TUI path configuration.".to_string());
         Ok(())
@@ -1466,6 +1477,7 @@ mod tests {
                     media: Some(PathBuf::from("/stale/media")),
                     min_age: Some(900),
                     threads: Some(8),
+                    link_mode: Some(LinkMode::Best),
                 })
             },
             |config| {
@@ -1474,6 +1486,7 @@ mod tests {
                     media: config.media.clone(),
                     min_age: config.min_age,
                     threads: config.threads,
+                    link_mode: config.link_mode,
                 });
                 Ok(())
             },

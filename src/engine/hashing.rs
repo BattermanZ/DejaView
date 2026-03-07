@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use super::types::emit_tui_event;
 use super::linking::plan_hashed_group_actions;
 use super::report::build_report_entries;
-use super::types::{Cache, CacheEntry, FileInfo, RunWarnings};
+use super::types::{Cache, CacheEntry, FileInfo, LinkMode, RunWarnings};
 use crate::protocol::TuiEvent;
 
 fn sample_digest(path: &Path, size: u64) -> Result<[u8; 32]> {
@@ -79,6 +79,7 @@ pub(super) fn hash_groups_and_update_cache(
     strict: bool,
     show_progress: bool,
     tui_events: bool,
+    link_mode: LinkMode,
     warnings: &mut RunWarnings,
 ) -> Result<()> {
     let total_sample_files = groups.iter().map(Vec::len).sum::<usize>();
@@ -255,7 +256,7 @@ pub(super) fn hash_groups_and_update_cache(
                 }
             }
             if tui_events {
-                let entries = build_report_entries(&plan_hashed_group_actions(group));
+                let entries = build_report_entries(&plan_hashed_group_actions(group), link_mode);
                 if !entries.is_empty() {
                     let _ = emit_tui_event(&TuiEvent::PlannedEntries { entries });
                 }
