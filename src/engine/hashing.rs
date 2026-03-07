@@ -80,8 +80,9 @@ pub(super) fn hash_groups_and_update_cache(
     warnings: &mut RunWarnings,
 ) -> Result<()> {
     let total_sample_files = groups.iter().map(Vec::len).sum::<usize>();
+    let total_sample_u64 = total_sample_files as u64;
     let bar = if show_progress {
-        let bar = ProgressBar::new(total_sample_files as u64);
+        let bar = ProgressBar::new(total_sample_u64);
         bar.set_style(
             ProgressStyle::with_template("{msg} {pos}/{len} [{wide_bar:.cyan/blue}] {elapsed}")
                 .unwrap(),
@@ -159,6 +160,12 @@ pub(super) fn hash_groups_and_update_cache(
         });
         emit_hash_progress(0, total_full_files, true);
     }
+    if let Some(progress_bar) = &bar {
+        progress_bar.set_length(total_sample_u64 + total_full_files as u64);
+        if total_full_files > 0 {
+            progress_bar.set_message("Verifying duplicates".bold().to_string());
+        }
+    }
 
     let full_done_for_threads = Arc::clone(&full_done);
     groups
@@ -174,6 +181,9 @@ pub(super) fn hash_groups_and_update_cache(
                         file.hash = Some(hash.clone());
                         let done = full_done_for_threads.fetch_add(1, Ordering::Relaxed) + 1;
                         emit_hash_progress(done as usize, total_full_files, tui_events);
+                        if let Some(progress_bar) = &bar {
+                            progress_bar.inc(1);
+                        }
                         continue;
                     }
                 }
@@ -185,6 +195,9 @@ pub(super) fn hash_groups_and_update_cache(
                             file.hash = Some(entry.hash.clone());
                             let done = full_done_for_threads.fetch_add(1, Ordering::Relaxed) + 1;
                             emit_hash_progress(done as usize, total_full_files, tui_events);
+                            if let Some(progress_bar) = &bar {
+                                progress_bar.inc(1);
+                            }
                             continue;
                         }
                     }
@@ -199,6 +212,9 @@ pub(super) fn hash_groups_and_update_cache(
                 let digest_result = full_digest(&file.path);
                 let done = full_done_for_threads.fetch_add(1, Ordering::Relaxed) + 1;
                 emit_hash_progress(done as usize, total_full_files, tui_events);
+                if let Some(progress_bar) = &bar {
+                    progress_bar.inc(1);
+                }
                 emit_worker_activity("hashing_full", worker, None, tui_events);
 
                 match digest_result {

@@ -656,6 +656,7 @@ impl App {
         match event {
             TuiEvent::Phase { phase } => {
                 self.current_phase = Some(phase.clone());
+                self.current_path = None;
                 if phase.starts_with("hashing_") {
                     self.active_workers.clear();
                 } else {
@@ -674,6 +675,7 @@ impl App {
                 path,
             } => {
                 self.current_phase = Some(phase);
+                self.current_path = None;
                 match path {
                     Some(path) => {
                         self.active_workers.insert(worker, path);
@@ -1070,6 +1072,24 @@ mod tests {
         app.current_phase = Some("hashing_sample".to_string());
 
         assert_eq!(app.current_path_label(), "current");
+    }
+
+    #[test]
+    fn phase_change_clears_stale_current_path() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        app.current_path = Some("/downloads/old.mkv".to_string());
+
+        let cleared = app.apply_tui_event(
+            JobKind::Scan,
+            TuiEvent::Phase {
+                phase: "planning".to_string(),
+            },
+        );
+
+        assert!(!cleared);
+        assert_eq!(app.current_path(), None);
+        assert_eq!(app.activity_phase(), "PLANNING ACTIONS");
     }
 
     #[test]
