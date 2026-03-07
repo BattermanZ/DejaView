@@ -1,6 +1,6 @@
 use ratatui::prelude::*;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
 use crate::tui::app::{App, ConfigEditor, ConfigField, FocusPane, Overlay};
 use crate::tui::layout;
@@ -38,7 +38,7 @@ fn trim_middle(input: &str, max_len: usize) -> String {
     format!("{start}...{end}")
 }
 
-fn status_chip_style(row: &LinkReportEntry, is_selected: bool) -> Style {
+fn status_chip_style(row: &LinkReportEntry, _is_selected: bool) -> Style {
     if row.status.eq_ignore_ascii_case("failed") {
         return Theme::chip_danger();
     }
@@ -50,19 +50,16 @@ fn status_chip_style(row: &LinkReportEntry, is_selected: bool) -> Style {
     {
         return Theme::chip_warning();
     }
-    if is_selected {
-        Theme::badge_accent()
-    } else {
-        Theme::chip_success()
-    }
+    Theme::chip_success()
 }
 
 fn row_style(row: &LinkReportEntry, is_selected: bool) -> Style {
-    if is_selected {
-        return Theme::panel_active();
-    }
     if row.status.eq_ignore_ascii_case("failed") {
-        return Theme::danger();
+        return if is_selected {
+            Theme::result_row_selected().fg(Theme::danger().fg.unwrap_or(Color::Reset))
+        } else {
+            Theme::danger()
+        };
     }
     if row
         .method
@@ -70,115 +67,146 @@ fn row_style(row: &LinkReportEntry, is_selected: bool) -> Style {
         .is_some_and(|method| method.eq_ignore_ascii_case("symlink"))
         || row.fallback_reason.is_some()
     {
-        return Theme::warning();
+        return if is_selected {
+            Theme::result_row_selected().fg(Theme::warning().fg.unwrap_or(Color::Reset))
+        } else {
+            Theme::warning()
+        };
     }
-    Theme::base()
+    if is_selected {
+        Theme::accent()
+    } else {
+        Theme::base()
+    }
 }
 
-fn pane_block(title: &'static str, pane: FocusPane, app: &App, featured: bool) -> Block<'static> {
-    let active = app.focus == pane;
-    let surface = if featured {
-        Theme::panel_feature()
-    } else if active {
-        Theme::panel_active()
+fn pane_block(title: &str, pane: FocusPane, app: &App, accent: bool) -> Block<'static> {
+    let is_active = app.focus == pane;
+    let title_style = if accent || is_active {
+        Theme::title(true)
     } else {
-        Theme::panel()
+        Theme::title(false)
     };
 
     Block::default()
-        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+        .borders(Borders::ALL)
         .title(Line::from(vec![Span::styled(
             format!(" {title} "),
-            Theme::title(active),
+            title_style,
         )]))
-        .style(surface)
-        .border_style(if active {
+        .style(Theme::panel())
+        .border_style(if accent || is_active {
             Theme::accent()
         } else {
-            Theme::muted()
+            Theme::line()
+        })
+}
+
+fn card_block(title: &str, accent: bool) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(vec![Span::styled(
+            format!(" {title} "),
+            if accent {
+                Theme::title(true)
+            } else {
+                Theme::muted()
+            },
+        )]))
+        .style(Theme::card())
+        .border_style(if accent {
+            Theme::accent()
+        } else {
+            Theme::line()
         })
 }
 
 fn metric_card(title: &str, value: String) -> Paragraph<'static> {
     Paragraph::new(vec![
-        Line::from(Span::styled(format!(" {title}"), Theme::metric_label())),
-        Line::from(Span::styled(format!(" {value}"), Theme::metric_value())),
+        Line::from(Span::styled(title.to_string(), Theme::metric_label())),
+        Line::from(Span::styled(value, Theme::metric_number())),
     ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .style(Theme::panel_active()),
-    )
-    .style(Theme::panel_active())
+    .block(card_block(title, false))
+    .style(Theme::card())
 }
 
-fn context_lines(app: &App) -> Vec<Line<'static>> {
+fn key_hint(key: &str, label: &str, accent: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!(" {key} "),
+            if accent {
+                Theme::badge_accent()
+            } else {
+                Theme::badge()
+            },
+        ),
+        Span::raw(" "),
+        Span::styled(label.to_string(), Theme::muted()),
+    ])
+}
+
+fn mode_chip(app: &App) -> (&'static str, Style) {
+    if app.mode_label().eq_ignore_ascii_case("Linking") {
+        return ("LINK ACTIVE", Theme::badge_accent());
+    }
+    if app.mode_label().eq_ignore_ascii_case("Scanning") {
+        return ("SCAN ACTIVE", Theme::badge_accent());
+    }
+    if app.mode_label().eq_ignore_ascii_case("Link") {
+        return ("DONE", Theme::chip_success());
+    }
+    if app.mode_label().eq_ignore_ascii_case("Scan") {
+        return ("READY", Theme::badge_lavender());
+    }
+    ("IDLE", Theme::badge())
+}
+
+fn sidebar_lines(app: &App) -> Vec<Line<'static>> {
     vec![
         Line::from(Span::styled(" PATHS", Theme::title(false))),
         Line::from(vec![
-            Span::styled("Downloads", Theme::muted()),
-            Span::raw(" "),
-            Span::styled(trim_middle(&app.downloads_label(), 28), Theme::base()),
+            Span::styled("Downloads", Theme::dim()),
+            Span::raw("  "),
+            Span::styled(trim_middle(&app.downloads_label(), 22), Theme::base()),
         ]),
         Line::from(vec![
-            Span::styled("Media", Theme::muted()),
-            Span::raw(" "),
-            Span::styled(trim_middle(&app.media_label(), 28), Theme::base()),
+            Span::styled("Media", Theme::dim()),
+            Span::raw("      "),
+            Span::styled(trim_middle(&app.media_label(), 22), Theme::base()),
         ]),
         Line::raw(""),
         Line::from(Span::styled(" SETTINGS", Theme::title(false))),
         Line::from(vec![
-            Span::styled("Min age", Theme::muted()),
-            Span::raw(" "),
+            Span::styled("Min age", Theme::dim()),
+            Span::raw("    "),
             Span::styled(format!("{}s", app.min_age_secs()), Theme::base()),
         ]),
         Line::from(vec![
-            Span::styled("Threads", Theme::muted()),
-            Span::raw(" "),
+            Span::styled("Threads", Theme::dim()),
+            Span::raw("    "),
             Span::styled(app.threads_label(), Theme::base()),
         ]),
         Line::raw(""),
         Line::from(Span::styled(" ACTIONS", Theme::title(false))),
-        Line::from(vec![
-            Span::styled(" e ", Theme::badge()),
-            Span::styled("edit paths", Theme::base()),
-        ]),
-        Line::from(vec![
-            Span::styled(" S ", Theme::badge()),
-            Span::styled("scan duplicates", Theme::base()),
-        ]),
-        Line::from(vec![
-            Span::styled(" L ", Theme::badge()),
-            Span::styled("link confirmed", Theme::base()),
-        ]),
-        Line::from(vec![
-            Span::styled(" R ", Theme::badge()),
-            Span::styled("save report", Theme::base()),
-        ]),
-        Line::from(vec![
-            Span::styled(" J ", Theme::badge()),
-            Span::styled("json preview", Theme::base()),
-        ]),
+        key_hint("e", "edit paths", true),
+        key_hint("S", "scan library", false),
+        key_hint("L", "link confirmed", false),
+        key_hint("R", "save report", false),
+        key_hint("J", "json preview", false),
     ]
 }
 
 fn empty_results_lines() -> Vec<Line<'static>> {
     vec![
-        Line::from(Span::styled("READY FOR A SCAN", Theme::title(true))),
+        Line::from(Span::styled("READY TO SCAN", Theme::title(true))),
         Line::raw(""),
         Line::from(Span::styled(
-            "Set your paths, then scan for duplicate media groups.",
+            "No duplicate actions are loaded yet.",
             Theme::base(),
         )),
         Line::raw(""),
-        Line::from(vec![
-            Span::styled(" e ", Theme::badge_accent()),
-            Span::styled("configure paths", Theme::base()),
-        ]),
-        Line::from(vec![
-            Span::styled(" S ", Theme::badge()),
-            Span::styled("run scan", Theme::base()),
-        ]),
+        key_hint("e", "set paths", true),
+        key_hint("S", "run scan", false),
     ]
 }
 
@@ -191,95 +219,89 @@ fn outcome_label(row: &LinkReportEntry) -> String {
     }
 }
 
-fn details_lines(app: &App) -> Vec<Line<'static>> {
+fn notes_text(entry: &LinkReportEntry) -> String {
+    entry
+        .fallback_reason
+        .clone()
+        .or_else(|| entry.error.clone())
+        .unwrap_or_else(|| "Clean operation".to_string())
+}
+
+fn inspector_lines(app: &App) -> Vec<Line<'static>> {
     let Some(entry) = app.selected_entry() else {
         return vec![
-            Line::from(Span::styled("NO SELECTION", Theme::title(true))),
+            Line::from(Span::styled(" OUTCOME", Theme::title(false))),
+            Line::from(Span::styled("No selection", Theme::inspector_value())),
             Line::raw(""),
-            Line::from(Span::styled(
-                "Run a scan and select a result to inspect the action outcome.",
-                Theme::base(),
-            )),
-            Line::raw(""),
-            Line::from(Span::styled("Run saved", Theme::muted())),
+            Line::from(Span::styled(" RUN TOTAL", Theme::title(false))),
             Line::from(Span::styled(
                 format_bytes(app.total_saved_bytes()),
-                Theme::metric_value(),
+                Theme::metric_number(),
+            )),
+            Line::raw(""),
+            Line::from(Span::styled(" NOTES", Theme::title(false))),
+            Line::from(Span::styled(
+                "Run a scan and select a result to inspect it.",
+                Theme::muted(),
             )),
         ];
     };
 
-    let chip_style = status_chip_style(entry, true);
+    let notes_style = if entry.error.is_some() {
+        Theme::danger()
+    } else if entry.fallback_reason.is_some() {
+        Theme::warning()
+    } else {
+        Theme::base()
+    };
+
     vec![
-        Line::from(Span::styled(" OUTCOME", Theme::title(true))),
+        Line::from(Span::styled(" OUTCOME", Theme::title(false))),
         Line::from(Span::styled(
             format!(" {} ", outcome_label(entry)),
-            chip_style,
+            status_chip_style(entry, true),
         )),
         Line::raw(""),
-        Line::from(Span::styled(" RUN TOTAL SAVED", Theme::muted())),
+        Line::from(Span::styled(" RUN TOTAL", Theme::title(false))),
         Line::from(Span::styled(
             format_bytes(app.total_saved_bytes()),
-            Theme::metric_value(),
+            Theme::metric_number(),
         )),
         Line::raw(""),
-        Line::from(Span::styled(" SOURCE", Theme::muted())),
-        Line::from(Span::styled(trim_middle(&entry.source, 34), Theme::base())),
+        Line::from(Span::styled(" SOURCE", Theme::title(false))),
+        Line::from(Span::styled(trim_middle(&entry.source, 28), Theme::base())),
         Line::raw(""),
-        Line::from(Span::styled(" TARGET", Theme::muted())),
-        Line::from(Span::styled(trim_middle(&entry.target, 34), Theme::base())),
+        Line::from(Span::styled(" TARGET", Theme::title(false))),
+        Line::from(Span::styled(trim_middle(&entry.target, 28), Theme::base())),
         Line::raw(""),
-        Line::from(Span::styled(" NOTES", Theme::muted())),
+        Line::from(Span::styled(" NOTES", Theme::title(false))),
+        Line::from(Span::styled(notes_text(entry), notes_style)),
+    ]
+}
+
+fn header_activity_lines(app: &App) -> Vec<Line<'static>> {
+    let (chip_label, chip_style) = mode_chip(app);
+    vec![
+        Line::from(vec![
+            Span::styled(format!(" {chip_label} "), chip_style),
+            Span::raw(" "),
+            Span::styled(app.activity_phase(), Theme::accent_soft()),
+        ]),
+        Line::from(Span::styled(app.throughput_label(), Theme::muted())),
         Line::from(Span::styled(
-            entry
-                .fallback_reason
-                .clone()
-                .or_else(|| entry.error.clone())
-                .unwrap_or_else(|| "clean operation".to_string()),
-            if entry.error.is_some() {
-                Theme::danger()
-            } else if entry.fallback_reason.is_some() {
-                Theme::warning()
-            } else {
-                Theme::base()
-            },
+            trim_middle(&app.last_log_line(), 110),
+            Theme::dim(),
         )),
     ]
 }
 
-pub fn render(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-    frame.render_widget(Block::default().style(Theme::app()), area);
-    let l = layout::dashboard(area);
-
-    render_header(frame, l.top, app);
-
-    let left = Paragraph::new(context_lines(app))
-        .block(pane_block("Workspace", FocusPane::Left, app, false))
-        .style(Theme::panel())
-        .wrap(Wrap { trim: true });
-    frame.render_widget(left, l.center_left);
-
-    render_results(frame, l.center_main, app);
-
-    let details = Paragraph::new(details_lines(app))
-        .block(pane_block("Inspector", FocusPane::Right, app, false))
-        .style(Theme::panel())
-        .wrap(Wrap { trim: true });
-    frame.render_widget(details, l.center_right);
-
-    let log = Paragraph::new(app.log_lines().join("\n"))
-        .block(pane_block("Run Log", FocusPane::Bottom, app, false).borders(Borders::ALL))
-        .style(Theme::panel())
-        .wrap(Wrap { trim: true });
-    frame.render_widget(log, l.bottom_log);
-
-    let footer = Paragraph::new(Line::from(vec![
+fn footer_line() -> Line<'static> {
+    Line::from(vec![
         Span::styled(" q ", Theme::badge()),
         Span::styled("quit", Theme::muted()),
         Span::raw("  "),
         Span::styled(" tab ", Theme::badge()),
-        Span::styled("focus", Theme::muted()),
+        Span::styled("pane", Theme::muted()),
         Span::raw("  "),
         Span::styled(" e ", Theme::badge_accent()),
         Span::styled("paths", Theme::muted()),
@@ -290,15 +312,49 @@ pub fn render(frame: &mut Frame, app: &App) {
         Span::styled(" L ", Theme::badge()),
         Span::styled("link", Theme::muted()),
         Span::raw("  "),
+        Span::styled(" j/k ", Theme::badge()),
+        Span::styled("rows", Theme::muted()),
+        Span::raw("  "),
         Span::styled(" ? ", Theme::badge()),
         Span::styled("help", Theme::muted()),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::TOP)
-            .border_style(Theme::accent()),
-    )
-    .style(Theme::app());
+    ])
+}
+
+pub fn render(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    frame.render_widget(Block::default().style(Theme::canvas()), area);
+    let l = layout::dashboard(area);
+
+    render_header(frame, l.top, app);
+
+    let left = Paragraph::new(sidebar_lines(app))
+        .block(pane_block("Workspace", FocusPane::Left, app, false))
+        .style(Theme::panel())
+        .wrap(Wrap { trim: true });
+    frame.render_widget(left, l.center_left);
+
+    render_results(frame, l.center_main, app);
+
+    let details = Paragraph::new(inspector_lines(app))
+        .block(pane_block("Inspector", FocusPane::Right, app, false))
+        .style(Theme::panel())
+        .wrap(Wrap { trim: true });
+    frame.render_widget(details, l.center_right);
+
+    let log = Paragraph::new(app.log_lines().join("\n"))
+        .block(pane_block("Run Log", FocusPane::Bottom, app, false))
+        .style(Theme::panel())
+        .wrap(Wrap { trim: true });
+    frame.render_widget(log, l.bottom_log);
+
+    let footer = Paragraph::new(footer_line())
+        .block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Theme::line())
+                .style(Theme::canvas()),
+        )
+        .style(Theme::canvas());
     frame.render_widget(footer, l.footer);
 
     match app.overlay() {
@@ -312,53 +368,64 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-    let top = Layout::default()
+    let split = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(32), Constraint::Min(40)])
+        .constraints([Constraint::Length(30), Constraint::Min(40)])
         .split(area);
 
     let brand = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(3)])
-        .split(top[0]);
+        .constraints([Constraint::Length(4), Constraint::Min(4)])
+        .split(split[0]);
 
-    let wordmark = Paragraph::new(vec![
-        Line::from(Span::styled(" DEJAVIEW ", Theme::banner())),
-        Line::from(Span::styled(
-            " media duplicate workspace ",
-            Theme::badge_accent(),
-        )),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::RIGHT)
-            .border_style(Theme::accent()),
-    )
-    .style(Theme::app());
-    frame.render_widget(wordmark, brand[0]);
+    let brand_block = Block::default()
+        .borders(Borders::RIGHT | Borders::BOTTOM)
+        .border_style(Theme::line())
+        .style(Theme::canvas());
+    let brand_inner = brand_block.inner(brand[0]);
+    frame.render_widget(brand_block, brand[0]);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled("DEJAVIEW", Theme::wordmark())),
+            Line::from(Span::styled("media duplicate workspace", Theme::subtitle())),
+        ])
+        .style(Theme::canvas()),
+        brand_inner,
+    );
 
-    let sub = Paragraph::new(vec![
-        Line::from(Span::styled(app.activity_phase(), Theme::title(true))),
-        Line::from(Span::styled(app.last_log_line(), Theme::base())),
-    ])
-    .style(Theme::app());
-    frame.render_widget(sub, brand[1]);
+    let (chip_label, chip_style) = mode_chip(app);
+    let status_block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(Theme::line())
+        .style(Theme::canvas());
+    let status_inner = status_block.inner(brand[1]);
+    frame.render_widget(status_block, brand[1]);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(format!(" {chip_label} "), chip_style)),
+            Line::from(Span::styled(app.activity_phase(), Theme::accent_soft())),
+            Line::from(Span::styled(
+                trim_middle(&app.last_log_line(), 28),
+                Theme::dim(),
+            )),
+        ])
+        .style(Theme::canvas())
+        .wrap(Wrap { trim: true }),
+        status_inner,
+    );
 
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(2),
-            Constraint::Min(2),
-        ])
-        .split(top[1]);
+        .constraints([Constraint::Length(4), Constraint::Min(4)])
+        .split(split[1]);
+
     let metrics = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(20),
-            Constraint::Percentage(20),
-            Constraint::Percentage(35),
+            Constraint::Percentage(22),
+            Constraint::Percentage(18),
+            Constraint::Percentage(18),
+            Constraint::Percentage(42),
         ])
         .split(right[0]);
 
@@ -379,43 +446,44 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         metrics[3],
     );
 
-    let gauge = Gauge::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Line::from(vec![Span::styled(
-                    format!(" ACTIVITY  {} ", app.progress_label()),
-                    Theme::title(true),
-                )]))
-                .border_style(Theme::accent())
-                .style(Theme::panel_active()),
-        )
-        .gauge_style(Theme::banner())
-        .ratio(app.progress_ratio().clamp(0.0, 1.0))
-        .label(app.activity_phase());
-    frame.render_widget(gauge, right[1]);
-
-    let strip = Paragraph::new(Line::from(vec![
-        Span::styled(" live ", Theme::badge_accent()),
-        Span::raw(" "),
-        Span::styled(app.throughput_label(), Theme::base()),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(Theme::muted()),
-    )
-    .style(Theme::app());
-    frame.render_widget(strip, right[2]);
+    let activity = Paragraph::new(header_activity_lines(app))
+        .block(card_block("Activity", true))
+        .style(Theme::card())
+        .wrap(Wrap { trim: true });
+    frame.render_widget(activity, right[1]);
 }
 
 fn render_results(frame: &mut Frame, area: Rect, app: &App) {
+    let block = pane_block("Results", FocusPane::Center, app, true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let content = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(inner);
+
+    let summary = Paragraph::new(Line::from(vec![
+        Span::styled(app.activity_phase(), Theme::title(true)),
+        Span::raw("  "),
+        Span::styled(
+            format!(
+                "{} rows  |  {} planned  |  {} applied",
+                app.rows().len(),
+                app.planned_actions(),
+                app.applied_actions()
+            ),
+            Theme::muted(),
+        ),
+    ]))
+    .style(Theme::panel());
+    frame.render_widget(summary, content[0]);
+
     if app.rows().is_empty() {
         let empty = Paragraph::new(empty_results_lines())
-            .block(pane_block("Results", FocusPane::Center, app, true).borders(Borders::ALL))
-            .style(Theme::panel_feature())
+            .style(Theme::panel())
             .wrap(Wrap { trim: true });
-        frame.render_widget(empty, area);
+        frame.render_widget(empty, content[1]);
         return;
     }
 
@@ -431,7 +499,7 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
                     status_chip_style(row, is_selected),
                 )),
                 Cell::from(Span::styled(
-                    trim_middle(&row.source, 34),
+                    trim_middle(&row.source, 54),
                     row_style(row, is_selected),
                 )),
                 Cell::from(Span::styled(
@@ -440,11 +508,10 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
                 )),
             ])
             .style(if is_selected {
-                Theme::panel_active()
+                Theme::result_row_selected()
             } else {
-                Theme::panel_feature()
+                Theme::result_row()
             })
-            .height(2)
         })
         .collect();
 
@@ -452,19 +519,18 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         rows,
         [
             Constraint::Length(12),
-            Constraint::Percentage(64),
-            Constraint::Percentage(24),
+            Constraint::Percentage(68),
+            Constraint::Percentage(20),
         ],
     )
-    .header(
-        Row::new(vec!["STATE", "SOURCE", "OUTCOME"])
-            .style(Theme::title(true))
-            .height(2),
-    )
-    .block(pane_block("Results", FocusPane::Center, app, true).borders(Borders::ALL))
-    .style(Theme::panel_feature())
+    .header(Row::new(vec![
+        Cell::from(Span::styled("STATE", Theme::title(false))),
+        Cell::from(Span::styled("SOURCE", Theme::title(false))),
+        Cell::from(Span::styled("OUTCOME", Theme::title(false))),
+    ]))
+    .style(Theme::panel())
     .column_spacing(2);
-    frame.render_widget(table, area);
+    frame.render_widget(table, content[1]);
 }
 
 fn render_help_overlay(frame: &mut Frame) {
@@ -537,7 +603,7 @@ fn render_config_overlay(frame: &mut Frame, editor: &ConfigEditor) {
                 .border_style(if editor.active_field == ConfigField::Downloads {
                     Theme::accent()
                 } else {
-                    Theme::muted()
+                    Theme::line()
                 }),
         )
         .style(Theme::input(editor.active_field == ConfigField::Downloads))
@@ -552,7 +618,7 @@ fn render_config_overlay(frame: &mut Frame, editor: &ConfigEditor) {
                 .border_style(if editor.active_field == ConfigField::Media {
                     Theme::accent()
                 } else {
-                    Theme::muted()
+                    Theme::line()
                 }),
         )
         .style(Theme::input(editor.active_field == ConfigField::Media))
@@ -570,7 +636,12 @@ fn render_config_overlay(frame: &mut Frame, editor: &ConfigEditor) {
     } else {
         Theme::muted()
     })
-    .block(Block::default().borders(Borders::ALL).title("Status"));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Status")
+            .border_style(Theme::line()),
+    );
     frame.render_widget(status, sections[2]);
 
     let tips = Paragraph::new(
@@ -673,14 +744,14 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(combined.contains("READY FOR A SCAN"));
+        assert!(combined.contains("READY TO SCAN"));
         assert!(combined.contains("run scan"));
     }
 
     #[test]
-    fn context_lines_keep_sections() {
+    fn sidebar_lines_keep_sections() {
         let app = App::new(&crate::config::Config::default(), false);
-        let combined = context_lines(&app)
+        let combined = sidebar_lines(&app)
             .iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -688,5 +759,28 @@ mod tests {
         assert!(combined.contains("PATHS"));
         assert!(combined.contains("SETTINGS"));
         assert!(combined.contains("ACTIONS"));
+    }
+
+    #[test]
+    fn inspector_labels_run_total_not_item_saved() {
+        let app = App::new(&crate::config::Config::default(), false);
+        let combined = inspector_lines(&app)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(combined.contains("RUN TOTAL"));
+    }
+
+    #[test]
+    fn header_activity_lines_use_truthful_labels() {
+        let app = App::new(&crate::config::Config::default(), false);
+        let combined = header_activity_lines(&app)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(combined.contains("IDLE"));
+        assert!(combined.contains("READY TO SCAN"));
     }
 }

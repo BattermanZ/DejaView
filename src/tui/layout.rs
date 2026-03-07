@@ -13,9 +13,9 @@ pub fn dashboard(area: Rect) -> DashboardLayout {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),
+            Constraint::Length(9),
             Constraint::Min(10),
-            Constraint::Length(7),
+            Constraint::Length(6),
             Constraint::Length(2),
         ])
         .split(area);
@@ -23,9 +23,9 @@ pub fn dashboard(area: Rect) -> DashboardLayout {
     let center = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
+            Constraint::Percentage(20),
+            Constraint::Percentage(57),
             Constraint::Percentage(23),
-            Constraint::Percentage(52),
-            Constraint::Percentage(25),
         ])
         .split(vertical[1]);
 

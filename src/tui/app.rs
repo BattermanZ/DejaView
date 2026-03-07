@@ -216,35 +216,6 @@ impl App {
         }
     }
 
-    pub fn progress_ratio(&self) -> f64 {
-        match &self.running_job {
-            Some(job) => match job.kind {
-                JobKind::Scan => 0.35,
-                JobKind::Link => 0.75,
-            },
-            None => match &self.report {
-                Some(_) => 1.0,
-                None => 0.0,
-            },
-        }
-    }
-
-    pub fn progress_label(&self) -> String {
-        match &self.running_job {
-            Some(job) => match job.kind {
-                JobKind::Scan => "SCAN".to_string(),
-                JobKind::Link => "LINK".to_string(),
-            },
-            None => {
-                if self.report.is_some() {
-                    "DONE".to_string()
-                } else {
-                    "IDLE".to_string()
-                }
-            }
-        }
-    }
-
     pub fn throughput_label(&self) -> String {
         if self.running_job.is_some() {
             return format!(
