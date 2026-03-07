@@ -7,6 +7,10 @@ use anyhow::{anyhow, Context, Result};
 
 use super::model::{RunReport, TuiEvent};
 
+fn should_forward_terminal_error(status_success: bool, saw_error_event: bool) -> bool {
+    !status_success && !saw_error_event
+}
+
 fn stream_subcommand_events(
     subcommand: &str,
     strict: bool,
@@ -36,6 +40,7 @@ fn stream_subcommand_events(
     });
 
     let mut saw_done = false;
+    let mut saw_error_event = false;
     for line in BufReader::new(stdout).lines() {
         let line = match line {
             Ok(line) => line,
@@ -67,6 +72,9 @@ fn stream_subcommand_events(
         if matches!(event, TuiEvent::Done { .. }) {
             saw_done = true;
         }
+        if matches!(event, TuiEvent::Error { .. }) {
+            saw_error_event = true;
+        }
         let _ = tx.send(Ok(event));
     }
 
@@ -82,11 +90,13 @@ fn stream_subcommand_events(
         } else {
             format!("{subcommand} failed: {stderr}")
         };
-        let _ = tx.send(Err(anyhow!(message.clone())));
+        if should_forward_terminal_error(status.success(), saw_error_event) {
+            let _ = tx.send(Err(anyhow!(message.clone())));
+        }
         return Err(anyhow!(message));
     }
 
-    if !saw_done {
+    if !saw_done && !saw_error_event {
         let message = format!("{subcommand} ended without a final done event");
         let _ = tx.send(Err(anyhow!(message.clone())));
         return Err(anyhow!(message));
@@ -141,5 +151,11 @@ mod tests {
         assert_eq!(report.mode, "scan");
         assert_eq!(report.files_considered, 10);
         assert_eq!(report.warning_total(), 0);
+    }
+
+    #[test]
+    fn structured_error_suppresses_terminal_error_forwarding() {
+        assert!(!should_forward_terminal_error(false, true));
+        assert!(should_forward_terminal_error(false, false));
     }
 }

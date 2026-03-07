@@ -312,7 +312,7 @@ fn header_activity_lines(app: &App) -> Vec<Line<'static>> {
     ];
     if let Some(path) = app.current_path() {
         lines.push(Line::from(vec![
-            Span::styled("current ", Theme::dim()),
+            Span::styled(format!("{} ", app.current_path_label()), Theme::dim()),
             Span::styled(display_path(path, 100, app.expand_paths()), Theme::base()),
         ]));
     }

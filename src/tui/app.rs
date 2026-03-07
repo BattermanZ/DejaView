@@ -287,6 +287,13 @@ impl App {
         self.current_path.as_deref()
     }
 
+    pub fn current_path_label(&self) -> &'static str {
+        match self.current_phase.as_deref() {
+            Some("hashing") => "recent",
+            _ => "current",
+        }
+    }
+
     pub fn elapsed_label(&self) -> String {
         let duration = if let Some(started) = self.job_started_at {
             started.elapsed()
@@ -400,6 +407,8 @@ impl App {
             return;
         }
         self.reset_live_run_state();
+        self.report = None;
+        self.selected_row = 0;
         self.push_log("Running scan...".to_string());
         let strict = self.strict;
         let (tx, rx) = mpsc::channel();
@@ -421,6 +430,8 @@ impl App {
             return;
         }
         self.reset_live_run_state();
+        self.report = None;
+        self.selected_row = 0;
         self.push_log("Running link...".to_string());
         let strict = self.strict;
         let (tx, rx) = mpsc::channel();
@@ -644,7 +655,10 @@ impl App {
                     self.current_phase = Some(phase);
                 }
                 self.current_path = Some(path.clone());
-                self.latest_activity_message = Some(format!("Working on {}", path));
+                self.latest_activity_message = Some(match self.current_phase.as_deref() {
+                    Some("hashing") => format!("Recent hash worker update: {path}"),
+                    _ => format!("Working on {path}"),
+                });
                 false
             }
             TuiEvent::Count {
@@ -955,6 +969,20 @@ mod tests {
     }
 
     #[test]
+    fn starting_run_clears_stale_report_rows() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        app.report = Some(sample_report());
+        app.selected_row = 1;
+
+        app.start_scan_job();
+
+        assert!(app.report.is_none());
+        assert_eq!(app.selected_row, 0);
+        assert!(app.running_job.is_some());
+    }
+
+    #[test]
     fn path_toggle_switches_to_expanded_mode() {
         let config = Config::default();
         let mut app = App::new(&config, false);
@@ -964,6 +992,15 @@ mod tests {
 
         assert!(app.expand_paths());
         assert!(app.logs.iter().any(|line| line == "Path display expanded."));
+    }
+
+    #[test]
+    fn hashing_phase_uses_recent_path_label() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        app.current_phase = Some("hashing".to_string());
+
+        assert_eq!(app.current_path_label(), "recent");
     }
 
     #[test]
