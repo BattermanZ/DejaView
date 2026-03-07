@@ -2,7 +2,7 @@ use ratatui::prelude::*;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
-use crate::tui::app::{App, ConfigEditor, ConfigField, FocusPane, Overlay};
+use crate::tui::app::{App, ConfigEditor, ConfigField, Overlay};
 use crate::tui::layout;
 use crate::tui::model::LinkReportEntry;
 use crate::tui::theme::Theme;
@@ -36,6 +36,10 @@ fn trim_middle(input: &str, max_len: usize) -> String {
         .rev()
         .collect();
     format!("{start}...{end}")
+}
+
+fn trim_to_width(input: &str, width: u16) -> String {
+    trim_middle(input, usize::from(width.saturating_sub(1)))
 }
 
 fn status_chip_style(row: &LinkReportEntry, _is_selected: bool) -> Style {
@@ -80,9 +84,8 @@ fn row_style(row: &LinkReportEntry, is_selected: bool) -> Style {
     }
 }
 
-fn pane_block(title: &str, pane: FocusPane, app: &App, accent: bool) -> Block<'static> {
-    let is_active = app.focus == pane;
-    let title_style = if accent || is_active {
+fn pane_block(title: &str, accent: bool) -> Block<'static> {
+    let title_style = if accent {
         Theme::title(true)
     } else {
         Theme::title(false)
@@ -95,7 +98,7 @@ fn pane_block(title: &str, pane: FocusPane, app: &App, accent: bool) -> Block<'s
             title_style,
         )]))
         .style(Theme::panel())
-        .border_style(if accent || is_active {
+        .border_style(if accent {
             Theme::accent()
         } else {
             Theme::line()
@@ -169,14 +172,15 @@ fn mode_chip(app: &App) -> (&'static str, Style) {
     ("IDLE", Theme::badge())
 }
 
-fn sidebar_lines(app: &App) -> Vec<Line<'static>> {
+fn sidebar_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let path_width = usize::from(width.saturating_sub(14)).max(12);
     vec![
         Line::from(Span::styled(" PATHS", Theme::title(false))),
         Line::from(vec![
             Span::styled("Downloads", Theme::dim()),
             Span::raw("  "),
             Span::styled(
-                display_path(&app.downloads_label(), 22, app.expand_paths()),
+                display_path(&app.downloads_label(), path_width, app.expand_paths()),
                 Theme::base(),
             ),
         ]),
@@ -184,7 +188,7 @@ fn sidebar_lines(app: &App) -> Vec<Line<'static>> {
             Span::styled("Media", Theme::dim()),
             Span::raw("      "),
             Span::styled(
-                display_path(&app.media_label(), 22, app.expand_paths()),
+                display_path(&app.media_label(), path_width, app.expand_paths()),
                 Theme::base(),
             ),
         ]),
@@ -294,7 +298,8 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
-fn header_activity_lines(app: &App) -> Vec<Line<'static>> {
+fn header_activity_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let line_width = width.saturating_sub(4);
     let (chip_label, chip_style) = mode_chip(app);
     let mut lines = vec![
         Line::from(vec![
@@ -306,14 +311,17 @@ fn header_activity_lines(app: &App) -> Vec<Line<'static>> {
         ]),
         Line::from(Span::styled(app.throughput_label(), Theme::muted())),
         Line::from(Span::styled(
-            trim_middle(&app.activity_message(), 110),
+            trim_to_width(&app.activity_message(), line_width),
             Theme::dim(),
         )),
     ];
     if let Some(path) = app.current_path() {
         lines.push(Line::from(vec![
             Span::styled(format!("{} ", app.current_path_label()), Theme::dim()),
-            Span::styled(display_path(path, 100, app.expand_paths()), Theme::base()),
+            Span::styled(
+                display_path(path, usize::from(line_width).max(12), app.expand_paths()),
+                Theme::base(),
+            ),
         ]));
     }
     lines
@@ -323,9 +331,6 @@ fn footer_line() -> Line<'static> {
     Line::from(vec![
         Span::styled(" q ", Theme::badge()),
         Span::styled("quit", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" tab ", Theme::badge()),
-        Span::styled("pane", Theme::muted()),
         Span::raw("  "),
         Span::styled(" e ", Theme::badge_accent()),
         Span::styled("paths", Theme::muted()),
@@ -354,8 +359,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_header(frame, l.top, app);
 
-    let left = Paragraph::new(sidebar_lines(app))
-        .block(pane_block("Workspace", FocusPane::Left, app, false))
+    let left_block = pane_block("Workspace", false);
+    let left_inner = left_block.inner(l.center_left);
+    let left = Paragraph::new(sidebar_lines(app, left_inner.width))
+        .block(left_block)
         .style(Theme::panel())
         .wrap(Wrap { trim: true });
     frame.render_widget(left, l.center_left);
@@ -363,13 +370,13 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_results(frame, l.center_main, app);
 
     let details = Paragraph::new(inspector_lines(app))
-        .block(pane_block("Inspector", FocusPane::Right, app, false))
+        .block(pane_block("Inspector", false))
         .style(Theme::panel())
         .wrap(Wrap { trim: true });
     frame.render_widget(details, l.center_right);
 
     let log = Paragraph::new(app.log_lines().join("\n"))
-        .block(pane_block("Run Log", FocusPane::Bottom, app, false))
+        .block(pane_block("Run Log", false))
         .style(Theme::panel())
         .wrap(Wrap { trim: true });
     frame.render_widget(log, l.bottom_log);
@@ -432,7 +439,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(Span::styled(format!(" {chip_label} "), chip_style)),
             Line::from(Span::styled(app.activity_phase(), Theme::accent_soft())),
             Line::from(Span::styled(
-                trim_middle(&app.last_log_line(), 28),
+                trim_to_width(&app.last_log_line(), status_inner.width),
                 Theme::dim(),
             )),
         ])
@@ -473,7 +480,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         metrics[3],
     );
 
-    let activity = Paragraph::new(header_activity_lines(app))
+    let activity = Paragraph::new(header_activity_lines(app, right[1].width))
         .block(card_block("Activity", true))
         .style(Theme::card())
         .wrap(Wrap { trim: true });
@@ -481,7 +488,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_results(frame: &mut Frame, area: Rect, app: &App) {
-    let block = pane_block("Results", FocusPane::Center, app, true);
+    let block = pane_block("Results", true);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -515,6 +522,20 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    let state_width = 12u16;
+    let max_outcome_len = app
+        .rows()
+        .iter()
+        .map(|row| outcome_label(row).chars().count())
+        .max()
+        .unwrap_or_else(|| "OUTCOME".chars().count());
+    let outcome_width = (max_outcome_len as u16 + 2).clamp(12, 18);
+    let source_width = content[1]
+        .width
+        .saturating_sub(state_width)
+        .saturating_sub(outcome_width)
+        .saturating_sub(4);
+
     let rows: Vec<Row> = app
         .rows()
         .iter()
@@ -527,7 +548,7 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
                     status_chip_style(row, is_selected),
                 )),
                 Cell::from(Span::styled(
-                    trim_middle(&row.source, 54),
+                    trim_to_width(&row.source, source_width),
                     row_style(row, is_selected),
                 )),
                 Cell::from(Span::styled(
@@ -546,9 +567,9 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(12),
-            Constraint::Percentage(68),
-            Constraint::Percentage(20),
+            Constraint::Length(state_width),
+            Constraint::Min(source_width.max(12)),
+            Constraint::Length(outcome_width),
         ],
     )
     .header(Row::new(vec![
@@ -565,7 +586,7 @@ fn render_help_overlay(frame: &mut Frame) {
     let area = centered_rect(78, 72, frame.area());
     frame.render_widget(Clear, area);
     let help = Paragraph::new(
-        "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\ntab next pane\nshift+tab previous pane\np toggle compact/full paths\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nL confirm and run link job\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels",
+        "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\np toggle compact/full paths\nj/k move rows\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nL confirm and run link job\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels",
     )
     .block(
         Block::default()
@@ -793,7 +814,7 @@ mod tests {
     #[test]
     fn sidebar_lines_keep_sections() {
         let app = App::new(&crate::config::Config::default(), false);
-        let combined = sidebar_lines(&app)
+        let combined = sidebar_lines(&app, 30)
             .iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -817,7 +838,7 @@ mod tests {
     #[test]
     fn header_activity_lines_use_truthful_labels() {
         let app = App::new(&crate::config::Config::default(), false);
-        let combined = header_activity_lines(&app)
+        let combined = header_activity_lines(&app, 80)
             .iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -831,5 +852,11 @@ mod tests {
         let path = "/very/long/path/that/should/remain/fully/visible/source-file.mkv";
         assert_eq!(display_path(path, 20, true), path);
         assert!(display_path(path, 20, false).contains("..."));
+    }
+
+    #[test]
+    fn trim_to_width_uses_available_width() {
+        let path = "/this/is/a/very/long/path/example.mkv";
+        assert!(trim_to_width(path, 10).chars().count() <= 9);
     }
 }

@@ -13,14 +13,6 @@ use super::actions;
 use super::events::{self, Event};
 use super::model::{LinkReportEntry, RunReport, TuiEvent};
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum FocusPane {
-    Left,
-    Center,
-    Right,
-    Bottom,
-}
-
 #[derive(Clone, Debug)]
 pub enum Overlay {
     None,
@@ -58,7 +50,6 @@ struct RunningJob {
 
 pub struct App {
     pub strict: bool,
-    pub focus: FocusPane,
     selected_row: usize,
     pub overlay: Overlay,
     report: Option<RunReport>,
@@ -87,7 +78,6 @@ impl App {
         logs.push_back("TUI started. Press ? for help.".to_string());
         Self {
             strict,
-            focus: FocusPane::Center,
             selected_row: 0,
             overlay: Overlay::None,
             report: None,
@@ -353,8 +343,6 @@ impl App {
         match code {
             KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('?') => self.overlay = Overlay::Help,
-            KeyCode::Tab => self.focus = next_focus(self.focus),
-            KeyCode::BackTab => self.focus = prev_focus(self.focus),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Char('p') => self.toggle_path_mode(),
@@ -793,24 +781,6 @@ fn display_phase(phase: &str) -> &'static str {
     }
 }
 
-fn next_focus(pane: FocusPane) -> FocusPane {
-    match pane {
-        FocusPane::Left => FocusPane::Center,
-        FocusPane::Center => FocusPane::Right,
-        FocusPane::Right => FocusPane::Bottom,
-        FocusPane::Bottom => FocusPane::Left,
-    }
-}
-
-fn prev_focus(pane: FocusPane) -> FocusPane {
-    match pane {
-        FocusPane::Left => FocusPane::Bottom,
-        FocusPane::Center => FocusPane::Left,
-        FocusPane::Right => FocusPane::Center,
-        FocusPane::Bottom => FocusPane::Right,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::protocol::WarningSummary;
@@ -853,20 +823,6 @@ mod tests {
             },
             entries: vec![],
         }
-    }
-
-    #[test]
-    fn focus_cycles_forward() {
-        assert_eq!(next_focus(FocusPane::Left), FocusPane::Center);
-        assert_eq!(next_focus(FocusPane::Center), FocusPane::Right);
-        assert_eq!(next_focus(FocusPane::Right), FocusPane::Bottom);
-        assert_eq!(next_focus(FocusPane::Bottom), FocusPane::Left);
-    }
-
-    #[test]
-    fn focus_cycles_backward() {
-        assert_eq!(prev_focus(FocusPane::Left), FocusPane::Bottom);
-        assert_eq!(prev_focus(FocusPane::Bottom), FocusPane::Right);
     }
 
     #[test]
@@ -992,6 +948,18 @@ mod tests {
 
         assert!(app.expand_paths());
         assert!(app.logs.iter().any(|line| line == "Path display expanded."));
+    }
+
+    #[test]
+    fn tab_no_longer_cycles_fake_pane_focus() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+
+        app.handle_main_key(KeyCode::Tab)
+            .expect("key handling should not fail");
+
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(app.selected_row(), 0);
     }
 
     #[test]
