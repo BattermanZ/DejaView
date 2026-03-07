@@ -388,16 +388,8 @@ fn large_wordmark_lines() -> Vec<Line<'static>> {
 
 fn compact_wordmark_lines() -> Vec<Line<'static>> {
     vec![
-        Line::from(vec![
-            Span::styled("DEJAVIEW", Theme::wordmark()),
-            Span::raw(" "),
-            Span::styled("DEJAVIEW", Theme::wordmark_shadow()),
-        ]),
-        Line::from(vec![
-            Span::styled("duplicate workspace", Theme::subtitle()),
-            Span::raw(" "),
-            Span::styled("media utility", Theme::wordmark_shadow()),
-        ]),
+        Line::from(Span::styled("DEJAVIEW", Theme::wordmark())),
+        Line::from(Span::styled("duplicate workspace", Theme::subtitle())),
     ]
 }
 

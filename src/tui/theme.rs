@@ -121,13 +121,6 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
-    pub fn wordmark_shadow() -> Style {
-        Style::default()
-            .fg(Color::White)
-            .bg(Self::BASE)
-            .add_modifier(Modifier::BOLD)
-    }
-
     pub fn wordmark_highlight() -> Style {
         Style::default()
             .fg(Self::SKY)
