@@ -17,6 +17,15 @@ pub(super) struct FileInfo {
     pub(super) in_downloads: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FileSnapshot {
+    pub(super) size: u64,
+    pub(super) mtime_ns: u128,
+    pub(super) ctime_ns: i128,
+    pub(super) dev: u64,
+    pub(super) inode: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct CacheEntry {
     pub(super) size: u64,
@@ -48,6 +57,8 @@ pub(super) struct LinkAction {
     pub(super) src: PathBuf,
     pub(super) tgt: PathBuf,
     pub(super) size: u64,
+    pub(super) src_snapshot: FileSnapshot,
+    pub(super) tgt_snapshot: FileSnapshot,
 }
 
 pub struct ScanRunOptions<'a> {

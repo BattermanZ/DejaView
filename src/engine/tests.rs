@@ -10,9 +10,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::cache::{clear_cache_file, load_cache, save_cache};
 use super::collect::collect_files;
 use super::linking::{
-    ensure_target_within_media_root, plan_group_actions, replace_file_with_best_link_with,
-    replace_file_with_relative_symlink,
+    apply_actions, ensure_target_within_media_root, plan_group_actions,
+    replace_file_with_best_link_with, replace_file_with_relative_symlink,
 };
+use crate::protocol::LinkReportEntry;
 use super::types::{Cache, CacheEntry, FileInfo, RunMetrics, RunWarnings};
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -164,6 +165,18 @@ fn replace_file_with_best_link_falls_back_to_symlink_on_hardlink_error() {
     assert_eq!(fs::read(&src).expect("read through symlink"), b"new");
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+fn planned_entry_for(action: &super::types::LinkAction) -> LinkReportEntry {
+    LinkReportEntry {
+        source: action.src.display().to_string(),
+        target: action.tgt.display().to_string(),
+        size: action.size,
+        status: "planned".to_string(),
+        method: None,
+        fallback_reason: None,
+        error: None,
+    }
 }
 
 #[test]
@@ -339,6 +352,151 @@ fn run_scan_writes_link_report_manifest() {
             .expect("status"),
         "applied"
     );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn apply_actions_rejects_source_metadata_change_after_planning() {
+    let root = unique_temp_dir("source_changed");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let src = downloads.join("movie.mkv");
+    let tgt = media.join("movie.mkv");
+    write_file(&src, b"same-content");
+    write_file(&tgt, b"same-content");
+
+    let src_meta = fs::metadata(&src).expect("src metadata");
+    let tgt_meta = fs::metadata(&tgt).expect("tgt metadata");
+    let action = super::types::LinkAction {
+        src: src.clone(),
+        tgt: tgt.clone(),
+        size: src_meta.len(),
+        src_snapshot: super::types::FileSnapshot {
+            size: src_meta.len(),
+            mtime_ns: src_meta
+                .modified()
+                .expect("src modified")
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("src mtime")
+                .as_nanos(),
+            ctime_ns: (src_meta.ctime() as i128 * 1_000_000_000) + src_meta.ctime_nsec() as i128,
+            dev: src_meta.dev(),
+            inode: src_meta.ino(),
+        },
+        tgt_snapshot: super::types::FileSnapshot {
+            size: tgt_meta.len(),
+            mtime_ns: tgt_meta
+                .modified()
+                .expect("tgt modified")
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("tgt mtime")
+                .as_nanos(),
+            ctime_ns: (tgt_meta.ctime() as i128 * 1_000_000_000) + tgt_meta.ctime_nsec() as i128,
+            dev: tgt_meta.dev(),
+            inode: tgt_meta.ino(),
+        },
+    };
+    std::thread::sleep(Duration::from_millis(2));
+    write_file(&src, b"changed-content");
+
+    let mut warnings = RunWarnings::default();
+    let mut report_entries = vec![planned_entry_for(&action)];
+    let (applied, strict_error) = apply_actions(
+        &[action],
+        &media,
+        false,
+        true,
+        false,
+        &mut warnings,
+        &mut report_entries,
+    );
+
+    assert_eq!(applied, 0);
+    assert!(strict_error.is_none());
+    assert_eq!(warnings.link_errors, 1);
+    assert_eq!(report_entries[0].status, "failed");
+    assert!(
+        report_entries[0]
+            .error
+            .as_deref()
+            .expect("error message")
+            .contains("source changed since planning")
+    );
+    assert_eq!(fs::read(&src).expect("read src"), b"changed-content");
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn apply_actions_rejects_target_metadata_change_after_planning() {
+    let root = unique_temp_dir("target_changed");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let src = downloads.join("movie.mkv");
+    let tgt = media.join("movie.mkv");
+    write_file(&src, b"same-content");
+    write_file(&tgt, b"same-content");
+
+    let src_meta = fs::metadata(&src).expect("src metadata");
+    let tgt_meta = fs::metadata(&tgt).expect("tgt metadata");
+    let action = super::types::LinkAction {
+        src: src.clone(),
+        tgt: tgt.clone(),
+        size: src_meta.len(),
+        src_snapshot: super::types::FileSnapshot {
+            size: src_meta.len(),
+            mtime_ns: src_meta
+                .modified()
+                .expect("src modified")
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("src mtime")
+                .as_nanos(),
+            ctime_ns: (src_meta.ctime() as i128 * 1_000_000_000) + src_meta.ctime_nsec() as i128,
+            dev: src_meta.dev(),
+            inode: src_meta.ino(),
+        },
+        tgt_snapshot: super::types::FileSnapshot {
+            size: tgt_meta.len(),
+            mtime_ns: tgt_meta
+                .modified()
+                .expect("tgt modified")
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("tgt mtime")
+                .as_nanos(),
+            ctime_ns: (tgt_meta.ctime() as i128 * 1_000_000_000) + tgt_meta.ctime_nsec() as i128,
+            dev: tgt_meta.dev(),
+            inode: tgt_meta.ino(),
+        },
+    };
+    std::thread::sleep(Duration::from_millis(2));
+    write_file(&tgt, b"changed-content");
+
+    let mut warnings = RunWarnings::default();
+    let mut report_entries = vec![planned_entry_for(&action)];
+    let (applied, strict_error) = apply_actions(
+        &[action],
+        &media,
+        false,
+        true,
+        false,
+        &mut warnings,
+        &mut report_entries,
+    );
+
+    assert_eq!(applied, 0);
+    assert!(strict_error.is_none());
+    assert_eq!(warnings.link_errors, 1);
+    assert_eq!(report_entries[0].status, "failed");
+    assert!(
+        report_entries[0]
+            .error
+            .as_deref()
+            .expect("error message")
+            .contains("target changed since planning")
+    );
+    let meta = fs::symlink_metadata(&src).expect("src metadata after reject");
+    assert!(meta.file_type().is_file());
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

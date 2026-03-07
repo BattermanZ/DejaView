@@ -12,7 +12,7 @@ use crate::protocol::TuiEvent;
 use crate::protocol::LinkReportEntry;
 
 use super::types::emit_tui_event;
-use super::types::{FileInfo, LinkAction, RunWarnings};
+use super::types::{FileInfo, FileSnapshot, LinkAction, RunWarnings};
 
 pub(super) fn ensure_target_within_media_root(media_root: &Path, target: &Path) -> Result<()> {
     let canonical_media = fs::canonicalize(media_root)
@@ -33,6 +33,44 @@ pub(super) fn ensure_target_within_media_root(media_root: &Path, target: &Path) 
 fn resolve_verified_target(media_root: &Path, target: &Path) -> Result<std::path::PathBuf> {
     ensure_target_within_media_root(media_root, target)?;
     fs::canonicalize(target).with_context(|| format!("canonicalize {}", target.display()))
+}
+
+fn snapshot_from_file_info(file: &FileInfo) -> FileSnapshot {
+    FileSnapshot {
+        size: file.size,
+        mtime_ns: file.mtime_ns,
+        ctime_ns: file.ctime_ns,
+        dev: file.dev,
+        inode: file.inode,
+    }
+}
+
+fn snapshot_path(path: &Path) -> Result<FileSnapshot> {
+    let meta = fs::metadata(path).with_context(|| format!("metadata {}", path.display()))?;
+    let mtime_ns = meta
+        .modified()
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Ok(FileSnapshot {
+        size: meta.len(),
+        mtime_ns,
+        ctime_ns: (meta.ctime() as i128 * 1_000_000_000) + meta.ctime_nsec() as i128,
+        dev: meta.dev(),
+        inode: meta.ino(),
+    })
+}
+
+fn ensure_snapshot_matches(path: &Path, expected: &FileSnapshot, label: &str) -> Result<()> {
+    let current = snapshot_path(path)?;
+    if current != *expected {
+        return Err(anyhow!(
+            "{label} changed since planning; rerun scan before linking: {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn replace_file_with_relative_symlink(src: &Path, tgt: &Path) -> Result<()> {
@@ -154,6 +192,8 @@ pub(super) fn plan_group_actions(group: &[&FileInfo]) -> Vec<LinkAction> {
             src: src.path.clone(),
             tgt: canonical.path.clone(),
             size: src.size,
+            src_snapshot: snapshot_from_file_info(src),
+            tgt_snapshot: snapshot_from_file_info(canonical),
         });
     }
 
@@ -223,7 +263,9 @@ pub(super) fn apply_actions(
             });
         }
         let apply_result = (|| -> Result<()> {
+            ensure_snapshot_matches(&action.src, &action.src_snapshot, "source")?;
             let resolved_target = resolve_verified_target(media, &action.tgt)?;
+            ensure_snapshot_matches(&resolved_target, &action.tgt_snapshot, "target")?;
             let (method, fallback_reason) =
                 replace_file_with_best_link(&action.src, &resolved_target)?;
             report_entries[index].method = Some(method);
