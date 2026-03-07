@@ -135,6 +135,13 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
     }
     let out_path = resolve_report_path(downloads, &options);
     let mut report_entries = build_report_entries(&actions);
+    if options.tui_events && !report_entries.is_empty() {
+        for entry in report_entries.iter().cloned() {
+            let _ = types::emit_tui_event(&TuiEvent::PlannedEntries {
+                entries: vec![entry],
+            });
+        }
+    }
 
     let (applied_actions, strict_link_error) = if options.dry_run {
         (0usize, None)

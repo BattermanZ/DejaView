@@ -252,9 +252,9 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
             Line::from(Span::styled(" OUTCOME", Theme::title(false))),
             Line::from(Span::styled("No selection", Theme::inspector_value())),
             Line::raw(""),
-            Line::from(Span::styled(" RUN TOTAL", Theme::title(false))),
+            Line::from(Span::styled(" SELECTED SIZE", Theme::title(false))),
             Line::from(Span::styled(
-                format_bytes(app.total_saved_bytes()),
+                "No selection",
                 Theme::metric_number(),
             )),
             Line::raw(""),
@@ -281,9 +281,9 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
             status_chip_style(entry, true),
         )),
         Line::raw(""),
-        Line::from(Span::styled(" RUN TOTAL", Theme::title(false))),
+        Line::from(Span::styled(" SELECTED SIZE", Theme::title(false))),
         Line::from(Span::styled(
-            format_bytes(app.total_saved_bytes()),
+            format_bytes(entry.size),
             Theme::metric_number(),
         )),
         Line::raw(""),
@@ -871,14 +871,14 @@ mod tests {
     }
 
     #[test]
-    fn inspector_labels_run_total_not_item_saved() {
+    fn inspector_labels_show_selected_size() {
         let app = App::new(&crate::config::Config::default(), false);
         let combined = inspector_lines(&app)
             .iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(combined.contains("RUN TOTAL"));
+        assert!(combined.contains("SELECTED SIZE"));
     }
 
     #[test]

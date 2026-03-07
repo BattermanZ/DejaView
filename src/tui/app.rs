@@ -54,6 +54,7 @@ pub struct App {
     selected_row: usize,
     pub overlay: Overlay,
     report: Option<RunReport>,
+    live_entries: Vec<LinkReportEntry>,
     logs: VecDeque<String>,
     downloads: Option<PathBuf>,
     media: Option<PathBuf>,
@@ -85,6 +86,7 @@ impl App {
             selected_row: 0,
             overlay: Overlay::None,
             report: None,
+            live_entries: Vec::new(),
             logs,
             downloads: config.downloads.clone(),
             media: config.media.clone(),
@@ -161,13 +163,6 @@ impl App {
             .unwrap_or(0)
     }
 
-    pub fn total_saved_bytes(&self) -> u64 {
-        self.report
-            .as_ref()
-            .map(|r| r.total_saved_bytes)
-            .unwrap_or(0)
-    }
-
     pub fn saved_bytes(&self) -> u64 {
         self.report
             .as_ref()
@@ -186,6 +181,9 @@ impl App {
     }
 
     pub fn potential_saved_bytes(&self) -> u64 {
+        if self.report.is_none() && !self.live_entries.is_empty() {
+            return self.live_entries.iter().map(|entry| entry.size).sum();
+        }
         self.report
             .as_ref()
             .map(|report| {
@@ -247,10 +245,10 @@ impl App {
     }
 
     pub fn rows(&self) -> &[LinkReportEntry] {
-        self.report
-            .as_ref()
-            .map(|r| r.entries.as_slice())
-            .unwrap_or(&[])
+        if let Some(report) = &self.report {
+            return report.entries.as_slice();
+        }
+        self.live_entries.as_slice()
     }
 
     pub fn log_lines(&self) -> Vec<String> {
@@ -462,6 +460,7 @@ impl App {
         }
         self.reset_live_run_state();
         self.report = None;
+        self.live_entries.clear();
         self.selected_row = 0;
         self.push_log("Running scan...".to_string());
         let strict = self.strict;
@@ -485,6 +484,7 @@ impl App {
         }
         self.reset_live_run_state();
         self.report = None;
+        self.live_entries.clear();
         self.selected_row = 0;
         self.push_log("Running link...".to_string());
         let strict = self.strict;
@@ -795,6 +795,17 @@ impl App {
                 }
                 false
             }
+            TuiEvent::PlannedEntries { entries } => {
+                if !entries.is_empty() {
+                    self.live_entries.extend(entries);
+                    self.live_planned_actions = Some(self.live_entries.len());
+                    self.latest_activity_message = Some(format!(
+                        "Planning actions: {} queued",
+                        self.live_entries.len()
+                    ));
+                }
+                false
+            }
             TuiEvent::Log { message } => {
                 self.latest_activity_message = Some(message.clone());
                 self.push_log(message);
@@ -822,6 +833,7 @@ impl App {
                 self.hash_progress_done = None;
                 self.hash_progress_total = None;
                 self.report = Some(report);
+                self.live_entries.clear();
                 self.running_job = None;
                 self.finish_live_run();
                 match kind {
@@ -880,6 +892,7 @@ impl App {
         self.live_groups_found = None;
         self.live_planned_actions = None;
         self.live_applied_actions = None;
+        self.live_entries.clear();
         self.hash_progress_done = None;
         self.hash_progress_total = None;
         self.active_workers.clear();
@@ -1139,6 +1152,41 @@ mod tests {
         assert_eq!(app.activity_phase(), "HASHING FILES");
         assert_eq!(app.active_worker_paths(), vec![(2, "/downloads/movie.mkv")]);
         assert_eq!(app.throughput_label(), "23 / 42 files hashed");
+    }
+
+    #[test]
+    fn planned_entries_populate_live_rows_and_to_save() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+
+        let (tx, rx) = mpsc::channel();
+        app.running_job = Some(RunningJob {
+            kind: JobKind::Scan,
+            receiver: rx,
+        });
+
+        tx.send(Ok(TuiEvent::PlannedEntries {
+            entries: vec![LinkReportEntry {
+                source: "/downloads/a.mkv".to_string(),
+                target: "/media/a.mkv".to_string(),
+                size: 10,
+                status: "planned".to_string(),
+                method: Some("hardlink".to_string()),
+                fallback_reason: None,
+                error: None,
+            }],
+        }))
+        .expect("send planned entry");
+
+        app.poll_running_job();
+
+        assert_eq!(app.rows().len(), 1);
+        assert_eq!(app.planned_actions(), 1);
+        assert_eq!(app.potential_saved_bytes(), 10);
+        assert_eq!(
+            app.selected_entry().and_then(|entry| entry.method.as_deref()),
+            Some("hardlink")
+        );
     }
 
     #[test]

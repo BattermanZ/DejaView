@@ -129,8 +129,19 @@ pub(super) fn build_report_entries(actions: &[LinkAction]) -> Vec<LinkReportEntr
             target: action.tgt.display().to_string(),
             size: action.size,
             status: "planned".to_string(),
-            method: None,
-            fallback_reason: None,
+            method: Some(
+                if action.src_snapshot.dev == action.tgt_snapshot.dev {
+                    "hardlink"
+                } else {
+                    "symlink"
+                }
+                .to_string(),
+            ),
+            fallback_reason: if action.src_snapshot.dev == action.tgt_snapshot.dev {
+                None
+            } else {
+                Some("cross-device; hardlink not possible".to_string())
+            },
             error: None,
         })
         .collect()

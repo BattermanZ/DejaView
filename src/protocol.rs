@@ -58,6 +58,9 @@ pub enum TuiEvent {
         hash_progress_done: Option<usize>,
         hash_progress_total: Option<usize>,
     },
+    PlannedEntries {
+        entries: Vec<LinkReportEntry>,
+    },
     Log {
         message: String,
     },
