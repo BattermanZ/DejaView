@@ -135,7 +135,7 @@ enum CacheCommands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let command_name = command_name(&cli.command);
-    let log_path = logger::init(command_name)?;
+    let (_log_session, log_path) = logger::init(command_name)?;
     let mut config = load_config()?;
     logger::info(
         "main",
@@ -240,8 +240,6 @@ fn main() -> Result<()> {
             tui::run_logo_preview()?;
         }
     }
-
-    logger::shutdown();
     Ok(())
 }
 

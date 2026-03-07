@@ -10,6 +10,8 @@ struct LoggerState {
     run_id: String,
 }
 
+pub struct Session;
+
 static LOGGER: OnceLock<Mutex<Option<LoggerState>>> = OnceLock::new();
 
 fn logger_slot() -> &'static Mutex<Option<LoggerState>> {
@@ -37,8 +39,7 @@ pub fn default_log_path() -> Result<PathBuf> {
     Ok(base.join("dejaview").join("dejaview.log"))
 }
 
-pub fn init(command: &str) -> Result<PathBuf> {
-    let path = default_log_path()?;
+fn init_at_path(path: &PathBuf, command: &str) -> Result<Session> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("log path has no parent: {}", path.display()))?;
@@ -58,7 +59,13 @@ pub fn init(command: &str) -> Result<PathBuf> {
     if let Ok(mut slot) = logger_slot().lock() {
         *slot = Some(LoggerState { file, run_id });
     }
-    Ok(path)
+    Ok(Session)
+}
+
+pub fn init(command: &str) -> Result<(Session, PathBuf)> {
+    let path = default_log_path()?;
+    let session = init_at_path(&path, command)?;
+    Ok((session, path))
 }
 
 fn write_line(level: &str, op: &str, message: &str) {
@@ -106,6 +113,12 @@ pub fn shutdown() {
     }
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        shutdown();
+    }
+}
+
 #[cfg(test)]
 use std::path::Path;
 
@@ -125,6 +138,23 @@ mod tests {
             .expect("write test log");
         assert!(contents.contains("op=link"));
         assert!(contents.contains("temp cleanup attempted"));
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn session_drop_writes_shutdown_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "dejaview_logger_drop_{}_{}",
+            std::process::id(),
+            timestamp_nanos()
+        ));
+        let path = root.join("dejaview.log");
+        {
+            let _session = init_at_path(&path, "scan").expect("init test logger");
+            info("scan", "doing work");
+        }
+        let contents = fs::read_to_string(&path).expect("read log");
+        assert!(contents.contains("msg=\"run finished\""));
         fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 }
