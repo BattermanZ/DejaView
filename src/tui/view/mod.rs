@@ -1,3 +1,4 @@
+use ratatui::layout::Alignment;
 use ratatui::prelude::*;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
@@ -126,12 +127,10 @@ fn card_block(title: &str, accent: bool) -> Block<'static> {
 }
 
 fn metric_card(title: &str, value: String) -> Paragraph<'static> {
-    Paragraph::new(vec![
-        Line::from(Span::styled(title.to_string(), Theme::metric_label())),
-        Line::from(Span::styled(value, Theme::metric_number())),
-    ])
-    .block(card_block(title, false))
-    .style(Theme::card())
+    Paragraph::new(Line::from(Span::styled(value, Theme::metric_number())))
+        .block(card_block(title, false))
+        .style(Theme::card())
+        .alignment(Alignment::Left)
 }
 
 fn key_hint(key: &str, label: &str, accent: bool) -> Line<'static> {
@@ -479,14 +478,26 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         .style(Theme::canvas());
     let brand_inner = brand_block.inner(split[0]);
     frame.render_widget(brand_block, split[0]);
+    let wordmark_lines = wordmark_lines(brand_inner.width);
+    let wordmark_height = u16::try_from(wordmark_lines.len()).unwrap_or(brand_inner.height);
+    let brand_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(wordmark_height.min(brand_inner.height)),
+            Constraint::Min(0),
+        ])
+        .split(brand_inner);
     frame.render_widget(
-        Paragraph::new(wordmark_lines(brand_inner.width)).style(Theme::canvas()),
-        brand_inner,
+        Paragraph::new(wordmark_lines)
+            .style(Theme::canvas())
+            .alignment(Alignment::Center),
+        brand_layout[1],
     );
 
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(5)])
+        .constraints([Constraint::Length(3), Constraint::Min(6)])
         .split(split[1]);
 
     let metrics = Layout::default()

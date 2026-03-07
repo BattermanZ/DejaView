@@ -107,10 +107,6 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
-    pub fn metric_label() -> Style {
-        Style::default().fg(Self::SUBTEXT0).bg(Self::SURFACE0)
-    }
-
     pub fn metric_number() -> Style {
         Style::default()
             .fg(Self::TEXT)
@@ -127,7 +123,7 @@ impl Theme {
 
     pub fn wordmark_shadow() -> Style {
         Style::default()
-            .fg(Self::LINE)
+            .fg(Color::White)
             .bg(Self::BASE)
             .add_modifier(Modifier::BOLD)
     }

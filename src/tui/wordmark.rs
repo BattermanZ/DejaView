@@ -54,7 +54,22 @@ pub(crate) fn filled_block_lines() -> Vec<Line<'static>> {
         };
         lines.push(Line::from(Span::styled(row.clone(), style)));
     }
-    let shadow = format!("  {}", rows[GLYPH_HEIGHT - 1].replace('█', "░"));
+    let shadow = format!(" {}", rows[GLYPH_HEIGHT - 1]);
     lines.push(Line::from(Span::styled(shadow, Theme::wordmark_shadow())));
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shadow_line_stays_aligned_to_wordmark() {
+        let rows = filled_block_lines()
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        assert!(rows[GLYPH_HEIGHT].starts_with(' '));
+        assert!(rows[GLYPH_HEIGHT].contains('█'));
+    }
 }
