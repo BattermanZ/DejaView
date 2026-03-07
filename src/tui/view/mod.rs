@@ -208,6 +208,7 @@ fn sidebar_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         Line::from(Span::styled(" ACTIONS", Theme::title(false))),
         key_hint("e", "edit paths", true),
         key_hint("S", "scan library", false),
+        key_hint("X", "rescan fresh", false),
         key_hint("L", "link confirmed", false),
         key_hint("R", "save report", false),
         key_hint("J", "json preview", false),
@@ -631,7 +632,7 @@ fn render_help_overlay(frame: &mut Frame) {
     let area = centered_rect(78, 72, frame.area());
     frame.render_widget(Clear, area);
     let help = Paragraph::new(
-        "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\np toggle compact/full paths\nj/k move rows\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nL confirm and run link job\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels",
+        "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\np toggle compact/full paths\nj/k move rows\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nX clear cache and rescan\nL confirm and run link job\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels",
     )
     .block(
         Block::default()

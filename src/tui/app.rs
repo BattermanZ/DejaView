@@ -412,6 +412,11 @@ impl App {
             KeyCode::Char('p') => self.toggle_path_mode(),
             KeyCode::Char('e') => self.open_config_editor(),
             KeyCode::Char('S') | KeyCode::Char('s') => self.start_scan_job(),
+            KeyCode::Char('X') | KeyCode::Char('x') => {
+                if let Err(err) = self.start_rescan_job() {
+                    self.push_log(format!("Rescan failed: {err}"));
+                }
+            }
             KeyCode::Char('L') => self.overlay = Overlay::ConfirmLink,
             KeyCode::Char('l') => {
                 self.push_log("Per-group link intent is not implemented yet. Use uppercase L to confirm a full link run.".to_string());
@@ -475,6 +480,25 @@ impl App {
             kind: JobKind::Scan,
             receiver: rx,
         });
+    }
+
+    fn start_rescan_job(&mut self) -> Result<()> {
+        self.start_rescan_job_with(actions::clear_cache)
+    }
+
+    fn start_rescan_job_with<F>(&mut self, clear_cache_fn: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        if self.running_job.is_some() {
+            self.push_log("A run is already in progress.".to_string());
+            return Ok(());
+        }
+
+        clear_cache_fn()?;
+        self.push_log("Cache cleared. Running fresh scan...".to_string());
+        self.start_scan_job();
+        Ok(())
     }
 
     fn start_link_job(&mut self) {
@@ -1201,6 +1225,32 @@ mod tests {
         assert!(app.report.is_none());
         assert_eq!(app.selected_row, 0);
         assert!(app.running_job.is_some());
+    }
+
+    #[test]
+    fn rescan_clears_cache_then_starts_scan() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+
+        app.start_rescan_job_with(|| Ok(()))
+            .expect("rescan should start");
+
+        assert!(app.running_job.is_some());
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line == "Cache cleared. Running fresh scan...")
+        );
+    }
+
+    #[test]
+    fn rescan_failure_does_not_start_job() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+
+        let err = app.start_rescan_job_with(|| Err(anyhow::anyhow!("boom")));
+        assert!(err.is_err());
+        assert!(app.running_job.is_none());
     }
 
     #[test]

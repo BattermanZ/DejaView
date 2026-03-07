@@ -5,6 +5,8 @@ use std::sync::mpsc::Sender;
 
 use anyhow::{Context, Result, anyhow};
 
+use crate::config::load_config;
+use crate::engine;
 use crate::fsutil::safe_write_bytes;
 
 use super::model::{RunReport, TuiEvent};
@@ -113,6 +115,11 @@ pub fn run_scan(strict: bool, tx: Sender<Result<TuiEvent>>) -> Result<()> {
 
 pub fn run_link(strict: bool, tx: Sender<Result<TuiEvent>>) -> Result<()> {
     stream_subcommand_events("link", strict, tx)
+}
+
+pub fn clear_cache() -> Result<()> {
+    let config = load_config()?;
+    engine::clear_cache(&config)
 }
 
 pub fn save_report(report: &RunReport, path: &Path) -> Result<()> {
