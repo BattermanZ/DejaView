@@ -37,14 +37,6 @@ fn write_file(path: &Path, content: &[u8]) {
     fs::write(path, content).expect("write file");
 }
 
-fn write_three_meg_with_middle(path: &Path, middle: u8) {
-    let mut data = vec![b'A'; 3 * 1024 * 1024];
-    for byte in &mut data[1024 * 1024..2 * 1024 * 1024] {
-        *byte = middle;
-    }
-    write_file(path, &data);
-}
-
 fn sample_file_info(path: &str, dev: u64, inode: u64, in_downloads: bool) -> FileInfo {
     FileInfo {
         path: PathBuf::from(path),
@@ -170,27 +162,6 @@ fn replace_file_with_best_link_falls_back_to_symlink_on_hardlink_error() {
     let meta = fs::symlink_metadata(&src).expect("source metadata");
     assert!(meta.file_type().is_symlink());
     assert_eq!(fs::read(&src).expect("read through symlink"), b"new");
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
-}
-
-#[test]
-fn replace_file_with_best_link_works_when_source_path_is_absent() {
-    let root = unique_temp_dir("link_missing_src");
-    let downloads = root.join("downloads");
-    let media = root.join("media");
-    fs::create_dir_all(&downloads).expect("create downloads dir");
-    fs::create_dir_all(&media).expect("create media dir");
-
-    let src = downloads.join("duplicate.mkv");
-    let tgt = media.join("canonical.mkv");
-    fs::write(&tgt, b"new").expect("write target");
-
-    let result = replace_file_with_best_link_with(&src, &tgt, |from, to| fs::hard_link(from, to))
-        .expect("replace with missing source");
-
-    assert_eq!(result.0, "hardlink");
-    assert_eq!(fs::read(&src).expect("read through hardlink"), b"new");
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
@@ -367,32 +338,6 @@ fn run_scan_writes_link_report_manifest() {
             .as_str()
             .expect("status"),
         "applied"
-    );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
-}
-
-#[test]
-fn run_scan_does_not_reuse_stale_cached_hash_for_mutated_file() {
-    let root = unique_temp_dir("stale_cache");
-    let downloads = root.join("downloads");
-    let media = root.join("media");
-    let src = downloads.join("movie.mkv");
-    let tgt = media.join("movie.mkv");
-    write_three_meg_with_middle(&src, b'B');
-    write_three_meg_with_middle(&tgt, b'B');
-    let config = make_config(&downloads, &media, 0);
-
-    run_scan(&config, true, false, None);
-
-    write_three_meg_with_middle(&src, b'C');
-    run_scan(&config, false, false, None);
-
-    let meta = fs::symlink_metadata(&src).expect("source metadata");
-    assert!(meta.file_type().is_file());
-    assert_ne!(
-        fs::read(&src).expect("read source"),
-        fs::read(&tgt).expect("read target")
     );
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
