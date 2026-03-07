@@ -1,48 +1,106 @@
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::Sender;
 
 use anyhow::{anyhow, Context, Result};
 
-use super::model::RunReport;
+use super::model::{RunReport, TuiEvent};
 
-fn run_subcommand_json(subcommand: &str, strict: bool) -> Result<RunReport> {
+fn stream_subcommand_events(
+    subcommand: &str,
+    strict: bool,
+    tx: Sender<Result<TuiEvent>>,
+) -> Result<()> {
     let exe = std::env::current_exe().context("resolve current executable")?;
     let mut cmd = Command::new(exe);
-    cmd.arg(subcommand).arg("--json").arg("--no-progress");
+    cmd.arg(subcommand)
+        .arg("--tui-events")
+        .arg("--no-progress")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if strict {
         cmd.arg("--strict");
     }
 
-    let output = cmd
-        .output()
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("execute '{subcommand}' in subprocess"))?;
+    let stdout = child.stdout.take().context("capture subprocess stdout")?;
+    let stderr = child.stderr.take().context("capture subprocess stderr")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stderr_handle = std::thread::spawn(move || -> Result<String> {
+        let mut buf = String::new();
+        BufReader::new(stderr).read_to_string(&mut buf)?;
+        Ok(buf)
+    });
+
+    let mut saw_done = false;
+    for line in BufReader::new(stdout).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let message = format!("read streamed event line: {err}");
+                let _ = tx.send(Err(anyhow!(message.clone())));
+                return Err(anyhow!(message));
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: TuiEvent = match serde_json::from_str(&line).with_context(|| {
+            format!(
+                "parse streamed event from {subcommand} (first 200 bytes: {})",
+                line.chars().take(200).collect::<String>()
+            )
+        }) {
+            Ok(event) => event,
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = tx.send(Err(anyhow!(err.to_string())));
+                return Err(err);
+            }
+        };
+        if matches!(event, TuiEvent::Done { .. }) {
+            saw_done = true;
+        }
+        let _ = tx.send(Ok(event));
+    }
+
+    let status = child.wait().context("wait for subprocess completion")?;
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| anyhow!("stderr reader thread panicked"))??;
+
+    if !status.success() {
+        let stderr = stderr.trim().to_string();
         let message = if stderr.is_empty() {
-            format!("{subcommand} failed with status {}", output.status)
+            format!("{subcommand} failed with status {status}")
         } else {
             format!("{subcommand} failed: {stderr}")
         };
+        let _ = tx.send(Err(anyhow!(message.clone())));
         return Err(anyhow!(message));
     }
 
-    let stdout = String::from_utf8(output.stdout).context("decode json stdout")?;
-    let report: RunReport = serde_json::from_str(&stdout).with_context(|| {
-        format!(
-            "parse {subcommand} json output (first 200 bytes: {})",
-            stdout.chars().take(200).collect::<String>()
-        )
-    })?;
-    Ok(report)
+    if !saw_done {
+        let message = format!("{subcommand} ended without a final done event");
+        let _ = tx.send(Err(anyhow!(message.clone())));
+        return Err(anyhow!(message));
+    }
+
+    Ok(())
 }
 
-pub fn run_scan(strict: bool) -> Result<RunReport> {
-    run_subcommand_json("scan", strict)
+pub fn run_scan(strict: bool, tx: Sender<Result<TuiEvent>>) -> Result<()> {
+    stream_subcommand_events("scan", strict, tx)
 }
 
-pub fn run_link(strict: bool) -> Result<RunReport> {
-    run_subcommand_json("link", strict)
+pub fn run_link(strict: bool, tx: Sender<Result<TuiEvent>>) -> Result<()> {
+    stream_subcommand_events("link", strict, tx)
 }
 
 pub fn save_report(report: &RunReport, path: &Path) -> Result<()> {

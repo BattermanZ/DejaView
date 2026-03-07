@@ -7,7 +7,12 @@ use std::os::unix::fs::{symlink, MetadataExt};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::types::{FileInfo, LinkAction, LinkReportEntry, RunWarnings};
+use crate::protocol::TuiEvent;
+
+use crate::protocol::LinkReportEntry;
+
+use super::types::emit_tui_event;
+use super::types::{FileInfo, LinkAction, RunWarnings};
 
 pub(super) fn ensure_target_within_media_root(media_root: &Path, target: &Path) -> Result<()> {
     let canonical_media = fs::canonicalize(media_root)
@@ -187,6 +192,7 @@ pub(super) fn apply_actions(
     media: &Path,
     strict: bool,
     json_output: bool,
+    tui_events: bool,
     warnings: &mut RunWarnings,
     report_entries: &mut [LinkReportEntry],
 ) -> (usize, Option<anyhow::Error>) {
@@ -202,6 +208,12 @@ pub(super) fn apply_actions(
     }
 
     for (index, action) in actions.iter().enumerate() {
+        if tui_events {
+            let _ = emit_tui_event(&TuiEvent::File {
+                phase: Some("applying".to_string()),
+                path: action.src.display().to_string(),
+            });
+        }
         let apply_result = (|| -> Result<()> {
             ensure_target_within_media_root(media, &action.tgt)?;
             let (method, fallback_reason) = replace_file_with_best_link(&action.src, &action.tgt)?;
@@ -234,6 +246,14 @@ pub(super) fn apply_actions(
             }
         }
         applied_actions += 1;
+        if tui_events {
+            let _ = emit_tui_event(&TuiEvent::Count {
+                files_seen: None,
+                groups_found: None,
+                planned_actions: Some(actions.len()),
+                applied_actions: Some(applied_actions),
+            });
+        }
     }
 
     (applied_actions, strict_link_error)

@@ -9,7 +9,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use super::types::emit_tui_event;
 use super::types::{Cache, CacheEntry, FileInfo, RunWarnings};
+use crate::protocol::TuiEvent;
 
 fn sample_digest(path: &Path, size: u64) -> Result<[u8; 32]> {
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -46,6 +48,7 @@ pub(super) fn hash_groups_and_update_cache(
     inode_hash: &Arc<Mutex<HashMap<(u64, u64), String>>>,
     strict: bool,
     show_progress: bool,
+    tui_events: bool,
     warnings: &mut RunWarnings,
 ) -> Result<()> {
     let bar = if show_progress {
@@ -70,6 +73,12 @@ pub(super) fn hash_groups_and_update_cache(
     groups.par_iter_mut().try_for_each(|group| -> Result<()> {
         let mut sample_hashes: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
         for (i, fi) in group.iter().enumerate() {
+            if tui_events {
+                let _ = emit_tui_event(&TuiEvent::File {
+                    phase: Some("hashing".to_string()),
+                    path: fi.path.display().to_string(),
+                });
+            }
             match sample_digest(&fi.path, fi.size) {
                 Ok(h) => {
                     sample_hashes.entry(h).or_default().push(i);
@@ -104,6 +113,12 @@ pub(super) fn hash_groups_and_update_cache(
                             continue;
                         }
                     }
+                }
+                if tui_events {
+                    let _ = emit_tui_event(&TuiEvent::File {
+                        phase: Some("hashing".to_string()),
+                        path: fi.path.display().to_string(),
+                    });
                 }
                 match full_digest(&fi.path) {
                     Ok(h) => {

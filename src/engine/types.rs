@@ -1,6 +1,9 @@
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+use crate::protocol::TuiEvent;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub(super) struct FileInfo {
@@ -43,39 +46,6 @@ pub(super) struct LinkAction {
     pub(super) size: u64,
 }
 
-#[derive(Serialize)]
-pub(super) struct WarningSummary {
-    pub(super) walk_errors: u64,
-    pub(super) metadata_errors: u64,
-    pub(super) sample_hash_errors: u64,
-    pub(super) full_hash_errors: u64,
-    pub(super) link_errors: u64,
-}
-
-#[derive(Serialize)]
-pub(super) struct LinkReportEntry {
-    pub(super) source: String,
-    pub(super) target: String,
-    pub(super) status: String,
-    pub(super) method: Option<String>,
-    pub(super) fallback_reason: Option<String>,
-    pub(super) error: Option<String>,
-}
-
-#[derive(Serialize)]
-pub(super) struct RunReport {
-    pub(super) mode: String,
-    pub(super) dry_run: bool,
-    pub(super) strict: bool,
-    pub(super) files_considered: usize,
-    pub(super) planned_actions: usize,
-    pub(super) applied_actions: usize,
-    pub(super) total_saved_bytes: u64,
-    pub(super) skipped_by_min_age: u64,
-    pub(super) warnings: WarningSummary,
-    pub(super) entries: Vec<LinkReportEntry>,
-}
-
 pub struct ScanRunOptions<'a> {
     pub dry_run: bool,
     pub strict: bool,
@@ -83,4 +53,13 @@ pub struct ScanRunOptions<'a> {
     pub json_output: bool,
     pub show_progress: bool,
     pub require_confirm: bool,
+    pub tui_events: bool,
+}
+
+pub(super) fn emit_tui_event(event: &TuiEvent) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    serde_json::to_writer(&mut lock, event)?;
+    lock.write_all(b"\n")?;
+    lock.flush()
 }

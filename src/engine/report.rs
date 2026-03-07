@@ -3,9 +3,9 @@ use colored::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::types::{
-    LinkAction, LinkReportEntry, RunMetrics, RunReport, RunWarnings, ScanRunOptions, WarningSummary,
-};
+use crate::protocol::{LinkReportEntry, RunReport, WarningSummary};
+
+use super::types::{LinkAction, RunMetrics, RunWarnings, ScanRunOptions};
 
 fn format_size(bytes: u64) -> String {
     let units = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];

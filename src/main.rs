@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 mod config;
 mod engine;
+mod protocol;
 mod tui;
 
 use config::{load_config, save_config};
@@ -65,6 +66,9 @@ struct RunOutputArgs {
     /// Shortcut for --progress off
     #[arg(long, conflicts_with = "progress")]
     no_progress: bool,
+    /// Internal NDJSON event stream for the TUI subprocess runner
+    #[arg(long, hide = true)]
+    tui_events: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -74,8 +78,8 @@ enum ProgressMode {
     Off,
 }
 
-fn progress_enabled(mode: ProgressMode, no_progress: bool, json: bool) -> bool {
-    if no_progress || json {
+fn progress_enabled(mode: ProgressMode, no_progress: bool, json: bool, tui_events: bool) -> bool {
+    if no_progress || json || tui_events {
         return false;
     }
     match mode {
@@ -145,8 +149,10 @@ fn main() -> Result<()> {
                         output.progress,
                         output.no_progress,
                         output.json,
+                        output.tui_events,
                     ),
                     require_confirm: false,
+                    tui_events: output.tui_events,
                 },
             )?
         }
@@ -167,8 +173,10 @@ fn main() -> Result<()> {
                         output.progress,
                         output.no_progress,
                         output.json,
+                        output.tui_events,
                     ),
                     require_confirm: confirm,
+                    tui_events: output.tui_events,
                 },
             )?
         }
@@ -331,6 +339,7 @@ mod tests {
                 assert_eq!(output.report, None);
                 assert_eq!(output.progress, ProgressMode::Auto);
                 assert!(!output.no_progress);
+                assert!(!output.tui_events);
             }
             _ => panic!("expected scan command"),
         }
@@ -359,6 +368,7 @@ mod tests {
                 assert_eq!(output.report, Some(PathBuf::from("/tmp/report.json")));
                 assert_eq!(output.progress, ProgressMode::Auto);
                 assert!(output.no_progress);
+                assert!(!output.tui_events);
             }
             _ => panic!("expected link command"),
         }

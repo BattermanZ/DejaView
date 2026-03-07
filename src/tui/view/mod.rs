@@ -145,6 +145,14 @@ fn key_hint(key: &str, label: &str, accent: bool) -> Line<'static> {
     ])
 }
 
+fn display_path(input: &str, max_len: usize, expand: bool) -> String {
+    if expand {
+        input.to_string()
+    } else {
+        trim_middle(input, max_len)
+    }
+}
+
 fn mode_chip(app: &App) -> (&'static str, Style) {
     if app.mode_label().eq_ignore_ascii_case("Linking") {
         return ("LINK ACTIVE", Theme::badge_accent());
@@ -167,12 +175,18 @@ fn sidebar_lines(app: &App) -> Vec<Line<'static>> {
         Line::from(vec![
             Span::styled("Downloads", Theme::dim()),
             Span::raw("  "),
-            Span::styled(trim_middle(&app.downloads_label(), 22), Theme::base()),
+            Span::styled(
+                display_path(&app.downloads_label(), 22, app.expand_paths()),
+                Theme::base(),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Media", Theme::dim()),
             Span::raw("      "),
-            Span::styled(trim_middle(&app.media_label(), 22), Theme::base()),
+            Span::styled(
+                display_path(&app.media_label(), 22, app.expand_paths()),
+                Theme::base(),
+            ),
         ]),
         Line::raw(""),
         Line::from(Span::styled(" SETTINGS", Theme::title(false))),
@@ -193,6 +207,7 @@ fn sidebar_lines(app: &App) -> Vec<Line<'static>> {
         key_hint("L", "link confirmed", false),
         key_hint("R", "save report", false),
         key_hint("J", "json preview", false),
+        key_hint("p", "toggle paths", false),
     ]
 }
 
@@ -269,10 +284,10 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
         )),
         Line::raw(""),
         Line::from(Span::styled(" SOURCE", Theme::title(false))),
-        Line::from(Span::styled(trim_middle(&entry.source, 28), Theme::base())),
+        Line::from(Span::styled(entry.source.clone(), Theme::base())),
         Line::raw(""),
         Line::from(Span::styled(" TARGET", Theme::title(false))),
-        Line::from(Span::styled(trim_middle(&entry.target, 28), Theme::base())),
+        Line::from(Span::styled(entry.target.clone(), Theme::base())),
         Line::raw(""),
         Line::from(Span::styled(" NOTES", Theme::title(false))),
         Line::from(Span::styled(notes_text(entry), notes_style)),
@@ -281,18 +296,27 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
 
 fn header_activity_lines(app: &App) -> Vec<Line<'static>> {
     let (chip_label, chip_style) = mode_chip(app);
-    vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(format!(" {chip_label} "), chip_style),
             Span::raw(" "),
             Span::styled(app.activity_phase(), Theme::accent_soft()),
+            Span::raw("  "),
+            Span::styled(format!("elapsed {}", app.elapsed_label()), Theme::muted()),
         ]),
         Line::from(Span::styled(app.throughput_label(), Theme::muted())),
         Line::from(Span::styled(
-            trim_middle(&app.last_log_line(), 110),
+            trim_middle(&app.activity_message(), 110),
             Theme::dim(),
         )),
-    ]
+    ];
+    if let Some(path) = app.current_path() {
+        lines.push(Line::from(vec![
+            Span::styled("current ", Theme::dim()),
+            Span::styled(display_path(path, 100, app.expand_paths()), Theme::base()),
+        ]));
+    }
+    lines
 }
 
 fn footer_line() -> Line<'static> {
@@ -311,6 +335,9 @@ fn footer_line() -> Line<'static> {
         Span::raw("  "),
         Span::styled(" L ", Theme::badge()),
         Span::styled("link", Theme::muted()),
+        Span::raw("  "),
+        Span::styled(" p ", Theme::badge()),
+        Span::styled("paths", Theme::muted()),
         Span::raw("  "),
         Span::styled(" j/k ", Theme::badge()),
         Span::styled("rows", Theme::muted()),
@@ -468,8 +495,9 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw("  "),
         Span::styled(
             format!(
-                "{} rows  |  {} planned  |  {} applied",
+                "{} rows  |  {} files  |  {} planned  |  {} applied",
                 app.rows().len(),
+                app.files_considered(),
                 app.planned_actions(),
                 app.applied_actions()
             ),
@@ -537,7 +565,7 @@ fn render_help_overlay(frame: &mut Frame) {
     let area = centered_rect(78, 72, frame.area());
     frame.render_widget(Clear, area);
     let help = Paragraph::new(
-        "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\ntab next pane\nshift+tab previous pane\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nL confirm and run link job\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels",
+        "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\ntab next pane\nshift+tab previous pane\np toggle compact/full paths\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nL confirm and run link job\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels",
     )
     .block(
         Block::default()
@@ -796,5 +824,12 @@ mod tests {
             .join(" ");
         assert!(combined.contains("IDLE"));
         assert!(combined.contains("READY TO SCAN"));
+    }
+
+    #[test]
+    fn display_path_respects_expanded_mode() {
+        let path = "/very/long/path/that/should/remain/fully/visible/source-file.mkv";
+        assert_eq!(display_path(path, 20, true), path);
+        assert!(display_path(path, 20, false).contains("..."));
     }
 }

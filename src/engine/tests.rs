@@ -47,6 +47,7 @@ fn run_scan(config: &Config, dry_run: bool, strict: bool, report_path: Option<&P
             json_output: false,
             show_progress: false,
             require_confirm: false,
+            tui_events: false,
         },
     )
     .expect("run scan");
@@ -293,6 +294,7 @@ fn collect_files_strict_fails_on_walk_error() {
         true,
         Duration::from_secs(0),
         true,
+        false,
         &mut warnings,
         &mut metrics,
     );
@@ -467,6 +469,7 @@ fn run_scan_strict_fails_on_sample_hash_error() {
             json_output: false,
             show_progress: false,
             require_confirm: false,
+            tui_events: false,
         },
     );
     assert!(strict_result.is_err());
@@ -479,6 +482,7 @@ fn run_scan_strict_fails_on_sample_hash_error() {
             json_output: false,
             show_progress: false,
             require_confirm: false,
+            tui_events: false,
         },
     );
     assert!(non_strict_result.is_ok());
@@ -518,6 +522,7 @@ fn run_scan_non_strict_link_failure_continues() {
             json_output: false,
             show_progress: false,
             require_confirm: false,
+            tui_events: false,
         },
     );
     assert!(result.is_ok());
@@ -561,6 +566,7 @@ fn run_scan_strict_link_failure_returns_error() {
             json_output: false,
             show_progress: false,
             require_confirm: false,
+            tui_events: false,
         },
     );
     assert!(result.is_err());

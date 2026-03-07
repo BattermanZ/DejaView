@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
@@ -11,7 +11,7 @@ use crate::config::{load_config, save_config, validate_runtime_paths, Config};
 
 use super::actions;
 use super::events::{self, Event};
-use super::model::{LinkReportEntry, RunReport};
+use super::model::{LinkReportEntry, RunReport, TuiEvent};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FocusPane {
@@ -53,7 +53,7 @@ enum JobKind {
 
 struct RunningJob {
     kind: JobKind,
-    receiver: Receiver<Result<RunReport>>,
+    receiver: Receiver<Result<TuiEvent>>,
 }
 
 pub struct App {
@@ -67,6 +67,16 @@ pub struct App {
     media: Option<PathBuf>,
     min_age: Option<u64>,
     threads: Option<usize>,
+    expand_paths: bool,
+    current_phase: Option<String>,
+    current_path: Option<String>,
+    latest_activity_message: Option<String>,
+    live_files_seen: Option<usize>,
+    live_groups_found: Option<usize>,
+    live_planned_actions: Option<usize>,
+    live_applied_actions: Option<usize>,
+    job_started_at: Option<Instant>,
+    last_run_duration: Option<Duration>,
     running_job: Option<RunningJob>,
     should_quit: bool,
 }
@@ -86,6 +96,16 @@ impl App {
             media: config.media.clone(),
             min_age: config.min_age,
             threads: config.threads,
+            expand_paths: false,
+            current_phase: None,
+            current_path: None,
+            latest_activity_message: None,
+            live_files_seen: None,
+            live_groups_found: None,
+            live_planned_actions: None,
+            live_applied_actions: None,
+            job_started_at: None,
+            last_run_duration: None,
             running_job: None,
             should_quit: false,
         }
@@ -127,18 +147,21 @@ impl App {
     }
 
     pub fn files_considered(&self) -> usize {
-        self.report
-            .as_ref()
-            .map(|r| r.files_considered)
+        self.live_files_seen
+            .or_else(|| self.report.as_ref().map(|r| r.files_considered))
             .unwrap_or(0)
     }
 
     pub fn planned_actions(&self) -> usize {
-        self.report.as_ref().map(|r| r.planned_actions).unwrap_or(0)
+        self.live_planned_actions
+            .or_else(|| self.report.as_ref().map(|r| r.planned_actions))
+            .unwrap_or(0)
     }
 
     pub fn applied_actions(&self) -> usize {
-        self.report.as_ref().map(|r| r.applied_actions).unwrap_or(0)
+        self.live_applied_actions
+            .or_else(|| self.report.as_ref().map(|r| r.applied_actions))
+            .unwrap_or(0)
     }
 
     pub fn total_saved_bytes(&self) -> u64 {
@@ -203,6 +226,9 @@ impl App {
     }
 
     pub fn activity_phase(&self) -> &'static str {
+        if let Some(phase) = self.current_phase.as_deref() {
+            return display_phase(phase);
+        }
         if let Some(job) = &self.running_job {
             return match job.kind {
                 JobKind::Scan => "SCANNING LIBRARY",
@@ -218,10 +244,23 @@ impl App {
 
     pub fn throughput_label(&self) -> String {
         if self.running_job.is_some() {
-            return format!(
-                "subprocess active  |  waiting for final report  |  {} rows currently visible",
-                self.rows().len()
-            );
+            let mut parts = Vec::new();
+            if let Some(files) = self.live_files_seen {
+                parts.push(format!("{files} files"));
+            }
+            if let Some(groups) = self.live_groups_found {
+                parts.push(format!("{groups} groups"));
+            }
+            if let Some(planned) = self.live_planned_actions {
+                parts.push(format!("{planned} planned"));
+            }
+            if let Some(applied) = self.live_applied_actions {
+                parts.push(format!("{applied} applied"));
+            }
+            if parts.is_empty() {
+                return "subprocess active".to_string();
+            }
+            return parts.join("  |  ");
         }
         format!(
             "{} files  |  {} planned  |  {} applied",
@@ -236,6 +275,31 @@ impl App {
             .back()
             .cloned()
             .unwrap_or_else(|| "No activity yet.".to_string())
+    }
+
+    pub fn activity_message(&self) -> String {
+        self.latest_activity_message
+            .clone()
+            .unwrap_or_else(|| self.last_log_line())
+    }
+
+    pub fn current_path(&self) -> Option<&str> {
+        self.current_path.as_deref()
+    }
+
+    pub fn elapsed_label(&self) -> String {
+        let duration = if let Some(started) = self.job_started_at {
+            started.elapsed()
+        } else if let Some(duration) = self.last_run_duration {
+            duration
+        } else {
+            Duration::ZERO
+        };
+        format_duration(duration)
+    }
+
+    pub fn expand_paths(&self) -> bool {
+        self.expand_paths
     }
 
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<()> {
@@ -286,6 +350,7 @@ impl App {
             KeyCode::BackTab => self.focus = prev_focus(self.focus),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Char('p') => self.toggle_path_mode(),
             KeyCode::Char('e') => self.open_config_editor(),
             KeyCode::Char('S') | KeyCode::Char('s') => self.start_scan_job(),
             KeyCode::Char('L') => self.overlay = Overlay::ConfirmLink,
@@ -334,12 +399,16 @@ impl App {
             self.push_log("A run is already in progress.".to_string());
             return;
         }
+        self.reset_live_run_state();
         self.push_log("Running scan...".to_string());
         let strict = self.strict;
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(actions::run_scan(strict));
+            let _ = actions::run_scan(strict, tx);
         });
+        self.job_started_at = Some(Instant::now());
+        self.current_phase = Some("collecting".to_string());
+        self.latest_activity_message = Some("Collecting candidate files".to_string());
         self.running_job = Some(RunningJob {
             kind: JobKind::Scan,
             receiver: rx,
@@ -351,16 +420,32 @@ impl App {
             self.push_log("A run is already in progress.".to_string());
             return;
         }
+        self.reset_live_run_state();
         self.push_log("Running link...".to_string());
         let strict = self.strict;
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(actions::run_link(strict));
+            let _ = actions::run_link(strict, tx);
         });
+        self.job_started_at = Some(Instant::now());
+        self.current_phase = Some("planning".to_string());
+        self.latest_activity_message = Some("Preparing link run".to_string());
         self.running_job = Some(RunningJob {
             kind: JobKind::Link,
             receiver: rx,
         });
+    }
+
+    fn toggle_path_mode(&mut self) {
+        self.expand_paths = !self.expand_paths;
+        self.push_log(format!(
+            "Path display {}.",
+            if self.expand_paths {
+                "expanded"
+            } else {
+                "compact"
+            }
+        ));
     }
 
     fn handle_config_editor_key(&mut self, code: KeyCode) -> Result<()> {
@@ -494,43 +579,129 @@ impl App {
     }
 
     fn poll_running_job(&mut self) {
-        let completion = if let Some(job) = self.running_job.as_mut() {
-            match job.receiver.try_recv() {
-                Ok(result) => Some((job.kind, result)),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some((
-                    job.kind,
-                    Err(anyhow::anyhow!("worker thread disconnected unexpectedly")),
-                )),
+        let mut disconnected_kind = None;
+        let mut events = Vec::new();
+        if let Some(job) = self.running_job.as_mut() {
+            loop {
+                match job.receiver.try_recv() {
+                    Ok(event) => events.push((job.kind, event)),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected_kind = Some(job.kind);
+                        break;
+                    }
+                }
             }
-        } else {
-            None
-        };
+        }
 
-        if let Some((kind, result)) = completion {
-            self.running_job = None;
+        let mut saw_done = false;
+        for (kind, result) in events {
             match result {
-                Ok(report) => {
-                    let planned = report.planned_actions;
-                    let applied = report.applied_actions;
-                    self.selected_row = 0;
-                    self.report = Some(report);
-                    match kind {
-                        JobKind::Scan => {
-                            self.push_log(format!("Scan finished. Planned actions: {planned}"))
-                        }
-                        JobKind::Link => {
-                            self.push_log(format!("Link finished. Applied actions: {applied}"))
-                        }
+                Ok(event) => {
+                    if self.apply_tui_event(kind, event) {
+                        saw_done = true;
                     }
                 }
                 Err(err) => {
+                    self.running_job = None;
+                    self.finish_live_run();
                     let label = match kind {
                         JobKind::Scan => "Scan",
                         JobKind::Link => "Link",
                     };
                     self.push_log(format!("{label} failed: {err}"));
+                    return;
                 }
+            }
+        }
+
+        if let Some(kind) = disconnected_kind {
+            if !saw_done && self.running_job.is_some() {
+                self.running_job = None;
+                self.finish_live_run();
+                let label = match kind {
+                    JobKind::Scan => "Scan",
+                    JobKind::Link => "Link",
+                };
+                self.push_log(format!(
+                    "{label} failed: worker thread disconnected unexpectedly"
+                ));
+            }
+        }
+    }
+
+    fn apply_tui_event(&mut self, kind: JobKind, event: TuiEvent) -> bool {
+        match event {
+            TuiEvent::Phase { phase } => {
+                self.current_phase = Some(phase.clone());
+                let message = format!("Phase: {}", display_phase(&phase));
+                self.latest_activity_message = Some(message.clone());
+                self.push_log(message);
+                false
+            }
+            TuiEvent::File { phase, path } => {
+                if let Some(phase) = phase {
+                    self.current_phase = Some(phase);
+                }
+                self.current_path = Some(path.clone());
+                self.latest_activity_message = Some(format!("Working on {}", path));
+                false
+            }
+            TuiEvent::Count {
+                files_seen,
+                groups_found,
+                planned_actions,
+                applied_actions,
+            } => {
+                if let Some(files_seen) = files_seen {
+                    self.live_files_seen = Some(files_seen);
+                }
+                if let Some(groups_found) = groups_found {
+                    self.live_groups_found = Some(groups_found);
+                }
+                if let Some(planned_actions) = planned_actions {
+                    self.live_planned_actions = Some(planned_actions);
+                }
+                if let Some(applied_actions) = applied_actions {
+                    self.live_applied_actions = Some(applied_actions);
+                }
+                false
+            }
+            TuiEvent::Log { message } => {
+                self.latest_activity_message = Some(message.clone());
+                self.push_log(message);
+                false
+            }
+            TuiEvent::Error { message } => {
+                self.running_job = None;
+                self.finish_live_run();
+                let label = match kind {
+                    JobKind::Scan => "Scan",
+                    JobKind::Link => "Link",
+                };
+                self.push_log(format!("{label} failed: {message}"));
+                true
+            }
+            TuiEvent::Done { report } => {
+                let planned = report.planned_actions;
+                let applied = report.applied_actions;
+                self.selected_row = 0;
+                self.live_files_seen = Some(report.files_considered);
+                self.live_planned_actions = Some(report.planned_actions);
+                self.live_applied_actions = Some(report.applied_actions);
+                self.current_path = None;
+                self.report = Some(report);
+                self.running_job = None;
+                self.finish_live_run();
+                match kind {
+                    JobKind::Scan => {
+                        self.push_log(format!("Scan finished. Planned actions: {planned}"))
+                    }
+                    JobKind::Link => {
+                        self.push_log(format!("Link finished. Applied actions: {applied}"))
+                    }
+                }
+                true
             }
         }
     }
@@ -569,6 +740,43 @@ impl App {
         }
         self.logs.push_back(line);
     }
+
+    fn reset_live_run_state(&mut self) {
+        self.current_phase = None;
+        self.current_path = None;
+        self.latest_activity_message = None;
+        self.live_files_seen = None;
+        self.live_groups_found = None;
+        self.live_planned_actions = None;
+        self.live_applied_actions = None;
+        self.last_run_duration = None;
+        self.job_started_at = None;
+    }
+
+    fn finish_live_run(&mut self) {
+        if let Some(started) = self.job_started_at.take() {
+            self.last_run_duration = Some(started.elapsed());
+        }
+        self.current_phase = None;
+        self.current_path = None;
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let minutes = secs / 60;
+    let seconds = secs % 60;
+    format!("{minutes:02}:{seconds:02}")
+}
+
+fn display_phase(phase: &str) -> &'static str {
+    match phase {
+        "collecting" => "COLLECTING FILES",
+        "hashing" => "HASHING DUPLICATES",
+        "planning" => "PLANNING ACTIONS",
+        "applying" => "APPLYING LINKS",
+        _ => "PROCESSING",
+    }
 }
 
 fn next_focus(pane: FocusPane) -> FocusPane {
@@ -591,7 +799,9 @@ fn prev_focus(pane: FocusPane) -> FocusPane {
 
 #[cfg(test)]
 mod tests {
-    use super::super::model::{RunReport, WarningSummary};
+    use crate::protocol::WarningSummary;
+
+    use super::super::model::{RunReport, TuiEvent};
     use super::*;
     use crossterm::event::KeyCode;
     use std::fs;
@@ -696,12 +906,64 @@ mod tests {
             kind: JobKind::Scan,
             receiver: rx,
         });
-        tx.send(Ok(sample_report())).expect("send result");
+        tx.send(Ok(TuiEvent::Done {
+            report: sample_report(),
+        }))
+        .expect("send result");
 
         app.poll_running_job();
         assert!(app.running_job.is_none());
         assert_eq!(app.files_considered(), 2);
         assert!(app.logs.iter().any(|line| line.contains("Scan finished")));
+    }
+
+    #[test]
+    fn poll_running_job_updates_live_progress_state() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+
+        let (tx, rx) = mpsc::channel();
+        app.running_job = Some(RunningJob {
+            kind: JobKind::Scan,
+            receiver: rx,
+        });
+        app.job_started_at = Some(Instant::now());
+
+        tx.send(Ok(TuiEvent::Phase {
+            phase: "hashing".to_string(),
+        }))
+        .expect("send phase");
+        tx.send(Ok(TuiEvent::File {
+            phase: Some("hashing".to_string()),
+            path: "/downloads/movie.mkv".to_string(),
+        }))
+        .expect("send file");
+        tx.send(Ok(TuiEvent::Count {
+            files_seen: Some(42),
+            groups_found: Some(3),
+            planned_actions: Some(2),
+            applied_actions: Some(0),
+        }))
+        .expect("send count");
+
+        app.poll_running_job();
+
+        assert_eq!(app.files_considered(), 42);
+        assert_eq!(app.planned_actions(), 2);
+        assert_eq!(app.current_path(), Some("/downloads/movie.mkv"));
+        assert_eq!(app.activity_phase(), "HASHING DUPLICATES");
+    }
+
+    #[test]
+    fn path_toggle_switches_to_expanded_mode() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+
+        app.handle_main_key(KeyCode::Char('p'))
+            .expect("key handling should not fail");
+
+        assert!(app.expand_paths());
+        assert!(app.logs.iter().any(|line| line == "Path display expanded."));
     }
 
     #[test]

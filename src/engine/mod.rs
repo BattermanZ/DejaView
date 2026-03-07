@@ -12,6 +12,7 @@ mod types;
 
 pub use types::ScanRunOptions;
 
+use crate::protocol::TuiEvent;
 use cache::{load_cache, save_cache};
 use collect::{collect_run_files, group_files_by_size};
 use hashing::hash_groups_and_update_cache;
@@ -34,6 +35,10 @@ pub fn clear_cache(config: &Config) -> Result<()> {
 }
 
 pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
+    if options.json_output && options.tui_events {
+        return Err(anyhow!("--json cannot be combined with --tui-events"));
+    }
+
     let downloads = config
         .downloads
         .as_ref()
@@ -43,19 +48,43 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         .as_ref()
         .ok_or_else(|| anyhow!("Media path not set"))?;
     let min_age = std::time::Duration::from_secs(config.min_age.unwrap_or(300));
+    let machine_output = options.json_output || options.tui_events;
 
     let mut warnings = RunWarnings::default();
     let mut metrics = RunMetrics::default();
+    if options.tui_events {
+        let _ = types::emit_tui_event(&TuiEvent::Phase {
+            phase: "collecting".to_string(),
+        });
+        let _ = types::emit_tui_event(&TuiEvent::Log {
+            message: "Collecting candidate files".to_string(),
+        });
+    }
     let files = collect_run_files(
         downloads,
         media,
         min_age,
         options.strict,
         options.show_progress,
+        options.tui_events,
         &mut warnings,
         &mut metrics,
     )?;
     let files_seen = files.len();
+    if options.tui_events {
+        let _ = types::emit_tui_event(&TuiEvent::Count {
+            files_seen: Some(files_seen),
+            groups_found: None,
+            planned_actions: None,
+            applied_actions: None,
+        });
+        let _ = types::emit_tui_event(&TuiEvent::Phase {
+            phase: "hashing".to_string(),
+        });
+        let _ = types::emit_tui_event(&TuiEvent::Log {
+            message: "Hashing duplicate candidates".to_string(),
+        });
+    }
 
     let cache_path = cache_path(config)?;
     let cache = Arc::new(Mutex::new(load_cache(&cache_path)));
@@ -68,6 +97,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         &inode_hash,
         options.strict,
         options.show_progress,
+        options.tui_events,
         &mut warnings,
     )?;
 
@@ -77,8 +107,22 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
 
     let (table, actions, total_saved_space) = plan_actions_and_table(&groups);
     let planned_actions = actions.len();
+    if options.tui_events {
+        let _ = types::emit_tui_event(&TuiEvent::Phase {
+            phase: "planning".to_string(),
+        });
+        let _ = types::emit_tui_event(&TuiEvent::Count {
+            files_seen: Some(files_seen),
+            groups_found: Some(groups.len()),
+            planned_actions: Some(planned_actions),
+            applied_actions: Some(0),
+        });
+        let _ = types::emit_tui_event(&TuiEvent::Log {
+            message: format!("Planning complete. {planned_actions} action(s) queued."),
+        });
+    }
 
-    if !options.json_output {
+    if !machine_output {
         println!("\n{} Found duplicates:", "▶".cyan());
         println!("{}", table);
         print_space_summary(actions.is_empty(), total_saved_space);
@@ -94,18 +138,27 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
                 "--confirm cannot be combined with --json; automation runs must stay non-interactive"
             ));
         }
+        if options.tui_events {
+            let _ = types::emit_tui_event(&TuiEvent::Phase {
+                phase: "applying".to_string(),
+            });
+            let _ = types::emit_tui_event(&TuiEvent::Log {
+                message: "Applying filesystem changes".to_string(),
+            });
+        }
         maybe_confirm_apply(options.require_confirm, planned_actions)?;
         apply_actions(
             &actions,
             media,
             options.strict,
             options.json_output,
+            options.tui_events,
             &mut warnings,
             &mut report_entries,
         )
     };
 
-    if !options.json_output {
+    if !machine_output {
         print_run_summary(
             files_seen,
             metrics.skipped_by_min_age,
@@ -130,15 +183,25 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
     if let Some(path) = out_path.as_deref() {
         try_write_run_report(path, &report);
     }
+
+    if let Err(err) = maybe_return_strict_errors(strict_link_error, options.strict, &warnings) {
+        if options.tui_events {
+            let _ = types::emit_tui_event(&TuiEvent::Error {
+                message: err.to_string(),
+            });
+        }
+        return Err(err);
+    }
+
     if options.json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if options.tui_events {
+        let _ = types::emit_tui_event(&TuiEvent::Done { report });
     } else if options.dry_run {
         println!("{} Dry-run; no changes.", "ℹ".yellow());
     }
 
-    maybe_return_strict_errors(strict_link_error, options.strict, &warnings)?;
-
-    if !options.json_output {
+    if !machine_output {
         println!("{} Done.", "✔".green());
     }
     Ok(())

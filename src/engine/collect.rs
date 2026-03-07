@@ -7,7 +7,9 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 use walkdir::{DirEntry, WalkDir};
 
+use super::types::emit_tui_event;
 use super::types::{FileInfo, RunMetrics, RunWarnings};
+use crate::protocol::TuiEvent;
 
 fn is_regular(entry: &DirEntry) -> bool {
     entry.file_type().is_file() && !entry.path_is_symlink()
@@ -18,6 +20,7 @@ pub(super) fn collect_files(
     in_downloads: bool,
     min_age: Duration,
     strict: bool,
+    tui_events: bool,
     warnings: &mut RunWarnings,
     metrics: &mut RunMetrics,
 ) -> Result<Vec<FileInfo>> {
@@ -69,6 +72,27 @@ pub(super) fn collect_files(
             hash: None,
             in_downloads,
         });
+
+        if tui_events {
+            let path = files
+                .last()
+                .expect("just pushed file")
+                .path
+                .display()
+                .to_string();
+            let _ = emit_tui_event(&TuiEvent::File {
+                phase: Some("collecting".to_string()),
+                path,
+            });
+            if files.len() == 1 || files.len() % 25 == 0 {
+                let _ = emit_tui_event(&TuiEvent::Count {
+                    files_seen: Some(files.len()),
+                    groups_found: None,
+                    planned_actions: None,
+                    applied_actions: None,
+                });
+            }
+        }
     }
     Ok(files)
 }
@@ -79,6 +103,7 @@ pub(super) fn collect_run_files(
     min_age: Duration,
     strict: bool,
     show_progress: bool,
+    tui_events: bool,
     warnings: &mut RunWarnings,
     metrics: &mut RunMetrics,
 ) -> Result<Vec<FileInfo>> {
@@ -98,12 +123,15 @@ pub(super) fn collect_run_files(
     };
 
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
-    let mut files = collect_files(downloads, true, min_age, strict, warnings, metrics)?;
+    let mut files = collect_files(
+        downloads, true, min_age, strict, tui_events, warnings, metrics,
+    )?;
     for f in &files {
         seen.insert((f.dev, f.inode));
     }
 
-    let mut media_files = collect_files(media, false, min_age, strict, warnings, metrics)?;
+    let mut media_files =
+        collect_files(media, false, min_age, strict, tui_events, warnings, metrics)?;
     media_files.retain(|f| !seen.contains(&(f.dev, f.inode)));
     files.extend(media_files);
 
