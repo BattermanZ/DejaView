@@ -167,6 +167,41 @@ impl App {
             .unwrap_or(0)
     }
 
+    pub fn saved_bytes(&self) -> u64 {
+        self.report
+            .as_ref()
+            .map(|report| {
+                if report.mode != "link" {
+                    return 0;
+                }
+                report
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.status.eq_ignore_ascii_case("applied"))
+                    .map(|entry| entry.size)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn potential_saved_bytes(&self) -> u64 {
+        self.report
+            .as_ref()
+            .map(|report| {
+                if report.mode == "link" {
+                    report
+                        .entries
+                        .iter()
+                        .filter(|entry| !entry.status.eq_ignore_ascii_case("applied"))
+                        .map(|entry| entry.size)
+                        .sum()
+                } else {
+                    report.total_saved_bytes
+                }
+            })
+            .unwrap_or(0)
+    }
+
     pub fn selected_row(&self) -> usize {
         self.selected_row
     }
@@ -879,6 +914,10 @@ impl App {
             receiver: rx,
         });
     }
+
+    pub(crate) fn set_report_for_test(&mut self, report: RunReport) {
+        self.report = Some(report);
+    }
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -941,6 +980,55 @@ mod tests {
             },
             entries: vec![],
         }
+    }
+
+    #[test]
+    fn savings_split_is_truthful_for_scan_and_link_reports() {
+        let mut app = App::new(&Config::default(), false);
+        app.report = Some(sample_report());
+        assert_eq!(app.saved_bytes(), 0);
+        assert_eq!(app.potential_saved_bytes(), 1024);
+
+        app.report = Some(RunReport {
+            mode: "link".to_string(),
+            dry_run: false,
+            strict: false,
+            files_considered: 2,
+            planned_actions: 2,
+            applied_actions: 1,
+            total_saved_bytes: 30,
+            skipped_by_min_age: 0,
+            warnings: WarningSummary {
+                walk_errors: 0,
+                metadata_errors: 0,
+                sample_hash_errors: 0,
+                full_hash_errors: 0,
+                link_errors: 0,
+            },
+            entries: vec![
+                LinkReportEntry {
+                    source: "a".to_string(),
+                    target: "b".to_string(),
+                    size: 10,
+                    status: "applied".to_string(),
+                    method: Some("hardlink".to_string()),
+                    fallback_reason: None,
+                    error: None,
+                },
+                LinkReportEntry {
+                    source: "c".to_string(),
+                    target: "d".to_string(),
+                    size: 20,
+                    status: "failed".to_string(),
+                    method: None,
+                    fallback_reason: None,
+                    error: Some("boom".to_string()),
+                },
+            ],
+        });
+
+        assert_eq!(app.saved_bytes(), 10);
+        assert_eq!(app.potential_saved_bytes(), 20);
     }
 
     #[test]

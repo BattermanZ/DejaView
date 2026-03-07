@@ -130,6 +130,7 @@ pub(super) fn build_report_entries(actions: &[LinkAction]) -> Vec<LinkReportEntr
         .map(|action| LinkReportEntry {
             source: action.src.display().to_string(),
             target: action.tgt.display().to_string(),
+            size: action.size,
             status: "planned".to_string(),
             method: None,
             fallback_reason: None,

@@ -467,47 +467,21 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-    let brand_width = area.width.saturating_sub(38).clamp(28, 60);
+    let brand_width = area.width.saturating_sub(52).clamp(28, 60);
     let split = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(brand_width), Constraint::Min(38)])
+        .constraints([Constraint::Length(brand_width), Constraint::Min(52)])
         .split(area);
 
-    let brand = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(3)])
-        .split(split[0]);
-
     let brand_block = Block::default()
-        .borders(Borders::RIGHT | Borders::BOTTOM)
-        .border_style(Theme::line())
-        .style(Theme::canvas());
-    let brand_inner = brand_block.inner(brand[0]);
-    frame.render_widget(brand_block, brand[0]);
-    frame.render_widget(
-        Paragraph::new(wordmark_lines(brand_inner.width)).style(Theme::canvas()),
-        brand_inner,
-    );
-
-    let (chip_label, chip_style) = mode_chip(app);
-    let status_block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(Theme::line())
         .style(Theme::canvas());
-    let status_inner = status_block.inner(brand[1]);
-    frame.render_widget(status_block, brand[1]);
+    let brand_inner = brand_block.inner(split[0]);
+    frame.render_widget(brand_block, split[0]);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(format!(" {chip_label} "), chip_style)),
-            Line::from(Span::styled(app.activity_phase(), Theme::accent_soft())),
-            Line::from(Span::styled(
-                trim_to_width(&app.last_log_line(), status_inner.width),
-                Theme::dim(),
-            )),
-        ])
-        .style(Theme::canvas())
-        .wrap(Wrap { trim: true }),
-        status_inner,
+        Paragraph::new(wordmark_lines(brand_inner.width)).style(Theme::canvas()),
+        brand_inner,
     );
 
     let right = Layout::default()
@@ -518,10 +492,11 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let metrics = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(22),
-            Constraint::Percentage(18),
-            Constraint::Percentage(18),
-            Constraint::Percentage(42),
+            Constraint::Percentage(16),
+            Constraint::Percentage(14),
+            Constraint::Percentage(14),
+            Constraint::Percentage(28),
+            Constraint::Percentage(28),
         ])
         .split(right[0]);
 
@@ -538,8 +513,12 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         metrics[2],
     );
     frame.render_widget(
-        metric_card("SAVED", format_bytes(app.total_saved_bytes())),
+        metric_card("SAVED", format_bytes(app.saved_bytes())),
         metrics[3],
+    );
+    frame.render_widget(
+        metric_card("TO SAVE", format_bytes(app.potential_saved_bytes())),
+        metrics[4],
     );
 
     let activity = Paragraph::new(header_activity_lines(app, right[1].width))
@@ -838,6 +817,7 @@ mod tests {
         let row = LinkReportEntry {
             source: "a".to_string(),
             target: "b".to_string(),
+            size: 42,
             status: "applied".to_string(),
             method: Some("symlink".to_string()),
             fallback_reason: Some("cross-device".to_string()),
@@ -852,6 +832,7 @@ mod tests {
         let row = LinkReportEntry {
             source: "a".to_string(),
             target: "b".to_string(),
+            size: 42,
             status: "applied".to_string(),
             method: Some("hardlink".to_string()),
             fallback_reason: None,
@@ -943,6 +924,51 @@ mod tests {
         assert!(combined.contains("VERIFYING DUPLICATES"));
         assert!(combined.contains("10 / 12 duplicate files verified"));
         assert!(!combined.contains("Verifying duplicate files: 10 / 12"));
+    }
+
+    #[test]
+    fn metric_split_distinguishes_saved_from_to_save() {
+        let mut app = App::new(&crate::config::Config::default(), false);
+        app.set_report_for_test(crate::protocol::RunReport {
+            mode: "link".to_string(),
+            dry_run: false,
+            strict: false,
+            files_considered: 2,
+            planned_actions: 2,
+            applied_actions: 1,
+            total_saved_bytes: 30,
+            skipped_by_min_age: 0,
+            warnings: crate::protocol::WarningSummary {
+                walk_errors: 0,
+                metadata_errors: 0,
+                sample_hash_errors: 0,
+                full_hash_errors: 0,
+                link_errors: 0,
+            },
+            entries: vec![
+                LinkReportEntry {
+                    source: "a".to_string(),
+                    target: "b".to_string(),
+                    size: 10,
+                    status: "applied".to_string(),
+                    method: Some("hardlink".to_string()),
+                    fallback_reason: None,
+                    error: None,
+                },
+                LinkReportEntry {
+                    source: "c".to_string(),
+                    target: "d".to_string(),
+                    size: 20,
+                    status: "planned".to_string(),
+                    method: None,
+                    fallback_reason: None,
+                    error: None,
+                },
+            ],
+        });
+
+        assert_eq!(format_bytes(app.saved_bytes()), "10.00 B");
+        assert_eq!(format_bytes(app.potential_saved_bytes()), "20.00 B");
     }
 
     #[test]

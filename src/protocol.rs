@@ -13,6 +13,8 @@ pub struct WarningSummary {
 pub struct LinkReportEntry {
     pub source: String,
     pub target: String,
+    #[serde(default)]
+    pub size: u64,
     pub status: String,
     pub method: Option<String>,
     pub fallback_reason: Option<String>,
