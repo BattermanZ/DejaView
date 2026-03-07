@@ -3,6 +3,7 @@ mod app;
 mod events;
 mod layout;
 mod model;
+mod preview;
 mod theme;
 mod view;
 
@@ -66,6 +67,25 @@ pub fn run(config: &Config, strict: bool) -> Result<()> {
             }
         }
     })();
+
+    terminal.show_cursor()?;
+    guard.restore()?;
+
+    run_result
+}
+
+pub fn run_logo_preview() -> Result<()> {
+    let mut guard = TerminalGuard::default();
+    enable_raw_mode()?;
+    guard.raw_enabled = true;
+
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    guard.alt_enabled = true;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let run_result = preview::run(&mut terminal);
 
     terminal.show_cursor()?;
     guard.restore()?;

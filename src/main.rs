@@ -50,6 +50,8 @@ enum Commands {
         #[arg(long)]
         strict: bool,
     },
+    /// Preview alternative terminal logo directions
+    TuiLogoPreview,
 }
 
 #[derive(Parser, Debug)]
@@ -222,6 +224,9 @@ fn main() -> Result<()> {
         },
         Commands::Tui { strict } => {
             tui::run(&config, strict)?;
+        }
+        Commands::TuiLogoPreview => {
+            tui::run_logo_preview()?;
         }
     }
 
@@ -433,6 +438,16 @@ mod tests {
         match cli.command {
             Commands::Tui { strict } => assert!(strict),
             _ => panic!("expected tui command"),
+        }
+    }
+
+    #[test]
+    fn parses_tui_logo_preview_command() {
+        let cli =
+            Cli::try_parse_from(["dejaview", "tui-logo-preview"]).expect("parse logo preview");
+        match cli.command {
+            Commands::TuiLogoPreview => {}
+            _ => panic!("expected logo preview command"),
         }
     }
 }

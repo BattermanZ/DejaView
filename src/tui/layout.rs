@@ -13,7 +13,7 @@ pub fn dashboard(area: Rect) -> DashboardLayout {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9),
+            Constraint::Length(10),
             Constraint::Min(10),
             Constraint::Length(6),
             Constraint::Length(2),

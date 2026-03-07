@@ -362,6 +362,96 @@ fn footer_line() -> Line<'static> {
     ])
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum WordmarkVariant {
+    Large,
+    Compact,
+    Minimal,
+}
+
+fn wordmark_variant(width: u16) -> WordmarkVariant {
+    if width >= 40 {
+        WordmarkVariant::Large
+    } else if width >= 24 {
+        WordmarkVariant::Compact
+    } else {
+        WordmarkVariant::Minimal
+    }
+}
+
+fn large_wordmark_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled(
+                " ____  ____  _  _   __   _  _  _  ____  _    _ ",
+                Theme::wordmark(),
+            ),
+            Span::styled(
+                "  ____  ____  _  _   __   _  _  _ ",
+                Theme::wordmark_shadow(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "|  _ \\| ___|| || | / _\\ | || || ||  _ \\| |  | |",
+                Theme::wordmark(),
+            ),
+            Span::styled(" |  _ \\| ___|| || | / _\\ ", Theme::wordmark_shadow()),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "| | | | _|  | || |/ /_\\ \\| || || || | | | |  | |",
+                Theme::wordmark_highlight(),
+            ),
+            Span::styled(" | | | | _|  | || |/ /_\\ \\", Theme::wordmark_shadow()),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "| |_| | |___| || /  _  \\ \\ V  V /| |_| | |__| |",
+                Theme::wordmark(),
+            ),
+            Span::styled(" | |_| | |___| || /  _  \\", Theme::wordmark_shadow()),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "|____/|_____||_||_| |_|  \\_/\\_/ |____/ \\____/ ",
+                Theme::wordmark(),
+            ),
+            Span::styled(" |____/|_____||_||_| |_| ", Theme::wordmark_shadow()),
+        ]),
+    ]
+}
+
+fn compact_wordmark_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled("DEJAVIEW", Theme::wordmark()),
+            Span::raw(" "),
+            Span::styled("DEJAVIEW", Theme::wordmark_shadow()),
+        ]),
+        Line::from(vec![
+            Span::styled("duplicate workspace", Theme::subtitle()),
+            Span::raw(" "),
+            Span::styled("media utility", Theme::wordmark_shadow()),
+        ]),
+    ]
+}
+
+fn minimal_wordmark_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled("DEJAVIEW", Theme::wordmark())),
+        Line::from(Span::styled("media duplicate workspace", Theme::subtitle())),
+    ]
+}
+
+fn wordmark_lines(width: u16) -> Vec<Line<'static>> {
+    match wordmark_variant(width) {
+        WordmarkVariant::Large => large_wordmark_lines(),
+        WordmarkVariant::Compact => compact_wordmark_lines(),
+        WordmarkVariant::Minimal => minimal_wordmark_lines(),
+    }
+}
+
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Theme::canvas()), area);
@@ -412,14 +502,15 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+    let brand_width = area.width.saturating_sub(40).clamp(24, 46);
     let split = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(30), Constraint::Min(40)])
+        .constraints([Constraint::Length(brand_width), Constraint::Min(40)])
         .split(area);
 
     let brand = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(4)])
+        .constraints([Constraint::Length(6), Constraint::Min(3)])
         .split(split[0]);
 
     let brand_block = Block::default()
@@ -429,11 +520,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let brand_inner = brand_block.inner(brand[0]);
     frame.render_widget(brand_block, brand[0]);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled("DEJAVIEW", Theme::wordmark())),
-            Line::from(Span::styled("media duplicate workspace", Theme::subtitle())),
-        ])
-        .style(Theme::canvas()),
+        Paragraph::new(wordmark_lines(brand_inner.width)).style(Theme::canvas()),
         brand_inner,
     );
 
@@ -460,7 +547,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(4)])
+        .constraints([Constraint::Length(4), Constraint::Min(5)])
         .split(split[1]);
 
     let metrics = Layout::default()
@@ -873,6 +960,41 @@ mod tests {
         assert!(combined.contains("worker 2"));
         assert!(combined.contains("worker 4"));
         assert!(combined.contains("alpha.mkv"));
+    }
+
+    #[test]
+    fn wordmark_uses_large_variant_for_wide_headers() {
+        let combined = wordmark_lines(44)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(matches!(wordmark_variant(44), WordmarkVariant::Large));
+        assert!(combined.contains("____"));
+    }
+
+    #[test]
+    fn wordmark_uses_compact_variant_for_medium_headers() {
+        let combined = wordmark_lines(28)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(matches!(wordmark_variant(28), WordmarkVariant::Compact));
+        assert!(combined.contains("DEJAVIEW"));
+        assert!(combined.contains("duplicate workspace"));
+    }
+
+    #[test]
+    fn wordmark_uses_minimal_variant_for_narrow_headers() {
+        let combined = wordmark_lines(18)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(matches!(wordmark_variant(18), WordmarkVariant::Minimal));
+        assert!(combined.contains("DEJAVIEW"));
+        assert!(combined.contains("media duplicate workspace"));
     }
 
     #[test]
