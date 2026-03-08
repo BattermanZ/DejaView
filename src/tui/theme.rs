@@ -146,10 +146,17 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
-    pub fn chip_warning() -> Style {
+    pub fn chip_success_alt() -> Style {
         Style::default()
             .fg(Self::CRUST)
-            .bg(Self::YELLOW)
+            .bg(Self::SKY)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn chip_pending() -> Style {
+        Style::default()
+            .fg(Self::CRUST)
+            .bg(Self::LAVENDER)
             .add_modifier(Modifier::BOLD)
     }
 

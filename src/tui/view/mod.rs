@@ -48,13 +48,15 @@ fn status_chip_style(row: &LinkReportEntry, _is_selected: bool) -> Style {
     if row.status.eq_ignore_ascii_case("failed") {
         return Theme::chip_danger();
     }
+    if row.status.eq_ignore_ascii_case("planned") {
+        return Theme::chip_pending();
+    }
     if row
         .method
         .as_deref()
         .is_some_and(|method| method.eq_ignore_ascii_case("symlink"))
-        || row.fallback_reason.is_some()
     {
-        return Theme::chip_warning();
+        return Theme::chip_success_alt();
     }
     Theme::chip_success()
 }
@@ -67,16 +69,22 @@ fn row_style(row: &LinkReportEntry, is_selected: bool) -> Style {
             Theme::danger()
         };
     }
+    if row.status.eq_ignore_ascii_case("planned") {
+        return if is_selected {
+            Theme::result_row_selected().fg(Theme::muted().fg.unwrap_or(Color::Reset))
+        } else {
+            Theme::muted()
+        };
+    }
     if row
         .method
         .as_deref()
         .is_some_and(|method| method.eq_ignore_ascii_case("symlink"))
-        || row.fallback_reason.is_some()
     {
         return if is_selected {
-            Theme::result_row_selected().fg(Theme::warning().fg.unwrap_or(Color::Reset))
+            Theme::result_row_selected().fg(Theme::accent_soft().fg.unwrap_or(Color::Reset))
         } else {
-            Theme::warning()
+            Theme::accent_soft()
         };
     }
     if is_selected {
@@ -861,7 +869,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn symlink_rows_use_warning_chip() {
+    fn symlink_rows_use_success_alt_chip() {
         let row = LinkReportEntry {
             source: "a".to_string(),
             target: "b".to_string(),
@@ -872,7 +880,7 @@ mod tests {
             error: None,
         };
 
-        assert_eq!(status_chip_style(&row, false), Theme::chip_warning());
+        assert_eq!(status_chip_style(&row, false), Theme::chip_success_alt());
     }
 
     #[test]
@@ -888,7 +896,22 @@ mod tests {
         };
 
         assert_eq!(outcome_label(&row), "TRY HARDLINK");
-        assert_eq!(status_chip_style(&row, false), Theme::chip_warning());
+        assert_eq!(status_chip_style(&row, false), Theme::chip_pending());
+    }
+
+    #[test]
+    fn planned_rows_use_pending_text_style() {
+        let row = LinkReportEntry {
+            source: "a".to_string(),
+            target: "b".to_string(),
+            size: 42,
+            status: "planned".to_string(),
+            method: Some("try-hardlink".to_string()),
+            fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
+            error: None,
+        };
+
+        assert_eq!(row_style(&row, false), Theme::muted());
     }
 
     #[test]
