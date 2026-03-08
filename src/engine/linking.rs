@@ -208,11 +208,22 @@ where
         Ok(())
     })();
 
-    if link_result.is_err() {
-        let _ = fs::remove_file(&tmp_link);
+    if let Err(err) = link_result {
+        let cleanup_note = match fs::remove_file(&tmp_link) {
+            Ok(()) => format!("temp hardlink path cleaned up: {}", tmp_link.display()),
+            Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => {
+                format!("temp hardlink path not created: {}", tmp_link.display())
+            }
+            Err(remove_err) => format!(
+                "failed to remove temp hardlink path {}: {}",
+                tmp_link.display(),
+                remove_err
+            ),
+        };
+        return Err(anyhow!("{err}; {cleanup_note}"));
     }
 
-    link_result
+    Ok(())
 }
 
 pub(super) fn replace_file_with_best_link_with<F>(
@@ -262,7 +273,9 @@ where
                         err
                     ),
                 );
-                Some(format!("hardlink failed: {err}"))
+                Some(format!(
+                    "hardlink failed; symlink applied successfully; {err}"
+                ))
             }
         }
     } else {
