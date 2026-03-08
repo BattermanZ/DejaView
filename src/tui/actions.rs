@@ -18,6 +18,7 @@ fn should_forward_terminal_error(status_success: bool, saw_error_event: bool) ->
 fn stream_subcommand_events(
     subcommand: &str,
     strict: bool,
+    extra_args: &[String],
     tx: Sender<Result<TuiEvent>>,
 ) -> Result<()> {
     let exe = std::env::current_exe().context("resolve current executable")?;
@@ -27,6 +28,7 @@ fn stream_subcommand_events(
         .arg("--no-progress")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    cmd.args(extra_args);
     if strict {
         cmd.arg("--strict");
     }
@@ -110,11 +112,20 @@ fn stream_subcommand_events(
 }
 
 pub fn run_scan(strict: bool, tx: Sender<Result<TuiEvent>>) -> Result<()> {
-    stream_subcommand_events("scan", strict, tx)
+    stream_subcommand_events("scan", strict, &[], tx)
 }
 
 pub fn run_link(strict: bool, tx: Sender<Result<TuiEvent>>) -> Result<()> {
-    stream_subcommand_events("link", strict, tx)
+    stream_subcommand_events("link", strict, &[], tx)
+}
+
+pub fn run_link_selected(strict: bool, source: &str, tx: Sender<Result<TuiEvent>>) -> Result<()> {
+    stream_subcommand_events(
+        "link",
+        strict,
+        &[String::from("--only-source"), source.to_string()],
+        tx,
+    )
 }
 
 pub fn clear_cache() -> Result<()> {

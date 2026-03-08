@@ -7,6 +7,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -80,6 +81,7 @@ pub(super) fn hash_groups_and_update_cache(
     show_progress: bool,
     tui_events: bool,
     link_mode: LinkMode,
+    only_sources: &[PathBuf],
     warnings: &mut RunWarnings,
 ) -> Result<()> {
     let total_sample_files = groups.iter().map(Vec::len).sum::<usize>();
@@ -256,7 +258,14 @@ pub(super) fn hash_groups_and_update_cache(
                 }
             }
             if tui_events {
-                let entries = build_report_entries(&plan_hashed_group_actions(group), link_mode);
+                let actions = plan_hashed_group_actions(group)
+                    .into_iter()
+                    .filter(|action| {
+                        only_sources.is_empty()
+                            || only_sources.iter().any(|path| path == &action.src)
+                    })
+                    .collect::<Vec<_>>();
+                let entries = build_report_entries(&actions, link_mode);
                 if !entries.is_empty() {
                     let _ = emit_tui_event(&TuiEvent::PlannedEntries { entries });
                 }

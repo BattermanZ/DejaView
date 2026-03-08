@@ -21,8 +21,14 @@ pub enum Overlay {
     Help,
     JsonPreview(String),
     ConfigEditor(ConfigEditor),
-    ConfirmLink,
+    ConfirmLink(ConfirmLinkMode),
     BlockingNotice(String),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ConfirmLinkMode {
+    All,
+    Selected,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -39,10 +45,11 @@ pub struct ConfigEditor {
     pub error: Option<String>,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum JobKind {
     Scan,
-    Link,
+    LinkAll,
+    LinkSelected(String),
 }
 
 struct RunningJob {
@@ -138,7 +145,7 @@ impl App {
         if let Some(job) = &self.running_job {
             return match job.kind {
                 JobKind::Scan => "Scanning",
-                JobKind::Link => "Linking",
+                JobKind::LinkAll | JobKind::LinkSelected(_) => "Linking",
             };
         }
         match &self.report {
@@ -156,13 +163,35 @@ impl App {
 
     pub fn planned_actions(&self) -> usize {
         self.live_planned_actions
-            .or_else(|| self.report.as_ref().map(|r| r.planned_actions))
+            .or_else(|| {
+                self.report.as_ref().map(|r| {
+                    if r.mode == "link" {
+                        r.entries
+                            .iter()
+                            .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
+                            .count()
+                    } else {
+                        r.planned_actions
+                    }
+                })
+            })
             .unwrap_or(0)
     }
 
     pub fn applied_actions(&self) -> usize {
         self.live_applied_actions
-            .or_else(|| self.report.as_ref().map(|r| r.applied_actions))
+            .or_else(|| {
+                self.report.as_ref().map(|r| {
+                    if r.mode == "link" {
+                        r.entries
+                            .iter()
+                            .filter(|entry| entry.status.eq_ignore_ascii_case("applied"))
+                            .count()
+                    } else {
+                        r.applied_actions
+                    }
+                })
+            })
             .unwrap_or(0)
     }
 
@@ -272,7 +301,8 @@ impl App {
         if let Some(job) = &self.running_job {
             return match job.kind {
                 JobKind::Scan => "SCANNING LIBRARY",
-                JobKind::Link => "LINKING DUPLICATES",
+                JobKind::LinkAll => "LINKING DUPLICATES",
+                JobKind::LinkSelected(_) => "LINKING SELECTED DUPLICATE",
             };
         }
         match &self.report {
@@ -379,7 +409,7 @@ impl App {
             return Ok(());
         }
 
-        match &self.overlay {
+        match self.overlay.clone() {
             Overlay::Help => match code {
                 KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
                     self.overlay = Overlay::None
@@ -393,10 +423,17 @@ impl App {
                 _ => {}
             },
             Overlay::ConfigEditor(_) => self.handle_config_editor_key(code)?,
-            Overlay::ConfirmLink => match code {
+            Overlay::ConfirmLink(mode) => match code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.overlay = Overlay::None;
-                    self.start_link_job();
+                    match mode {
+                        ConfirmLinkMode::All => self.start_link_job(),
+                        ConfirmLinkMode::Selected => {
+                            if let Err(err) = self.start_selected_link_job() {
+                                self.push_log(format!("Selected link failed: {err}"));
+                            }
+                        }
+                    }
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
                     self.overlay = Overlay::None;
@@ -427,9 +464,18 @@ impl App {
                     self.push_log(format!("Rescan failed: {err}"));
                 }
             }
-            KeyCode::Char('L') => self.overlay = Overlay::ConfirmLink,
+            KeyCode::Char('L') => self.overlay = Overlay::ConfirmLink(ConfirmLinkMode::All),
             KeyCode::Char('l') => {
-                self.push_log("Per-group link intent is not implemented yet. Use uppercase L to confirm a full link run.".to_string());
+                if self
+                    .selected_entry()
+                    .is_some_and(|entry| entry.status.eq_ignore_ascii_case("planned"))
+                {
+                    self.overlay = Overlay::ConfirmLink(ConfirmLinkMode::Selected);
+                } else {
+                    self.push_log(
+                        "Select a planned row before running a single-item link.".to_string(),
+                    );
+                }
             }
             KeyCode::Char('R') | KeyCode::Char('r') => {
                 if let Err(err) = self.save_report() {
@@ -530,9 +576,50 @@ impl App {
         self.current_phase = Some("planning".to_string());
         self.latest_activity_message = Some("Preparing link run".to_string());
         self.running_job = Some(RunningJob {
-            kind: JobKind::Link,
+            kind: JobKind::LinkAll,
             receiver: rx,
         });
+    }
+
+    fn start_selected_link_job(&mut self) -> Result<()> {
+        if self.running_job.is_some() {
+            self.push_log("A run is already in progress.".to_string());
+            return Ok(());
+        }
+
+        let Some(source) = self
+            .selected_entry()
+            .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
+            .map(|entry| entry.source.clone())
+        else {
+            self.push_log("Select a planned row before running a single-item link.".to_string());
+            return Ok(());
+        };
+
+        self.live_entries.clear();
+        self.live_planned_actions = None;
+        self.live_applied_actions = None;
+        self.current_phase = Some("planning".to_string());
+        self.latest_activity_message = Some("Preparing selected link".to_string());
+        self.current_path = Some(source.clone());
+        self.hash_progress_done = None;
+        self.hash_progress_total = None;
+        self.active_workers.clear();
+        self.job_started_at = Some(Instant::now());
+        self.last_run_duration = None;
+        self.push_log(format!("Running selected link for {source}"));
+
+        let strict = self.strict;
+        let source_for_job = source.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = actions::run_link_selected(strict, &source_for_job, tx);
+        });
+        self.running_job = Some(RunningJob {
+            kind: JobKind::LinkSelected(source),
+            receiver: rx,
+        });
+        Ok(())
     }
 
     fn toggle_path_mode(&mut self) {
@@ -688,10 +775,10 @@ impl App {
         if let Some(job) = self.running_job.as_mut() {
             loop {
                 match job.receiver.try_recv() {
-                    Ok(event) => events.push((job.kind, event)),
+                    Ok(event) => events.push((job.kind.clone(), event)),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        disconnected_kind = Some(job.kind);
+                        disconnected_kind = Some(job.kind.clone());
                         break;
                     }
                 }
@@ -729,7 +816,7 @@ impl App {
         self.finish_live_run();
         let label = match kind {
             JobKind::Scan => "Scan",
-            JobKind::Link => "Link",
+            JobKind::LinkAll | JobKind::LinkSelected(_) => "Link",
         };
         self.push_log(format!("{label} failed: {message}"));
     }
@@ -850,7 +937,7 @@ impl App {
                 self.finish_live_run();
                 let label = match kind {
                     JobKind::Scan => "Scan",
-                    JobKind::Link => "Link",
+                    JobKind::LinkAll | JobKind::LinkSelected(_) => "Link",
                 };
                 self.push_log(format!("{label} failed: {message}"));
                 true
@@ -860,14 +947,11 @@ impl App {
                 let applied = report.applied_actions;
                 let link_failures = report.warnings.link_errors;
                 self.selected_row = 0;
-                self.live_files_seen = Some(report.files_considered);
-                self.live_planned_actions = Some(report.planned_actions);
-                self.live_applied_actions = Some(report.applied_actions);
                 self.current_path = None;
                 self.active_workers.clear();
                 self.hash_progress_done = None;
                 self.hash_progress_total = None;
-                self.report = Some(report);
+                self.merge_report(kind.clone(), report);
                 self.live_entries.clear();
                 self.running_job = None;
                 self.finish_live_run();
@@ -875,11 +959,15 @@ impl App {
                     JobKind::Scan => {
                         self.push_log(format!("Scan finished. Planned actions: {planned}"))
                     }
-                    JobKind::Link => {
+                    JobKind::LinkAll => {
                         self.push_log(format!("Link finished. Applied actions: {applied}"))
                     }
+                    JobKind::LinkSelected(_) => self.push_log(format!(
+                        "Selected link finished. Applied actions: {applied}"
+                    )),
                 }
-                if kind == JobKind::Link && link_failures > 0 {
+                if matches!(kind, JobKind::LinkAll | JobKind::LinkSelected(_)) && link_failures > 0
+                {
                     self.push_log(format!(
                         "Link run had {link_failures} failure(s). Review failed rows for details."
                     ));
@@ -947,6 +1035,60 @@ impl App {
         self.current_phase = None;
         self.current_path = None;
         self.active_workers.clear();
+    }
+
+    fn merge_report(&mut self, kind: JobKind, report: RunReport) {
+        match kind {
+            JobKind::LinkSelected(_) => {
+                if let Some(existing) = &mut self.report {
+                    for entry in &report.entries {
+                        if let Some(current) = existing.entries.iter_mut().find(|current| {
+                            current.source == entry.source && current.target == entry.target
+                        }) {
+                            *current = entry.clone();
+                        } else {
+                            existing.entries.push(entry.clone());
+                        }
+                    }
+                    existing.mode = "link".to_string();
+                    existing.dry_run = false;
+                    existing.strict = report.strict;
+                    existing.files_considered =
+                        report.files_considered.max(existing.files_considered);
+                    existing.applied_actions = existing
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.status.eq_ignore_ascii_case("applied"))
+                        .count();
+                    existing.planned_actions = existing
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
+                        .count();
+                    existing.total_saved_bytes =
+                        existing.entries.iter().map(|entry| entry.size).sum();
+                    existing.warnings.link_errors = existing
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.status.eq_ignore_ascii_case("failed"))
+                        .count() as u64;
+                    self.live_files_seen = Some(existing.files_considered);
+                    self.live_planned_actions = Some(existing.planned_actions);
+                    self.live_applied_actions = Some(existing.applied_actions);
+                } else {
+                    self.live_files_seen = Some(report.files_considered);
+                    self.live_planned_actions = Some(report.planned_actions);
+                    self.live_applied_actions = Some(report.applied_actions);
+                    self.report = Some(report);
+                }
+            }
+            JobKind::Scan | JobKind::LinkAll => {
+                self.live_files_seen = Some(report.files_considered);
+                self.live_planned_actions = Some(report.planned_actions);
+                self.live_applied_actions = Some(report.applied_actions);
+                self.report = Some(report);
+            }
+        }
     }
 }
 
@@ -1161,7 +1303,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         app.running_job = Some(RunningJob {
-            kind: JobKind::Link,
+            kind: JobKind::LinkAll,
             receiver: rx,
         });
         let mut report = sample_report();
@@ -1267,7 +1409,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         app.running_job = Some(RunningJob {
-            kind: JobKind::Link,
+            kind: JobKind::LinkAll,
             receiver: rx,
         });
 
@@ -1397,7 +1539,7 @@ mod tests {
 
         let (_tx, rx) = mpsc::channel();
         app.running_job = Some(RunningJob {
-            kind: JobKind::Link,
+            kind: JobKind::LinkAll,
             receiver: rx,
         });
 
@@ -1414,7 +1556,7 @@ mod tests {
     }
 
     #[test]
-    fn lower_l_does_not_start_link_run() {
+    fn lower_l_requires_a_planned_row() {
         let config = Config::default();
         let mut app = App::new(&config, false);
 
@@ -1422,7 +1564,7 @@ mod tests {
             .expect("key handling should not fail");
 
         assert!(app.running_job.is_none());
-        assert!(app.logs.iter().any(|line| line.contains("uppercase L")));
+        assert!(app.logs.iter().any(|line| line.contains("planned row")));
     }
 
     #[test]
@@ -1433,8 +1575,133 @@ mod tests {
         app.handle_main_key(KeyCode::Char('L'))
             .expect("key handling should not fail");
 
-        assert!(matches!(app.overlay, Overlay::ConfirmLink));
+        assert!(matches!(
+            app.overlay,
+            Overlay::ConfirmLink(ConfirmLinkMode::All)
+        ));
         assert!(app.running_job.is_none());
+    }
+
+    #[test]
+    fn lowercase_l_opens_selected_confirmation_overlay() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        let mut report = sample_report();
+        report.entries = vec![LinkReportEntry {
+            source: "/downloads/a.mkv".to_string(),
+            target: "/media/a.mkv".to_string(),
+            size: 10,
+            status: "planned".to_string(),
+            method: Some("try-hardlink".to_string()),
+            fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
+            error: None,
+        }];
+        report.planned_actions = 1;
+        app.report = Some(report);
+
+        app.handle_main_key(KeyCode::Char('l'))
+            .expect("key handling should not fail");
+
+        assert!(matches!(
+            app.overlay,
+            Overlay::ConfirmLink(ConfirmLinkMode::Selected)
+        ));
+        assert!(app.running_job.is_none());
+    }
+
+    #[test]
+    fn selected_link_done_keeps_rows_and_updates_status() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        app.report = Some(RunReport {
+            mode: "scan".to_string(),
+            dry_run: true,
+            strict: false,
+            files_considered: 2,
+            planned_actions: 2,
+            applied_actions: 0,
+            total_saved_bytes: 30,
+            skipped_by_min_age: 0,
+            warnings: WarningSummary {
+                walk_errors: 0,
+                metadata_errors: 0,
+                sample_hash_errors: 0,
+                full_hash_errors: 0,
+                link_errors: 0,
+            },
+            entries: vec![
+                LinkReportEntry {
+                    source: "/downloads/a.mkv".to_string(),
+                    target: "/media/a.mkv".to_string(),
+                    size: 10,
+                    status: "planned".to_string(),
+                    method: Some("try-hardlink".to_string()),
+                    fallback_reason: Some(
+                        "tries hardlink first; may fall back to symlink".to_string(),
+                    ),
+                    error: None,
+                },
+                LinkReportEntry {
+                    source: "/downloads/b.mkv".to_string(),
+                    target: "/media/b.mkv".to_string(),
+                    size: 20,
+                    status: "planned".to_string(),
+                    method: Some("try-hardlink".to_string()),
+                    fallback_reason: Some(
+                        "tries hardlink first; may fall back to symlink".to_string(),
+                    ),
+                    error: None,
+                },
+            ],
+        });
+
+        let (tx, rx) = mpsc::channel();
+        app.running_job = Some(RunningJob {
+            kind: JobKind::LinkSelected("/downloads/a.mkv".to_string()),
+            receiver: rx,
+        });
+        tx.send(Ok(TuiEvent::Done {
+            report: RunReport {
+                mode: "link".to_string(),
+                dry_run: false,
+                strict: false,
+                files_considered: 2,
+                planned_actions: 1,
+                applied_actions: 1,
+                total_saved_bytes: 10,
+                skipped_by_min_age: 0,
+                warnings: WarningSummary {
+                    walk_errors: 0,
+                    metadata_errors: 0,
+                    sample_hash_errors: 0,
+                    full_hash_errors: 0,
+                    link_errors: 0,
+                },
+                entries: vec![LinkReportEntry {
+                    source: "/downloads/a.mkv".to_string(),
+                    target: "/media/a.mkv".to_string(),
+                    size: 10,
+                    status: "applied".to_string(),
+                    method: Some("hardlink".to_string()),
+                    fallback_reason: None,
+                    error: None,
+                }],
+            },
+        }))
+        .expect("send result");
+
+        app.poll_running_job();
+
+        assert_eq!(app.rows().len(), 2);
+        assert_eq!(app.applied_actions(), 1);
+        assert_eq!(app.planned_actions(), 1);
+        assert_eq!(app.rows()[0].status, "applied");
+        assert_eq!(app.rows()[1].status, "planned");
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line == "Selected link finished. Applied actions: 1")
+        );
     }
 
     #[test]

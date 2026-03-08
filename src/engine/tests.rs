@@ -65,6 +65,7 @@ fn run_scan(config: &Config, dry_run: bool, strict: bool, report_path: Option<&P
             require_confirm: false,
             tui_events: false,
             link_mode: LinkMode::Best,
+            only_sources: &[],
         },
     )
     .expect("run scan");
@@ -841,6 +842,7 @@ fn run_scan_strict_fails_on_sample_hash_error() {
             require_confirm: false,
             tui_events: false,
             link_mode: LinkMode::Best,
+            only_sources: &[],
         },
     );
     assert!(strict_result.is_err());
@@ -855,6 +857,7 @@ fn run_scan_strict_fails_on_sample_hash_error() {
             require_confirm: false,
             tui_events: false,
             link_mode: LinkMode::Best,
+            only_sources: &[],
         },
     );
     assert!(non_strict_result.is_ok());
@@ -896,6 +899,7 @@ fn run_scan_non_strict_link_failure_continues() {
             require_confirm: false,
             tui_events: false,
             link_mode: LinkMode::Best,
+            only_sources: &[],
         },
     );
     assert!(result.is_ok());
@@ -941,6 +945,7 @@ fn run_scan_strict_link_failure_returns_error() {
             require_confirm: false,
             tui_events: false,
             link_mode: LinkMode::Best,
+            only_sources: &[],
         },
     );
     assert!(result.is_err());

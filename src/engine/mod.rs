@@ -126,6 +126,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         options.show_progress,
         options.tui_events,
         options.link_mode,
+        options.only_sources,
         &mut warnings,
     )?;
 
@@ -133,7 +134,16 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         save_cache(&cache_path, &c.into_inner().unwrap())?;
     }
 
-    let (table, actions, total_saved_space) = plan_actions_and_table(&groups);
+    let (table, actions, _total_saved_space) = plan_actions_and_table(&groups);
+    let actions = if options.only_sources.is_empty() {
+        actions
+    } else {
+        actions
+            .into_iter()
+            .filter(|action| options.only_sources.iter().any(|path| path == &action.src))
+            .collect::<Vec<_>>()
+    };
+    let total_saved_space = actions.iter().map(|action| action.size).sum();
     let planned_actions = actions.len();
     logger::info(
         "run",

@@ -3,7 +3,7 @@ use ratatui::prelude::*;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
-use crate::tui::app::{App, ConfigEditor, ConfigField, Overlay};
+use crate::tui::app::{App, ConfigEditor, ConfigField, ConfirmLinkMode, Overlay};
 use crate::tui::layout;
 use crate::tui::model::LinkReportEntry;
 use crate::tui::theme::Theme;
@@ -214,7 +214,8 @@ fn sidebar_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         key_hint("e", "edit paths", true),
         key_hint("S", "scan library", false),
         key_hint("X", "rescan fresh", false),
-        key_hint("L", "link confirmed", false),
+        key_hint("l", "link selected", false),
+        key_hint("L", "link all", false),
         key_hint("R", "save report", false),
         key_hint("J", "json preview", false),
         key_hint("p", "toggle paths", false),
@@ -355,8 +356,11 @@ fn footer_line() -> Line<'static> {
         Span::styled(" S ", Theme::badge()),
         Span::styled("scan", Theme::muted()),
         Span::raw("  "),
+        Span::styled(" l ", Theme::badge()),
+        Span::styled("link one", Theme::muted()),
+        Span::raw("  "),
         Span::styled(" L ", Theme::badge()),
-        Span::styled("link", Theme::muted()),
+        Span::styled("link all", Theme::muted()),
         Span::raw("  "),
         Span::styled(" p ", Theme::badge()),
         Span::styled("paths", Theme::muted()),
@@ -456,7 +460,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Overlay::Help => render_help_overlay(frame),
         Overlay::JsonPreview(json) => render_json_overlay(frame, json),
         Overlay::ConfigEditor(editor) => render_config_overlay(frame, editor),
-        Overlay::ConfirmLink => render_confirm_link_overlay(frame, app),
+        Overlay::ConfirmLink(mode) => render_confirm_link_overlay(frame, app, *mode),
         Overlay::BlockingNotice(message) => render_blocking_notice_overlay(frame, message),
     }
 }
@@ -634,7 +638,7 @@ fn render_help_overlay(frame: &mut Frame) {
     let area = centered_rect(78, 72, frame.area());
     frame.render_widget(Clear, area);
     let help = Paragraph::new(
-        "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\np toggle compact/full paths\nj/k move rows\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nX clear cache and rescan\nL confirm and run link job\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels",
+        "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\np toggle compact/full paths\nj/k move rows\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nX clear cache and rescan\nl confirm and link selected row\nL confirm and run link-all job\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels",
     )
     .block(
         Block::default()
@@ -749,30 +753,46 @@ fn render_config_overlay(frame: &mut Frame, editor: &ConfigEditor) {
     frame.render_widget(tips, sections[3]);
 }
 
-fn render_confirm_link_overlay(frame: &mut Frame, app: &App) {
+fn render_confirm_link_overlay(frame: &mut Frame, app: &App, mode: ConfirmLinkMode) {
     let area = centered_rect(70, 45, frame.area());
     frame.render_widget(Clear, area);
-    let body = Paragraph::new(format!(
-        "Confirm link run\n\nThis will execute filesystem changes for the current configuration.\n\nEstimated planned actions: {}\nCurrent mode: {}\nRows with warnings or errors: {}\n\nPress y to continue or n/q to cancel.",
-        app.planned_actions(),
-        app.mode_label(),
-        app.rows()
-            .iter()
-            .filter(|row| row.error.is_some() || row.fallback_reason.is_some())
-            .count()
-    ))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(Line::from(vec![Span::styled(
-                " LINK CONFIRMATION ",
-                Theme::title(true),
-            )]))
-            .style(Theme::popup())
-            .border_style(Theme::accent()),
-    )
-    .style(Theme::popup())
-    .wrap(Wrap { trim: true });
+    let (title, body) = match mode {
+        ConfirmLinkMode::All => (
+            " LINK ALL CONFIRMATION ",
+            format!(
+                "Confirm link-all run\n\nThis will execute filesystem changes for all currently planned rows.\n\nEstimated planned actions: {}\nCurrent mode: {}\nRows with warnings or errors: {}\n\nPress y to continue or n/q to cancel.",
+                app.planned_actions(),
+                app.mode_label(),
+                app.rows()
+                    .iter()
+                    .filter(|row| row.error.is_some() || row.fallback_reason.is_some())
+                    .count()
+            ),
+        ),
+        ConfirmLinkMode::Selected => (
+            " LINK SELECTED CONFIRMATION ",
+            format!(
+                "Confirm selected-row link\n\nThis will execute filesystem changes only for the selected row.\n\nSelected source: {}\nSelected outcome: {}\nRows still planned: {}\n\nPress y to continue or n/q to cancel.",
+                app.selected_entry()
+                    .map(|entry| entry.source.clone())
+                    .unwrap_or_else(|| "No selection".to_string()),
+                app.selected_entry()
+                    .map(outcome_label)
+                    .unwrap_or_else(|| "N/A".to_string()),
+                app.planned_actions(),
+            ),
+        ),
+    };
+    let body = Paragraph::new(body)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Line::from(vec![Span::styled(title, Theme::title(true))]))
+                .style(Theme::popup())
+                .border_style(Theme::accent()),
+        )
+        .style(Theme::popup())
+        .wrap(Wrap { trim: true });
     frame.render_widget(body, area);
 }
 

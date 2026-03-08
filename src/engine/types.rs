@@ -96,6 +96,7 @@ pub struct ScanRunOptions<'a> {
     pub require_confirm: bool,
     pub tui_events: bool,
     pub link_mode: LinkMode,
+    pub only_sources: &'a [PathBuf],
 }
 
 pub(super) fn emit_tui_event(event: &TuiEvent) -> io::Result<()> {

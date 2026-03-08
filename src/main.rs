@@ -49,6 +49,9 @@ enum Commands {
         /// Force symlink creation and never attempt hardlinks
         #[arg(long)]
         symlink_only: bool,
+        /// Internal filter for linking only specific source paths
+        #[arg(long = "only-source", hide = true)]
+        only_sources: Vec<PathBuf>,
         #[command(flatten)]
         output: RunOutputArgs,
     },
@@ -199,6 +202,7 @@ fn main() -> Result<()> {
                     require_confirm: false,
                     tui_events: output.tui_events,
                     link_mode: effective_link_mode(&config, symlink_only),
+                    only_sources: &[],
                 },
             )?
         }
@@ -206,6 +210,7 @@ fn main() -> Result<()> {
             strict,
             confirm,
             symlink_only,
+            only_sources,
             output,
         } => {
             ensure_required_paths(&config)?;
@@ -225,6 +230,7 @@ fn main() -> Result<()> {
                     require_confirm: confirm,
                     tui_events: output.tui_events,
                     link_mode: effective_link_mode(&config, symlink_only),
+                    only_sources: &only_sources,
                 },
             )?
         }
@@ -453,11 +459,13 @@ mod tests {
                 strict,
                 confirm,
                 symlink_only,
+                only_sources,
                 output,
             } => {
                 assert!(!strict);
                 assert!(!confirm);
                 assert!(!symlink_only);
+                assert!(only_sources.is_empty());
                 assert!(output.json);
                 assert_eq!(output.report, Some(PathBuf::from("/tmp/report.json")));
                 assert_eq!(output.progress, ProgressMode::Auto);
