@@ -225,7 +225,10 @@ mod tests {
 
             let err = save_report(&sample_report(), &report_path)
                 .expect_err("symlink report path should fail");
-            assert!(err.to_string().contains("refusing to overwrite symlink target"));
+            assert!(
+                err.to_string()
+                    .contains("refusing to overwrite symlink target")
+            );
             assert_eq!(fs::read(&victim).expect("read victim"), b"keep");
 
             fs::remove_dir_all(&root).expect("cleanup temp dir");

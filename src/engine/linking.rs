@@ -7,8 +7,8 @@ use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::protocol::TuiEvent;
 use crate::logger;
+use crate::protocol::TuiEvent;
 
 use crate::protocol::LinkReportEntry;
 
@@ -71,11 +71,22 @@ fn snapshot_path(path: &Path) -> Result<FileSnapshot> {
     })
 }
 
-fn ensure_snapshot_matches(path: &Path, expected: &FileSnapshot, label: &str) -> Result<()> {
+fn ensure_source_snapshot_matches(path: &Path, expected: &FileSnapshot) -> Result<()> {
     let current = snapshot_path(path)?;
-    if current != *expected {
+    if !expected.matches_source(&current) {
         return Err(anyhow!(
-            "{label} changed since planning; rerun scan before linking: {}",
+            "source changed since planning; rerun scan before linking: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_target_snapshot_matches(path: &Path, expected: &FileSnapshot) -> Result<()> {
+    let current = snapshot_path(path)?;
+    if !expected.matches_target(&current) {
+        return Err(anyhow!(
+            "target changed since planning; rerun scan before linking: {}",
             path.display()
         ));
     }
@@ -86,7 +97,8 @@ fn finalize_tmp_swap_with<G>(tmp_link: &Path, src: &Path, rename_fn: G) -> Resul
 where
     G: Fn(&Path, &Path) -> std::io::Result<()>,
 {
-    rename_fn(tmp_link, src).with_context(|| format!("mv {:?} {:?}", tmp_link.display(), src.display()))?;
+    rename_fn(tmp_link, src)
+        .with_context(|| format!("mv {:?} {:?}", tmp_link.display(), src.display()))?;
     if tmp_link.exists() {
         logger::warn(
             "link",
@@ -131,7 +143,11 @@ where
     let link_result = (|| -> Result<()> {
         logger::info(
             "link",
-            format!("creating temp symlink {} -> {}", tmp_link.display(), tgt.display()),
+            format!(
+                "creating temp symlink {} -> {}",
+                tmp_link.display(),
+                tgt.display()
+            ),
         );
         symlink(&rel, &tmp_link)
             .with_context(|| format!("ln -s {:?} {:?}", rel, tmp_link.display()))?;
@@ -180,7 +196,11 @@ where
     let link_result = (|| -> Result<()> {
         logger::info(
             "link",
-            format!("creating temp hardlink {} -> {}", tmp_link.display(), tgt.display()),
+            format!(
+                "creating temp hardlink {} -> {}",
+                tmp_link.display(),
+                tgt.display()
+            ),
         );
         hard_link_fn(tgt, &tmp_link)
             .with_context(|| format!("ln {:?} {:?}", tgt.display(), tmp_link.display()))?;
@@ -370,11 +390,15 @@ pub(super) fn apply_actions(
         let apply_result = (|| -> Result<()> {
             logger::info(
                 "link",
-                format!("applying {} -> {}", action.src.display(), action.tgt.display()),
+                format!(
+                    "applying {} -> {}",
+                    action.src.display(),
+                    action.tgt.display()
+                ),
             );
-            ensure_snapshot_matches(&action.src, &action.src_snapshot, "source")?;
+            ensure_source_snapshot_matches(&action.src, &action.src_snapshot)?;
             ensure_target_within_media_root(media, &action.tgt)?;
-            ensure_snapshot_matches(&action.tgt, &action.tgt_snapshot, "target")?;
+            ensure_target_snapshot_matches(&action.tgt, &action.tgt_snapshot)?;
             let (method, fallback_reason) =
                 replace_file_with_best_link(&action.src, &action.tgt, link_mode)?;
             report_entries[index].method = Some(method);

@@ -334,8 +334,7 @@ fn validate_config(config: &config::Config) -> Result<()> {
                 ));
             } else {
                 match probe_directory_writable(path) {
-                    Ok(_) => {
-                    }
+                    Ok(_) => {}
                     Err(err) => failures.push(format!(
                         "downloads path is not writable (needed for cache/link ops): {} ({err})",
                         path.display()
@@ -578,11 +577,7 @@ mod tests {
             fs::create_dir_all(&root).expect("create root");
             let victim = root.join("victim");
             fs::write(&victim, b"keep").expect("write victim");
-            let link = root.join(format!(
-                ".dejaview_validate_{}.{}",
-                std::process::id(),
-                1u8
-            ));
+            let link = root.join(format!(".dejaview_validate_{}.{}", std::process::id(), 1u8));
             symlink(&victim, &link).expect("create symlink");
 
             for _ in 0..16 {

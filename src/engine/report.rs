@@ -127,7 +127,10 @@ pub(super) fn resolve_report_path(
     })
 }
 
-pub(super) fn build_report_entries(actions: &[LinkAction], link_mode: LinkMode) -> Vec<LinkReportEntry> {
+pub(super) fn build_report_entries(
+    actions: &[LinkAction],
+    link_mode: LinkMode,
+) -> Vec<LinkReportEntry> {
     actions
         .iter()
         .map(|action| LinkReportEntry {

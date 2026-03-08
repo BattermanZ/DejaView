@@ -260,10 +260,7 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
             Line::from(Span::styled("No selection", Theme::inspector_value())),
             Line::raw(""),
             Line::from(Span::styled(" SELECTED SIZE", Theme::title(false))),
-            Line::from(Span::styled(
-                "No selection",
-                Theme::metric_number(),
-            )),
+            Line::from(Span::styled("No selection", Theme::metric_number())),
             Line::raw(""),
             Line::from(Span::styled(" NOTES", Theme::title(false))),
             Line::from(Span::styled(

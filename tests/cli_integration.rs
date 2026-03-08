@@ -241,11 +241,8 @@ fn cache_audit_and_cleanup_temp_commands_work() {
     let nested = downloads.join("nested");
     fs::create_dir_all(&nested).expect("create nested downloads");
     fs::create_dir_all(&media).expect("create media");
-    fs::write(
-        downloads.join(".dejaview_hardlink.tmp.1"),
-        b"temp-artifact",
-    )
-    .expect("write temp artifact");
+    fs::write(downloads.join(".dejaview_hardlink.tmp.1"), b"temp-artifact")
+        .expect("write temp artifact");
     fs::write(nested.join(".dejaview_link.tmp.2"), b"temp-artifact").expect("write nested temp");
 
     run_ok(
@@ -262,12 +259,20 @@ fn cache_audit_and_cleanup_temp_commands_work() {
     );
 
     let out = run_cmd(&root, &["cache", "audit-temp"]);
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Temp artifacts: 2"));
 
     let out = run_cmd(&root, &["cache", "cleanup-temp"]);
-    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Removed temp artifacts: 2"));
     assert!(!downloads.join(".dejaview_hardlink.tmp.1").exists());

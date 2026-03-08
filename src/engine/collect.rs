@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use colored::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -130,7 +130,6 @@ pub(super) fn collect_run_files(
         None
     };
 
-    let mut seen: HashSet<(u64, u64)> = HashSet::new();
     let mut files = collect_files(
         downloads,
         true,
@@ -140,11 +139,7 @@ pub(super) fn collect_run_files(
         warnings,
         metrics,
     )?;
-    for f in &files {
-        seen.insert((f.dev, f.inode));
-    }
-
-    let mut media_files = collect_files(
+    let media_files = collect_files(
         media,
         false,
         min_age,
@@ -153,7 +148,6 @@ pub(super) fn collect_run_files(
         warnings,
         metrics,
     )?;
-    media_files.retain(|f| !seen.contains(&(f.dev, f.inode)));
     files.extend(media_files);
 
     if let Some(spinner) = spinner {

@@ -134,8 +134,8 @@ mod tests {
             timestamp_nanos()
         ));
         let path = root.join("dejaview.log");
-        let contents = write_test_log(&path, "link", "temp cleanup attempted")
-            .expect("write test log");
+        let contents =
+            write_test_log(&path, "link", "temp cleanup attempted").expect("write test log");
         assert!(contents.contains("op=link"));
         assert!(contents.contains("temp cleanup attempted"));
         fs::remove_dir_all(&root).expect("cleanup temp dir");

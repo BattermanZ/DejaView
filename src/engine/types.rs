@@ -39,6 +39,19 @@ pub(super) struct FileSnapshot {
     pub(super) inode: u64,
 }
 
+impl FileSnapshot {
+    pub(super) fn matches_source(&self, current: &Self) -> bool {
+        current == self
+    }
+
+    pub(super) fn matches_target(&self, current: &Self) -> bool {
+        current.size == self.size
+            && current.mtime_ns == self.mtime_ns
+            && current.dev == self.dev
+            && current.inode == self.inode
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct CacheEntry {
     pub(super) size: u64,

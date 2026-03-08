@@ -91,7 +91,10 @@ mod tests {
             symlink(&victim, &link).expect("create symlink");
 
             let err = safe_write_bytes(&link, b"replace").expect_err("symlink write should fail");
-            assert!(err.to_string().contains("refusing to overwrite symlink target"));
+            assert!(
+                err.to_string()
+                    .contains("refusing to overwrite symlink target")
+            );
             assert_eq!(fs::read(&victim).expect("read victim"), b"keep");
 
             fs::remove_dir_all(&root).expect("cleanup temp dir");

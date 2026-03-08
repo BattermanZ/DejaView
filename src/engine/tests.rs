@@ -8,14 +8,14 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::cache::{clear_cache_file, load_cache, save_cache};
-use super::collect::collect_files;
+use super::collect::{CollectOptions, collect_files, collect_run_files, group_files_by_size};
 use super::linking::{
     apply_actions, ensure_target_within_media_root, plan_group_actions,
     replace_file_with_best_link_with, replace_file_with_hardlink_and_rename_with,
     replace_file_with_relative_symlink,
 };
-use crate::protocol::LinkReportEntry;
 use super::types::{Cache, CacheEntry, FileInfo, LinkMode, RunMetrics, RunWarnings};
+use crate::protocol::LinkReportEntry;
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     let ts = SystemTime::now()
@@ -181,12 +181,17 @@ fn replace_file_with_best_link_falls_back_to_symlink_on_hardlink_error() {
     fs::write(&src, b"old").expect("write source");
     fs::write(&tgt, b"new").expect("write target");
 
-    let result = replace_file_with_best_link_with(&src, &tgt, |_old, _new| {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "simulated hardlink failure",
-        ))
-    }, LinkMode::Best)
+    let result = replace_file_with_best_link_with(
+        &src,
+        &tgt,
+        |_old, _new| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated hardlink failure",
+            ))
+        },
+        LinkMode::Best,
+    )
     .expect("replace with fallback");
 
     assert_eq!(result.0, "symlink");
@@ -342,6 +347,50 @@ fn collect_files_strict_fails_on_walk_error() {
     );
     assert!(result.is_err());
     assert!(warnings.walk_errors > 0);
+}
+
+#[test]
+fn partially_linked_groups_still_plan_remaining_download_duplicates() {
+    let root = unique_temp_dir("partial_group");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let linked_download = downloads.join("movie.mkv");
+    let remaining_download = downloads.join("movie-copy.mkv");
+    let target = media.join("movie.mkv");
+    write_file(&remaining_download, b"same-content");
+    write_file(&target, b"same-content");
+    fs::create_dir_all(linked_download.parent().expect("downloads parent"))
+        .expect("create downloads");
+    fs::hard_link(&target, &linked_download).expect("create already-linked download");
+
+    let mut warnings = RunWarnings::default();
+    let mut metrics = RunMetrics::default();
+    let mut files = collect_run_files(
+        &downloads,
+        &media,
+        Duration::from_secs(0),
+        CollectOptions {
+            strict: false,
+            show_progress: false,
+            tui_events: false,
+        },
+        &mut warnings,
+        &mut metrics,
+    )
+    .expect("collect run files");
+    assert_eq!(files.len(), 3);
+
+    for file in &mut files {
+        file.hash = Some("same-hash".to_string());
+    }
+
+    let groups = group_files_by_size(files);
+    let (_table, actions, _saved_bytes) = plan_actions_and_table(&groups);
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].src, remaining_download);
+    assert_eq!(actions[0].tgt, target);
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -574,6 +623,103 @@ fn apply_actions_rejects_target_metadata_change_after_planning() {
     );
     let meta = fs::symlink_metadata(&src).expect("src metadata after reject");
     assert!(meta.file_type().is_file());
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn apply_actions_allow_multiple_sources_for_same_target_in_one_run() {
+    let root = unique_temp_dir("multi_source_same_target");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let src_a = downloads.join("movie-a.mkv");
+    let src_b = downloads.join("movie-b.mkv");
+    let tgt = media.join("movie.mkv");
+    write_file(&src_a, b"same-content");
+    write_file(&src_b, b"same-content");
+    write_file(&tgt, b"same-content");
+
+    let src_a_meta = fs::metadata(&src_a).expect("src_a metadata");
+    let src_b_meta = fs::metadata(&src_b).expect("src_b metadata");
+    let tgt_meta = fs::metadata(&tgt).expect("tgt metadata");
+    let tgt_snapshot = super::types::FileSnapshot {
+        size: tgt_meta.len(),
+        mtime_ns: tgt_meta
+            .modified()
+            .expect("tgt modified")
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("tgt mtime")
+            .as_nanos(),
+        ctime_ns: (tgt_meta.ctime() as i128 * 1_000_000_000) + tgt_meta.ctime_nsec() as i128,
+        dev: tgt_meta.dev(),
+        inode: tgt_meta.ino(),
+    };
+    let actions = vec![
+        super::types::LinkAction {
+            src: src_a.clone(),
+            tgt: tgt.clone(),
+            size: src_a_meta.len(),
+            src_snapshot: super::types::FileSnapshot {
+                size: src_a_meta.len(),
+                mtime_ns: src_a_meta
+                    .modified()
+                    .expect("src_a modified")
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .expect("src_a mtime")
+                    .as_nanos(),
+                ctime_ns: (src_a_meta.ctime() as i128 * 1_000_000_000)
+                    + src_a_meta.ctime_nsec() as i128,
+                dev: src_a_meta.dev(),
+                inode: src_a_meta.ino(),
+            },
+            tgt_snapshot: tgt_snapshot.clone(),
+        },
+        super::types::LinkAction {
+            src: src_b.clone(),
+            tgt: tgt.clone(),
+            size: src_b_meta.len(),
+            src_snapshot: super::types::FileSnapshot {
+                size: src_b_meta.len(),
+                mtime_ns: src_b_meta
+                    .modified()
+                    .expect("src_b modified")
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .expect("src_b mtime")
+                    .as_nanos(),
+                ctime_ns: (src_b_meta.ctime() as i128 * 1_000_000_000)
+                    + src_b_meta.ctime_nsec() as i128,
+                dev: src_b_meta.dev(),
+                inode: src_b_meta.ino(),
+            },
+            tgt_snapshot,
+        },
+    ];
+
+    let mut warnings = RunWarnings::default();
+    let mut report_entries = actions.iter().map(planned_entry_for).collect::<Vec<_>>();
+    let (applied, strict_error) = apply_actions(
+        &actions,
+        &media,
+        false,
+        true,
+        false,
+        LinkMode::Best,
+        &mut warnings,
+        &mut report_entries,
+    );
+
+    assert_eq!(applied, 2);
+    assert!(strict_error.is_none());
+    assert_eq!(warnings.link_errors, 0);
+    assert!(report_entries.iter().all(|entry| entry.status == "applied"));
+
+    let src_a_meta = fs::metadata(&src_a).expect("src_a metadata after apply");
+    let src_b_meta = fs::metadata(&src_b).expect("src_b metadata after apply");
+    let tgt_meta = fs::metadata(&tgt).expect("tgt metadata after apply");
+    assert_eq!(src_a_meta.ino(), tgt_meta.ino());
+    assert_eq!(src_b_meta.ino(), tgt_meta.ino());
+    assert_eq!(src_a_meta.dev(), tgt_meta.dev());
+    assert_eq!(src_b_meta.dev(), tgt_meta.dev());
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

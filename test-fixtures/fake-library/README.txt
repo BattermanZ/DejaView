@@ -2,32 +2,40 @@ Fake dataset for manual DejaView testing.
 
 Structure:
 - downloads/
-- media/
+- media/library/
 
 Notes:
-- Large files are sparse, so apparent size is large but disk usage is small.
+- Files are sparse, so logical size is large while real disk usage stays small.
 - Matching files across downloads/media are intentional duplicates.
-- Files marked unique differ in content and should not be linked.
+- Same-size files with different seeded prefixes should hash differently and not link.
+- The fixture tree starts clean with no `.dejaview_*.tmp.*` artifacts.
 
 Fixture groups:
-- Duplicate pairs:
-  - 4 KiB: dupe-small-4k.bin
-  - 10 MiB: dupe-medium-10m.bin
-  - 512 MiB: dupe-large-512m.bin
-  - 2 GiB: dupe-huge-2g.bin
-  - 3 GiB: season-01/dupe-ultra-3g.bin <-> library/season-01/dupe-ultra-3g.bin
-  - 5 GiB: archives/dupe-massive-5g.bin <-> archive/dupe-massive-5g.bin
-  - 7 GiB: extras/Concert Night [1080p] {sample}-7g.bin
-- Same-size but different content:
-  - 128 MiB: same-size-unique-128m.bin
-  - 3 GiB: extras/same-size-different-content-3g.bin
-- One-sided files:
-  - downloads-only-64m.bin
-  - downloads-only-9g.bin
-  - media-only-96m.bin
-  - media-only-11g.bin
+- Exact duplicate pairs:
+  - `downloads/movies/dupe-alpha-8m.bin` <-> `media/library/movies/dupe-alpha-8m.bin`
+  - `downloads/concerts/live-show-3g.bin` <-> `media/library/concerts/live-show-3g.bin`
+  - `downloads/season-one/episode-s01e01-700m.bin` <-> `media/library/season-one/episode-s01e01-700m.bin`
+  - `downloads/boxsets/anthology-disc-a-11g.bin` <-> `media/library/boxsets/anthology-disc-a-11g.bin`
+- Multi-copy duplicates in downloads:
+  - `downloads/season-one/episode-s01e01-copy-700m.bin`
+  - `downloads/boxsets/anthology-disc-a-copy-11g.bin`
+  - `downloads/boxsets/anthology-disc-a-remux-11g.bin`
+- Same size, different content:
+  - `downloads/misc/same-size-different-content-256m.bin`
+  - `media/library/misc/same-size-different-content-256m.bin`
+- Downloads-only files:
+  - `downloads/misc/downloads-only-5g.bin`
+  - `downloads/misc/Multi Part Finale (Disc 2 of 3) - director cut sample.bin`
+- Media-only files:
+  - `media/library/misc/media-only-9g.bin`
+  - `media/library/misc/[Archived] Bonus Feature {1080p}.bin`
+  - `media/library/concerts/live-show-alt-copy-3g.bin`
 
-Sparse-file reminder:
-- `ls -lh` shows logical size.
-- `du -h` shows actual disk usage.
-- Copying these files with some tools can expand them into real fully allocated files.
+Useful checks:
+- `find test-fixtures/fake-library -type f | sort`
+- `du -h test-fixtures/fake-library`
+- `ls -lh test-fixtures/fake-library/downloads/boxsets`
+
+Suggested local config:
+- downloads: `test-fixtures/fake-library/downloads`
+- media: `test-fixtures/fake-library/media/library`

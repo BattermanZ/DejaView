@@ -1171,7 +1171,11 @@ mod tests {
 
         app.poll_running_job();
 
-        assert!(app.logs.iter().any(|line| line == "Link finished. Applied actions: 0"));
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line == "Link finished. Applied actions: 0")
+        );
         assert!(
             app.logs
                 .iter()
@@ -1250,7 +1254,8 @@ mod tests {
         assert_eq!(app.planned_actions(), 1);
         assert_eq!(app.potential_saved_bytes(), 10);
         assert_eq!(
-            app.selected_entry().and_then(|entry| entry.method.as_deref()),
+            app.selected_entry()
+                .and_then(|entry| entry.method.as_deref()),
             Some("try-hardlink")
         );
     }

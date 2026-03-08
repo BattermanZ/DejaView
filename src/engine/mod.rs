@@ -10,8 +10,8 @@ mod linking;
 mod report;
 mod types;
 
-pub use types::ScanRunOptions;
 pub use types::LinkMode;
+pub use types::ScanRunOptions;
 
 use crate::protocol::TuiEvent;
 use cache::{load_cache, save_cache};
