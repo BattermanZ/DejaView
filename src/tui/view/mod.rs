@@ -246,6 +246,23 @@ fn outcome_label(row: &LinkReportEntry) -> String {
     }
 }
 
+fn visible_row_window(
+    total_rows: usize,
+    selected_row: usize,
+    available_rows: usize,
+) -> (usize, usize) {
+    if total_rows == 0 || available_rows == 0 {
+        return (0, 0);
+    }
+
+    let window = available_rows.min(total_rows);
+    let max_start = total_rows.saturating_sub(window);
+    let start = selected_row
+        .saturating_sub(window.saturating_sub(1))
+        .min(max_start);
+    (start, start + window)
+}
+
 fn notes_text(entry: &LinkReportEntry) -> String {
     entry
         .fallback_reason
@@ -587,11 +604,15 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         .saturating_sub(state_width)
         .saturating_sub(outcome_width)
         .saturating_sub(4);
+    let visible_capacity = usize::from(content[1].height.saturating_sub(1));
+    let (start, end) = visible_row_window(app.rows().len(), app.selected_row(), visible_capacity);
 
     let rows: Vec<Row> = app
         .rows()
         .iter()
         .enumerate()
+        .skip(start)
+        .take(end.saturating_sub(start))
         .map(|(idx, row)| {
             let is_selected = idx == app.selected_row();
             Row::new(vec![
@@ -1060,5 +1081,24 @@ mod tests {
     fn trim_to_width_uses_available_width() {
         let path = "/this/is/a/very/long/path/example.mkv";
         assert!(trim_to_width(path, 10).chars().count() <= 9);
+    }
+
+    #[test]
+    fn visible_row_window_shows_top_rows_initially() {
+        assert_eq!(visible_row_window(10, 0, 4), (0, 4));
+        assert_eq!(visible_row_window(10, 3, 4), (0, 4));
+    }
+
+    #[test]
+    fn visible_row_window_scrolls_with_selection() {
+        assert_eq!(visible_row_window(10, 4, 4), (1, 5));
+        assert_eq!(visible_row_window(10, 7, 4), (4, 8));
+    }
+
+    #[test]
+    fn visible_row_window_clamps_to_bounds() {
+        assert_eq!(visible_row_window(10, 9, 4), (6, 10));
+        assert_eq!(visible_row_window(3, 9, 4), (0, 3));
+        assert_eq!(visible_row_window(3, 0, 0), (0, 0));
     }
 }
