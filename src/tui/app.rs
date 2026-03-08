@@ -707,13 +707,7 @@ impl App {
                     }
                 }
                 Err(err) => {
-                    self.running_job = None;
-                    self.finish_live_run();
-                    let label = match kind {
-                        JobKind::Scan => "Scan",
-                        JobKind::Link => "Link",
-                    };
-                    self.push_log(format!("{label} failed: {err}"));
+                    self.fail_running_job(kind, err.to_string());
                     return;
                 }
             }
@@ -723,16 +717,21 @@ impl App {
             && !saw_done
             && self.running_job.is_some()
         {
-            self.running_job = None;
-            self.finish_live_run();
-            let label = match kind {
-                JobKind::Scan => "Scan",
-                JobKind::Link => "Link",
-            };
-            self.push_log(format!(
-                "{label} failed: worker thread disconnected unexpectedly"
-            ));
+            self.fail_running_job(kind, "worker thread disconnected unexpectedly".to_string());
         }
+    }
+
+    fn fail_running_job(&mut self, kind: JobKind, message: String) {
+        self.running_job = None;
+        self.live_entries.clear();
+        self.live_planned_actions = None;
+        self.live_applied_actions = None;
+        self.finish_live_run();
+        let label = match kind {
+            JobKind::Scan => "Scan",
+            JobKind::Link => "Link",
+        };
+        self.push_log(format!("{label} failed: {message}"));
     }
 
     fn apply_tui_event(&mut self, kind: JobKind, event: TuiEvent) -> bool {
@@ -1000,6 +999,7 @@ fn display_phase(phase: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use crate::protocol::WarningSummary;
+    use anyhow::anyhow;
 
     use super::super::model::{RunReport, TuiEvent};
     use super::*;
@@ -1257,6 +1257,45 @@ mod tests {
             app.selected_entry()
                 .and_then(|entry| entry.method.as_deref()),
             Some("try-hardlink")
+        );
+    }
+
+    #[test]
+    fn link_job_error_clears_stale_live_rows() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+
+        let (tx, rx) = mpsc::channel();
+        app.running_job = Some(RunningJob {
+            kind: JobKind::Link,
+            receiver: rx,
+        });
+
+        tx.send(Ok(TuiEvent::PlannedEntries {
+            entries: vec![LinkReportEntry {
+                source: "/downloads/a.mkv".to_string(),
+                target: "/media/a.mkv".to_string(),
+                size: 10,
+                status: "planned".to_string(),
+                method: Some("try-hardlink".to_string()),
+                fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
+                error: None,
+            }],
+        }))
+        .expect("send planned entry");
+        tx.send(Err(anyhow!("parse streamed event from link")))
+            .expect("send error");
+
+        app.poll_running_job();
+
+        assert!(app.running_job.is_none());
+        assert!(app.rows().is_empty());
+        assert_eq!(app.planned_actions(), 0);
+        assert_eq!(app.applied_actions(), 0);
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line == "Link failed: parse streamed event from link")
         );
     }
 

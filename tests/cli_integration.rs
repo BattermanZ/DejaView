@@ -394,6 +394,55 @@ fn link_json_reports_applied_actions() {
 }
 
 #[test]
+fn link_tui_events_stdout_stays_machine_parseable() {
+    let root = unique_temp_dir("link_tui_events");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    fs::create_dir_all(&downloads).expect("create downloads");
+    fs::create_dir_all(&media).expect("create media");
+
+    let src = downloads.join("movie.mkv");
+    let tgt = media.join("movie.mkv");
+    fs::write(&src, b"same-content").expect("write src");
+    fs::write(&tgt, b"same-content").expect("write tgt");
+
+    run_ok(
+        &root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        &root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+    set_min_age_zero(&root);
+
+    let out = run_cmd(&root, &["link", "--tui-events", "--no-progress"]);
+    assert!(
+        out.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut saw_done = false;
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let value: serde_json::Value =
+            serde_json::from_str(line).expect("every tui-events stdout line should be json");
+        if value["type"] == "done" {
+            saw_done = true;
+        }
+    }
+    assert!(saw_done, "expected final done event in stdout:\n{stdout}");
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
 fn config_validate_reports_success_for_valid_paths() {
     let root = unique_temp_dir("config_validate");
     let downloads = root.join("downloads");

@@ -376,7 +376,7 @@ pub(super) fn apply_actions(
         return (applied_actions, strict_link_error);
     }
 
-    if !json_output {
+    if !json_output && !tui_events {
         println!("{} Applying…", "▶".cyan());
     }
 
