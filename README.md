@@ -1,6 +1,6 @@
 # DejaView
 
-**DejaView** is a Rust-based CLI utility designed to detect and replace duplicate media files across separate folders (e.g., a download directory and an organised media library). It scans for exact duplicates by file size and BLAKE3 hash, then replaces redundant copies in the download tree with relative symbolic links pointing to the canonical file in the media library. A persistent JSON cache speeds up subsequent runs by skipping unchanged files.
+**DejaView** is a Rust-based CLI utility designed to detect and replace duplicate media files across separate folders (e.g., a download directory and an organised media library). It scans for exact duplicates by file size and BLAKE3 hash, then replaces redundant copies in the download tree with hardlinks to the canonical file in the media library, falling back to relative symlinks when the two live on different devices. A persistent JSON cache speeds up subsequent runs by skipping unchanged files.
 
 ---
 
@@ -9,7 +9,7 @@
 *   **Size-prefiltered, hash-verified duplicates**: Groups files by size and confirms duplicates using BLAKE3 hashes.
 *   **Two-phase hashing**: Uses a fast sample hash to quickly filter out non-duplicates, then performs a full hash only on potential matches.
 *   **Persistent cache**: Stores `(path, size, mtime, hash)` in `.dejaview_cache.json` to skip rehashing unchanged files.
-*   **Relative symlinks**: Creates portable links that remain valid if the directory structure is mounted identically (important for Docker setups).
+*   **Hardlink first, symlink fallback**: Prefers hardlinks to reclaim space with no dangling references, and falls back to relative symlinks across devices (portable if the directory structure is mounted identically, which matters for Docker setups).
 *   **Concurrency**: Utilises Rayon to parallelise hashing across multiple CPU cores.
 *   **Progress UI**: Combines `indicatif` spinners and bars for a responsive terminal experience.
 *   **Table output**: Renders a dynamic, wrapped table of planned replacements using `comfy_table` and ANSI colours.
@@ -22,7 +22,13 @@
 
 1.  Ensure you have Rust and Cargo installed (via [rustup](https://rustup.rs/)).
 
-2.  Build the project:
+2.  Install the `dejaview` binary onto your PATH:
+
+    ```bash
+    cargo install --path .
+    ```
+
+    Or build without installing, then run from `./target/release/dejaview`:
 
     ```bash
     cargo build --release
@@ -32,7 +38,7 @@
 
 ## Usage
 
-DejaView is now controlled via subcommands. All commands should be run from your project root (where `Cargo.toml` lives) using `cargo run -- <subcommand> [args...]`.
+DejaView is controlled via subcommands: `dejaview <subcommand> [args...]`. The examples below assume the binary is on your PATH (see Installation).
 
 ### 1. Initial Configuration (One-Time Setup)
 
@@ -40,32 +46,32 @@ Before running any scans or links, you need to tell DejaView where your download
 
 *   **Set Downloads Path:**
     ```bash
-    cargo run -- config set-downloads /path/to/your/downloads
+    dejaview config set-downloads /path/to/your/downloads
     ```
 
 *   **Set Media Path:**
     ```bash
-    cargo run -- config set-media /path/to/your/media
+    dejaview config set-media /path/to/your/media
     ```
 
 *   **Show Current Configuration:**
     ```bash
-    cargo run -- config show
+    dejaview config show
     ```
 
 *   **Set Minimum File Age (seconds):**
     ```bash
-    cargo run -- config set-min-age 0
+    dejaview config set-min-age 0
     ```
 
 *   **Set Worker Threads:**
     ```bash
-    cargo run -- config set-threads 4
+    dejaview config set-threads 4
     ```
 
 *   **Validate Configuration and Access:**
     ```bash
-    cargo run -- config validate
+    dejaview config validate
     ```
 
 ### 2. Scanning for Duplicates (Dry Run)
@@ -73,13 +79,13 @@ Before running any scans or links, you need to tell DejaView where your download
 This command will scan your configured directories for duplicates and report them, including the potential space savings. No files will be modified.
 
 ```bash
-cargo run -- scan
+dejaview scan
 ```
 
 Machine-readable scan output for automation:
 
 ```bash
-cargo run -- scan --json --no-progress --report /tmp/dejaview-scan.json
+dejaview scan --json --no-progress --report /tmp/dejaview-scan.json
 ```
 
 ### 3. Linking Duplicates
@@ -87,19 +93,19 @@ cargo run -- scan --json --no-progress --report /tmp/dejaview-scan.json
 This command will perform the actual file operations: deleting duplicates in your downloads folder and replacing them with symbolic links to the media folder.
 
 ```bash
-cargo run -- link
+dejaview link
 ```
 
 Prompt before applying changes (interactive terminals):
 
 ```bash
-cargo run -- link --confirm
+dejaview link --confirm
 ```
 
 Machine-readable link output for automation:
 
 ```bash
-cargo run -- link --json --no-progress --report /tmp/dejaview-link.json
+dejaview link --json --no-progress --report /tmp/dejaview-link.json
 ```
 
 ### 4. Cache Management
@@ -108,12 +114,12 @@ DejaView uses a cache to speed up subsequent runs. You can manage it with these 
 
 *   **Clear Cache:**
     ```bash
-    cargo run -- cache clear
+    dejaview cache clear
     ```
 
 *   **Show Cache Info:**
     ```bash
-    cargo run -- cache info
+    dejaview cache info
     ```
 
 ### 5. Interactive TUI
@@ -121,13 +127,13 @@ DejaView uses a cache to speed up subsequent runs. You can manage it with these 
 Launch the terminal dashboard:
 
 ```bash
-cargo run -- tui
+dejaview tui
 ```
 
 Use strict mode for in-TUI scan/link actions:
 
 ```bash
-cargo run -- tui --strict
+dejaview tui --strict
 ```
 
 Default keybinds:
@@ -174,7 +180,7 @@ When `--json` is enabled, progress UI is automatically disabled so stdout remain
 
 *   **Maintain mount consistency** for relative symlinks (e.g., Docker bind `/mnt/mediazilla` identically).
 *   **Run `scan` first** to preview changes before running `link`.
-*   **Clear cache** periodically by running `cargo run -- cache clear` if your directory structure drastically changes or if you suspect cache inconsistencies.
+*   **Clear cache** periodically by running `dejaview cache clear` if your directory structure drastically changes or if you suspect cache inconsistencies.
 *   **Schedule via cron or invoke manually** after media imports for automated cleanup.
 
 ---
@@ -216,4 +222,4 @@ cargo test --test perf_harness perf_medium_dataset -- --ignored --nocapture
 
 ## License
 
-MIT
+GNU General Public License v3.0 (GPL-3.0). See `LICENSE`.
