@@ -35,6 +35,11 @@ pub struct RunReport {
     /// written before the floor existed.
     #[serde(default)]
     pub skipped_by_min_size: u64,
+    /// Downloads left alone because they are a library file seen through a
+    /// second mount (a bind mount or a mergerfs branch). Non-zero means the
+    /// downloads folder reaches into the library.
+    #[serde(default)]
+    pub skipped_as_library_file: u64,
     pub warnings: WarningSummary,
     pub entries: Vec<LinkReportEntry>,
 }

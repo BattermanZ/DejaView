@@ -184,6 +184,7 @@ pub(super) fn build_run_report(options: &ScanRunOptions<'_>, input: RunReportInp
         total_saved_bytes: input.total_saved_space,
         skipped_by_min_age: input.metrics.skipped_by_min_age,
         skipped_by_min_size: input.metrics.skipped_by_min_size,
+        skipped_as_library_file: input.metrics.skipped_as_library_file,
         warnings: WarningSummary {
             walk_errors: input.warnings.walk_errors,
             metadata_errors: input.warnings.metadata_errors,

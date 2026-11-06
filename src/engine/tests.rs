@@ -42,12 +42,14 @@ fn write_file(path: &Path, content: &[u8]) {
     fs::write(path, content).expect("write file");
 }
 
+/// A file whose ctime is its inode number, so different inodes never share
+/// timestamps by accident and paths of one inode always do.
 fn sample_file_info(path: &str, dev: u64, inode: u64, in_downloads: bool) -> FileInfo {
     FileInfo {
         path: PathBuf::from(path),
         size: 10,
         mtime_ns: 0,
-        ctime_ns: 0,
+        ctime_ns: inode as i128,
         dev,
         inode,
         hash: Some("h".into()),
@@ -326,6 +328,67 @@ fn plan_group_actions_skips_already_hardlinked_source() {
 }
 
 #[test]
+fn plan_group_actions_skips_download_already_linked_to_another_library_copy() {
+    // The library holds two identical copies; the *arr hardlink joins the
+    // download to the second one, which does not sort first.
+    let first_copy = sample_file_info("/media/A Movies/m.mkv", 1, 10, false);
+    let second_copy = sample_file_info("/media/B Movies/m.mkv", 1, 11, false);
+    let download = sample_file_info("/downloads/m.mkv", 1, 11, true);
+    let actions = plan_group_actions(&[&first_copy, &second_copy, &download]);
+    assert!(
+        actions.is_empty(),
+        "relinking would break the existing hardlink and free nothing"
+    );
+}
+
+#[test]
+fn plan_group_actions_skips_library_file_seen_through_a_second_mount() {
+    // mergerfs: downloads points at a branch that holds the library, media at
+    // the pool. One file shows up on two devices with the same size and
+    // timestamps; its only copy must not be replaced.
+    let pool_view = sample_file_info("/pool/media/m.mkv", 1, 10, false);
+    let mut branch_view = sample_file_info("/disk1/media/m.mkv", 2, 500, true);
+    branch_view.ctime_ns = pool_view.ctime_ns;
+    assert!(plan_group_actions(&[&pool_view, &branch_view]).is_empty());
+
+    // The same holds when the library has a second copy that sorts first: the
+    // branch view of B must not be paired with A.
+    let copy_a = sample_file_info("/pool/media/A/m.mkv", 1, 10, false);
+    let copy_b = sample_file_info("/pool/media/B/m.mkv", 1, 11, false);
+    let mut branch_b = sample_file_info("/disk1/media/B/m.mkv", 2, 501, true);
+    branch_b.ctime_ns = copy_b.ctime_ns;
+    assert!(plan_group_actions(&[&copy_a, &copy_b, &branch_b]).is_empty());
+
+    // A real copy on another device has its own ctime and is still planned.
+    let real_copy = sample_file_info("/downloads/m.mkv", 2, 502, true);
+    assert_eq!(plan_group_actions(&[&pool_view, &real_copy]).len(), 1);
+}
+
+#[test]
+fn link_run_keeps_a_download_hardlinked_to_a_second_library_copy() {
+    let root = unique_temp_dir("second_library_copy");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let copy_a = media.join("A Movies").join("m.mkv");
+    let copy_b = media.join("B Movies").join("m.mkv");
+    let download = downloads.join("m.mkv");
+    write_file(&copy_a, b"same-movie-bytes");
+    write_file(&copy_b, b"same-movie-bytes");
+    fs::create_dir_all(&downloads).expect("create downloads");
+    fs::hard_link(&copy_b, &download).expect("arr hardlink");
+    let config = make_config(&downloads, &media, 0);
+
+    run_scan(&config, false, false, None);
+
+    assert_eq!(
+        fs::metadata(&download).expect("download").ino(),
+        fs::metadata(&copy_b).expect("copy b").ino(),
+        "the download keeps its hardlink to B"
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
 fn plan_group_actions_requires_both_sides() {
     let media_only = sample_file_info("/media/a.mkv", 1, 1, false);
     let downloads_only = sample_file_info("/downloads/a.mkv", 2, 2, true);
@@ -394,7 +457,7 @@ fn partially_linked_groups_still_plan_remaining_download_duplicates() {
     }
 
     let groups = group_files_by_size(files);
-    let (_table, actions, _saved_bytes) = plan_actions_and_table(&groups);
+    let actions = plan_actions_and_table(&groups).actions;
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].src, remaining_download);
     assert_eq!(actions[0].tgt, target);

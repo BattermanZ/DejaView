@@ -176,7 +176,12 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     save_cache(&cache_path, &cache)?;
     hash_result?;
 
-    let (table, actions, _total_saved_space) = plan_actions_and_table(&groups);
+    let linking::Plan {
+        table,
+        actions,
+        seen_through_second_mount,
+    } = plan_actions_and_table(&groups);
+    report_second_mount_skips(&seen_through_second_mount, &options, &mut metrics);
     let actions = if options.only_sources.is_empty() {
         actions
     } else {
@@ -329,6 +334,41 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         ),
     );
     Ok(())
+}
+
+/// A download that is a library file seen through a second mount means the
+/// downloads folder reaches into the library, through a bind mount or a mergerfs
+/// branch. Such downloads are never planned; say so, since the configuration
+/// is what needs fixing.
+fn report_second_mount_skips(
+    skipped: &[(std::path::PathBuf, std::path::PathBuf)],
+    options: &ScanRunOptions<'_>,
+    metrics: &mut RunMetrics,
+) {
+    metrics.skipped_as_library_file = skipped.len() as u64;
+    for (download, library) in skipped {
+        logger::warn(
+            "plan",
+            format!(
+                "left alone {}: it is the library file {} seen through a second mount (same size and timestamps on another device)",
+                download.display(),
+                library.display()
+            ),
+        );
+    }
+    if skipped.is_empty() {
+        return;
+    }
+    let message = format!(
+        "Left alone {} download(s) that are library files seen through a second mount, such as {}. The downloads folder reaches into the library through a bind mount or a mergerfs branch: point downloads and media at the same view of the disks. The log lists every one.",
+        skipped.len(),
+        skipped[0].0.display()
+    );
+    if options.tui_events {
+        let _ = types::emit_tui_event(&TuiEvent::Log { message });
+    } else if !options.json_output {
+        eprintln!("{} {message}", "⚠".yellow());
+    }
 }
 
 #[cfg(test)]

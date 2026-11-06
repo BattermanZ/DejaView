@@ -1235,6 +1235,7 @@ mod tests {
             total_saved_bytes: 1024,
             skipped_by_min_age: 0,
             skipped_by_min_size: 0,
+            skipped_as_library_file: 0,
             warnings: WarningSummary {
                 walk_errors: 0,
                 metadata_errors: 0,
@@ -1263,6 +1264,7 @@ mod tests {
             total_saved_bytes: 30,
             skipped_by_min_age: 0,
             skipped_by_min_size: 0,
+            skipped_as_library_file: 0,
             warnings: WarningSummary {
                 walk_errors: 0,
                 metadata_errors: 0,
@@ -1738,6 +1740,7 @@ mod tests {
             total_saved_bytes: 30,
             skipped_by_min_age: 0,
             skipped_by_min_size: 0,
+            skipped_as_library_file: 0,
             warnings: WarningSummary {
                 walk_errors: 0,
                 metadata_errors: 0,
@@ -1788,6 +1791,7 @@ mod tests {
                 total_saved_bytes: 10,
                 skipped_by_min_age: 0,
                 skipped_by_min_size: 0,
+                skipped_as_library_file: 0,
                 warnings: WarningSummary {
                     walk_errors: 0,
                     metadata_errors: 0,

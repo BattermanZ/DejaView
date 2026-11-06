@@ -4,7 +4,7 @@ use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use pathdiff::diff_paths;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, symlink};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::logger;
@@ -331,6 +331,26 @@ pub(super) fn replace_file_with_best_link(
     replace_file_with_best_link_with(src, tgt, |from, to| fs::hard_link(from, to), link_mode)
 }
 
+/// Whether `download` already is the library file `library`: one inode, or one
+/// file seen through two mounts. A bind mount or a mergerfs branch shows a
+/// library file on a second device, often under another inode number, but with
+/// the same size and timestamps; two real copies almost never share a ctime to
+/// the nanosecond.
+fn is_same_physical_file(download: &FileInfo, library: &FileInfo) -> bool {
+    if download.dev == library.dev {
+        download.inode == library.inode
+    } else {
+        download.size == library.size
+            && download.mtime_ns == library.mtime_ns
+            && download.ctime_ns == library.ctime_ns
+    }
+}
+
+/// Plan one link per download in a group of identical files, all to the library
+/// file whose path sorts first. A download that already is one of the group's
+/// library files is left alone: relinking it frees nothing, breaks the
+/// hardlink Sonarr or Radarr made, and through a second mount would replace
+/// the library's only copy.
 pub(super) fn plan_group_actions(group: &[&FileInfo]) -> Vec<LinkAction> {
     let mut downloads: Vec<&FileInfo> = group.iter().copied().filter(|f| f.in_downloads).collect();
     let mut media: Vec<&FileInfo> = group.iter().copied().filter(|f| !f.in_downloads).collect();
@@ -345,7 +365,10 @@ pub(super) fn plan_group_actions(group: &[&FileInfo]) -> Vec<LinkAction> {
     let canonical = media[0];
     let mut actions = Vec::new();
     for src in downloads {
-        if src.dev == canonical.dev && src.inode == canonical.inode {
+        if media
+            .iter()
+            .any(|library| is_same_physical_file(src, library))
+        {
             continue;
         }
         actions.push(LinkAction {
@@ -360,7 +383,26 @@ pub(super) fn plan_group_actions(group: &[&FileInfo]) -> Vec<LinkAction> {
     actions
 }
 
-pub(super) fn plan_hashed_group_actions(group: &[FileInfo]) -> Vec<LinkAction> {
+/// Downloads in a group that are a library file seen through a second mount,
+/// each with the library path it matched. They are never planned; listing them
+/// tells the person that downloads and media overlap.
+fn library_files_seen_through_second_mount(group: &[&FileInfo]) -> Vec<(PathBuf, PathBuf)> {
+    let media: Vec<&FileInfo> = group.iter().copied().filter(|f| !f.in_downloads).collect();
+    group
+        .iter()
+        .filter(|f| f.in_downloads)
+        .filter_map(|download| {
+            media
+                .iter()
+                .find(|library| {
+                    library.dev != download.dev && is_same_physical_file(download, library)
+                })
+                .map(|library| (download.path.clone(), library.path.clone()))
+        })
+        .collect()
+}
+
+fn hash_buckets(group: &[FileInfo]) -> Vec<Vec<&FileInfo>> {
     let mut hash_map: std::collections::HashMap<String, Vec<&FileInfo>> =
         std::collections::HashMap::new();
     for file in group {
@@ -368,15 +410,25 @@ pub(super) fn plan_hashed_group_actions(group: &[FileInfo]) -> Vec<LinkAction> {
             hash_map.entry(hash.clone()).or_default().push(file);
         }
     }
-
-    let mut actions = Vec::new();
-    for hashed_group in hash_map.values() {
-        actions.extend(plan_group_actions(hashed_group));
-    }
-    actions
+    hash_map.into_values().collect()
 }
 
-pub(super) fn plan_actions_and_table(groups: &[Vec<FileInfo>]) -> (Table, Vec<LinkAction>, u64) {
+pub(super) fn plan_hashed_group_actions(group: &[FileInfo]) -> Vec<LinkAction> {
+    hash_buckets(group)
+        .iter()
+        .flat_map(|hashed_group| plan_group_actions(hashed_group))
+        .collect()
+}
+
+pub(super) struct Plan {
+    pub(super) table: Table,
+    pub(super) actions: Vec<LinkAction>,
+    /// Downloads left alone because they are a library file seen through a
+    /// second mount, with the library path each matched.
+    pub(super) seen_through_second_mount: Vec<(PathBuf, PathBuf)>,
+}
+
+pub(super) fn plan_actions_and_table(groups: &[Vec<FileInfo>]) -> Plan {
     let mut table = Table::new();
     table
         .load_style(UTF8_FULL.with_rounded_corners())
@@ -384,20 +436,26 @@ pub(super) fn plan_actions_and_table(groups: &[Vec<FileInfo>]) -> (Table, Vec<Li
         .set_header(vec!["Download".yellow(), "Media".yellow()]);
 
     let mut actions = Vec::new();
-    let mut total_saved_space: u64 = 0;
+    let mut seen_through_second_mount = Vec::new();
     for group in groups {
-        let planned = plan_hashed_group_actions(group);
-        for action in planned {
-            table.add_row(vec![
-                action.src.to_string_lossy().to_string(),
-                action.tgt.to_string_lossy().to_string(),
-            ]);
-            total_saved_space += action.size;
-            actions.push(action);
+        for hashed_group in hash_buckets(group) {
+            seen_through_second_mount
+                .extend(library_files_seen_through_second_mount(&hashed_group));
+            for action in plan_group_actions(&hashed_group) {
+                table.add_row(vec![
+                    action.src.to_string_lossy().to_string(),
+                    action.tgt.to_string_lossy().to_string(),
+                ]);
+                actions.push(action);
+            }
         }
     }
 
-    (table, actions, total_saved_space)
+    Plan {
+        table,
+        actions,
+        seen_through_second_mount,
+    }
 }
 
 pub(super) struct ApplyOptions<'a> {
