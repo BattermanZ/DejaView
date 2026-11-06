@@ -23,21 +23,68 @@ use crate::protocol::TuiEvent;
 /// for any run of characters and `?` for one.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Exclude {
-    patterns: Vec<String>,
+    patterns: Vec<Pattern>,
+}
+
+/// One exclude pattern, with the literal text before its first wildcard and
+/// after its last, so most names are turned away by a cheap comparison: the
+/// walk asks about every name it meets.
+#[derive(Clone, Debug)]
+struct Pattern {
+    text: String,
+    prefix: String,
+    suffix: String,
+    wild: bool,
+}
+
+impl Pattern {
+    fn new(text: String) -> Self {
+        let is_wild = |c: char| c == '*' || c == '?';
+        let prefix: String = text.chars().take_while(|&c| !is_wild(c)).collect();
+        let wild = prefix.len() < text.len();
+        let suffix = if wild {
+            let mut tail: Vec<char> = text.chars().rev().take_while(|&c| !is_wild(c)).collect();
+            tail.reverse();
+            tail.into_iter().collect()
+        } else {
+            String::new()
+        };
+        Pattern {
+            text,
+            prefix,
+            suffix,
+            wild,
+        }
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        if !self.wild {
+            return name == self.text;
+        }
+        name.len() >= self.prefix.len() + self.suffix.len()
+            && name.starts_with(&self.prefix)
+            && name.ends_with(&self.suffix)
+            && glob_matches(&self.text, name)
+    }
 }
 
 impl Exclude {
     pub(super) fn new(patterns: Vec<String>) -> Self {
-        Exclude { patterns }
+        Exclude {
+            patterns: patterns.into_iter().map(Pattern::new).collect(),
+        }
     }
 
     /// The pattern `name` matches, if any.
     pub(super) fn matching(&self, name: &OsStr) -> Option<&str> {
+        if self.patterns.is_empty() {
+            return None;
+        }
         let name = name.to_string_lossy();
         self.patterns
             .iter()
-            .find(|pattern| glob_matches(pattern, &name))
-            .map(String::as_str)
+            .find(|pattern| pattern.matches(&name))
+            .map(|pattern| pattern.text.as_str())
     }
 
     /// Whether a walk takes in `path`, logging what it leaves out.
@@ -565,6 +612,35 @@ mod tests {
         assert!(!glob_matches("?.nfo", "xy.nfo"));
         assert!(glob_matches("*", "anything"));
         assert!(glob_matches("$RECYCLE.BIN", "$RECYCLE.BIN"));
+    }
+
+    #[test]
+    fn a_pattern_matches_as_the_glob_does() {
+        let names = [
+            ".Trash-1000",
+            ".Trash-",
+            ".Trash",
+            "movie.mkv.part",
+            "x.nfo",
+            "xy.nfo",
+            "@eaDir",
+            "a.b",
+            "ab",
+            "aXbYc",
+            "",
+        ];
+        for pattern in [
+            ".Trash-*", "*.part", "?.nfo", "@eaDir", "a*b*c", "a?b", "*", "a*", "*b",
+        ] {
+            let compiled = Pattern::new(pattern.to_string());
+            for name in names {
+                assert_eq!(
+                    compiled.matches(name),
+                    glob_matches(pattern, name),
+                    "{pattern} against {name}"
+                );
+            }
+        }
     }
 
     #[test]
