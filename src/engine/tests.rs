@@ -872,6 +872,9 @@ fn run_scan_report_write_failure_is_non_fatal() {
     fs::set_permissions(&report_dir, reset).expect("reset perms");
 }
 
+/// A link leaves files younger than `min_age` alone, and links the same
+/// pair once no minimum age keeps it out: the second run is the control that
+/// shows the first had something to leave alone.
 #[test]
 fn run_scan_respects_min_age_filter() {
     let root = TempDir::new("min_age");
@@ -881,12 +884,126 @@ fn run_scan_respects_min_age_filter() {
     let tgt = media.join("movie.mkv");
     write_file(&src, b"same-content");
     write_file(&tgt, b"same-content");
-    let config = make_config(&downloads, &media, 3600);
+    let inode = |path: &Path| fs::metadata(path).expect("metadata").ino();
+    let src_inode = inode(&src);
+    let report = root.join("report.json");
 
-    run_scan(&config, false, false, None);
+    run_scan(
+        &make_config(&downloads, &media, 3600),
+        false,
+        false,
+        Some(&report),
+    );
+    assert_eq!(inode(&src), src_inode, "an hour old at most: left alone");
+    let written: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("report")).expect("parse report");
+    assert_eq!(written["skipped_by_min_age"], 2);
+    assert_eq!(written["planned_actions"], 0);
 
-    let meta = fs::symlink_metadata(&src).expect("source metadata");
-    assert!(meta.file_type().is_file());
+    run_scan(&make_config(&downloads, &media, 0), false, false, None);
+    assert_eq!(inode(&src), inode(&tgt), "with no minimum age, linked");
+}
+
+/// A link run that links one pair and fails the other finishes, exits with
+/// code 2 (ADR 0003), and reports each pair as it ended: the failure with
+/// its OS error and no planned method, and only the linked pair's bytes as
+/// freed. Root writes into any folder, so as root this returns early; `just
+/// test` runs it again as nobody.
+#[test]
+fn a_link_run_with_one_failed_pair_reports_each_pair_as_it_ended() {
+    if running_as_root() {
+        return;
+    }
+    let root = TempDir::new("partial_failure");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_file(&downloads.join("locked/b.mkv"), b"second-content");
+    write_file(&downloads.join("open/a.mkv"), b"first");
+    write_file(&media.join("b.mkv"), b"second-content");
+    write_file(&media.join("a.mkv"), b"first");
+    let locked = downloads.join("locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).expect("lock folder");
+    let report = root.join("report.json");
+
+    let end = run_scan_with_options(
+        &make_config(&downloads, &media, 0),
+        ScanRunOptions {
+            report_path: Some(&report),
+            ..ScanRunOptions::for_test(false)
+        },
+    )
+    .expect("a run with a failed pair still finishes");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("unlock folder");
+
+    assert_eq!(end, RunEnd::WithFailures);
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("report")).expect("parse report");
+    assert_eq!(report["outcome"], "complete");
+    assert_eq!(report["planned_actions"], 2);
+    assert_eq!(report["applied_actions"], 1);
+    assert_eq!(report["warnings"]["link_errors"], 1);
+    let failed = &report["entries"][0];
+    assert!(
+        failed["source"]
+            .as_str()
+            .is_some_and(|source| source.ends_with("locked/b.mkv"))
+    );
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["method"], serde_json::Value::Null);
+    assert!(
+        failed["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("Permission denied")),
+        "{failed}"
+    );
+    assert_eq!(report["entries"][1]["status"], "applied");
+    assert_eq!(report["entries"][1]["method"], "hardlink");
+    assert_eq!(report["planned_bytes"], 19);
+    assert_eq!(report["freed_bytes"], 5, "only the linked pair's bytes");
+    assert_eq!(report["total_saved_bytes"], 5);
+}
+
+/// A dashboard link of reviewed rows stopped before its first pair still
+/// writes its report: outcome `cancelled`, every pair still planned, nothing
+/// freed, and the run ends as cancelled, which exits 1.
+#[test]
+fn a_link_cancelled_before_its_first_pair_reports_cancelled() {
+    let root = TempDir::new("cancelled_report");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let src = downloads.join("movie.mkv");
+    let tgt = media.join("movie.mkv");
+    write_file(&src, b"same-content");
+    write_file(&tgt, b"same-content");
+    let src_inode = fs::metadata(&src).expect("meta").ino();
+    let config = make_config(&downloads, &media, 0);
+    // The scan caches both hashes, so the reviewed row is planned from the
+    // cache and the cancel is first seen when linking starts.
+    run_scan(&config, true, false, None);
+    let cancel = CancelToken::default();
+    cancel.cancel();
+    let pairs = [(src.clone(), tgt.clone())];
+    let report = root.join("report.json");
+
+    let end = run_scan_with_options(
+        &config,
+        ScanRunOptions {
+            only_pairs: &pairs,
+            cancel,
+            report_path: Some(&report),
+            ..ScanRunOptions::for_test(false)
+        },
+    )
+    .expect("a link cancelled partway returns how it ended");
+
+    assert_eq!(end, RunEnd::Cancelled);
+    assert_eq!(fs::metadata(&src).expect("meta").ino(), src_inode);
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("report")).expect("parse report");
+    assert_eq!(report["outcome"], "cancelled");
+    assert_eq!(report["applied_actions"], 0);
+    assert_eq!(report["freed_bytes"], 0);
+    assert_eq!(report["entries"][0]["status"], "planned");
 }
 
 #[test]

@@ -21,7 +21,17 @@ impl TempDir {
     /// A new, empty folder named after `prefix`, the process and a counter,
     /// so tests running at once never share one.
     pub fn new(prefix: &str) -> Self {
-        let path = unique_temp_path(prefix);
+        Self::at(unique_temp_path(prefix))
+    }
+
+    /// The same under `parent`, such as `/dev/shm` for a folder on another
+    /// filesystem than the system's temp folder.
+    pub fn new_in(parent: &Path, prefix: &str) -> Self {
+        let name = unique_temp_path(prefix);
+        Self::at(parent.join(name.file_name().expect("a file name")))
+    }
+
+    fn at(path: PathBuf) -> Self {
         std::fs::create_dir_all(&path)
             .unwrap_or_else(|err| panic!("create temp dir {}: {err}", path.display()));
         TempDir { path }

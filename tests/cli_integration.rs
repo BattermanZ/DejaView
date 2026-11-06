@@ -2082,3 +2082,93 @@ fn a_quiet_run_says_how_many_downloads_became_symlinks() {
         )
     );
 }
+
+/// A download on another filesystem than its library file cannot be
+/// hardlinked to it, so it becomes a relative symlink, and the report says
+/// so and why. Runs where /dev/shm is a filesystem of its own, as on CI.
+#[test]
+fn a_download_on_another_filesystem_becomes_a_symlink_and_says_why() {
+    let root = TempDir::new("cross_device");
+    let media = root.join("media");
+    write_seeded(&media.join("Movies/movie.mkv"), 5000, 1);
+    let shm = Path::new("/dev/shm");
+    if !shm.is_dir()
+        || fs::metadata(shm).expect("shm").dev() == fs::metadata(&media).expect("media").dev()
+    {
+        return;
+    }
+    let other = TempDir::new_in(shm, "cross_device_downloads");
+    let downloads = other.join("downloads");
+    let download = downloads.join("Movie.2020/movie.mkv");
+    // Written apart, as a download and its import are: files written within
+    // one tick of the kernel's clock share their timestamps to the
+    // nanosecond, and across two devices that is how one file seen through
+    // two mounts looks, which is left alone.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    write_seeded(&download, 5000, 1);
+    configure_small_files(&root, &downloads, &media);
+
+    let out = run_cmd(&root, &["link", "--json", "--no-progress"]);
+    assert!(
+        out.status.success(),
+        "a fallback is not a failure: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("report");
+    let entry = &report["entries"][0];
+    assert_eq!(entry["status"], "applied", "{report:#}");
+    assert_eq!(entry["method"], "symlink");
+    assert!(
+        entry["fallback_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with("cross-device")),
+        "{entry}"
+    );
+    assert_eq!(report["symlinked"], 1);
+    assert_eq!(report["freed_bytes"], 5000);
+
+    let link = fs::read_link(&download).expect("the download is a symlink");
+    assert!(link.is_relative(), "{}", link.display());
+    assert_eq!(
+        fs::canonicalize(&download).expect("it resolves"),
+        fs::canonicalize(media.join("Movies/movie.mkv")).expect("library file")
+    );
+}
+
+/// A cache file that is not JSON is named in the log with the reason, the
+/// scan carries on as with no cache, and the cache is written again whole.
+#[test]
+fn a_cache_that_cannot_be_parsed_is_logged_and_replaced() {
+    let root = TempDir::new("corrupt_cache");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("a.mkv"), 5000, 1);
+    write_seeded(&media.join("a.mkv"), 5000, 1);
+    configure_small_files(&root, &downloads, &media);
+    let cache = downloads.join(".dejaview_cache.json");
+    fs::write(&cache, b"{\"downloads/a.mkv\": {\"size\": ").expect("write a cut-off cache");
+    let log = root.join("dejaview.log");
+
+    let out = run_cmd_env(&root, &["scan", "--no-progress"], &[("DEJAVIEW_LOG", &log)]);
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let logged = fs::read_to_string(&log).expect("read log");
+    assert!(
+        logged.contains("level=WARN")
+            && logged.contains("cannot be parsed")
+            && logged.contains(&cache.display().to_string()),
+        "{logged}"
+    );
+    let rewritten: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cache).expect("read cache")).expect("valid JSON again");
+    let keys: Vec<_> = rewritten
+        .as_object()
+        .expect("an object")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(keys, ["downloads/a.mkv", "media/a.mkv"]);
+}
