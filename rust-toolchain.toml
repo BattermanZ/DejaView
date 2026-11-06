@@ -1,0 +1,8 @@
+# The Rust that builds, lints and tests DejaView, here and in CI, so a new
+# stable release cannot fail an unrelated change through a new lint. Move it
+# on purpose, in a change of its own. The oldest Rust that must still build
+# DejaView is `rust-version` in Cargo.toml, which CI checks too.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

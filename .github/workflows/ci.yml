@@ -16,9 +16,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # The Rust rust-toolchain.toml pins, with rustfmt and clippy, so a new
+      # stable release cannot fail this job through a new lint.
+      - name: Install Rust
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -27,3 +28,19 @@ jobs:
         run: just check
       - name: Test
         run: just test
+
+  msrv:
+    name: build on the oldest supported Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The oldest Rust DejaView supports is rust-version in Cargo.toml.
+      - name: Install the rust-version from Cargo.toml
+        run: |
+          msrv="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          [ -n "$msrv" ] || { echo "::error::no rust-version in Cargo.toml"; exit 1; }
+          rustup toolchain install "$msrv" --profile minimal
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo "+$MSRV" check --locked --all-targets

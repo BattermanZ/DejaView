@@ -23,3 +23,9 @@ dirs = "7.0"
 ratatui = "0.30"
 crossterm = "0.29"
 ctrlc = { version = "3.5.2", features = ["termination"] }
+
+# Release binaries are shipped as they are built: no debug symbols, and
+# thin LTO for a smaller, faster binary without fat LTO's build time.
+[profile.release]
+strip = true
+lto = "thin"

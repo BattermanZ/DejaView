@@ -53,10 +53,24 @@ What it is not:
 
 ## Quick start
 
-You need a Rust toolchain ([rustup](https://rustup.rs/)). From a clone of this repository:
+Each [release](https://github.com/BattermanZ/DejaView/releases/latest) has a static Linux binary for `x86_64` (most PCs and NAS boxes) and `aarch64` (a Raspberry Pi, an ARM NAS). Static means it needs no library from the system, so it runs on any distribution and in an empty container. Download the archive for your machine and `SHA256SUMS` into one folder, then check, unpack and install it, with the release's version in place of `v0.1.0`:
 
 ```bash
-cargo install --path .
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+```bash
+tar -xzf dejaview-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+```
+
+```bash
+sudo install dejaview-v0.1.0-x86_64-unknown-linux-musl/dejaview /usr/local/bin/
+```
+
+To build it instead, you need Rust 1.89 or newer ([rustup](https://rustup.rs/)). From a clone of this repository:
+
+```bash
+cargo install --locked --path .
 ```
 
 Point DejaView at your two folders:
@@ -127,7 +141,7 @@ For a cron job, give the binary's absolute path (cron's `PATH` is short), run wi
 
 ```bash
 # Every night at 03:17. The report stays at <downloads>/.dejaview_link_report.json.
-17 3 * * * out=$(/home/me/.cargo/bin/dejaview link --quiet 2>&1); [ "$?" -ne 3 ] && [ -n "$out" ] && echo "$out"
+17 3 * * * out=$(/usr/local/bin/dejaview link --quiet 2>&1); [ "$?" -ne 3 ] && [ -n "$out" ] && echo "$out"
 ```
 
 A quiet run prints a line only when it linked something or something failed, and the line prints it unless the run exited with 3, so cron mails only on a night something happened. The report and the log keep the rest, such as symlinks into the library that no longer resolve.
@@ -282,14 +296,22 @@ Files whose name starts with `.dejaview_` are never treated as duplicates.
 
 ## Development
 
+`rust-toolchain.toml` pins the Rust that builds, lints and tests DejaView, and rustup installs it on the first `cargo` command in the repository. Every check runs through [`just`](https://github.com/casey/just), as CI runs it:
+
 ```bash
-cargo test
+just check
 ```
+
+```bash
+just test
+```
+
+`just check` is `cargo fmt --check` and clippy with warnings as errors; `just test` runs every test, and under root runs the unit tests a second time as `nobody`. CI also builds with the oldest Rust DejaView supports, `rust-version` in `Cargo.toml`, and checks the dependencies against the RustSec advisories every week. A `v*` tag builds the release binaries.
 
 An ignored performance harness times a cold and a warm scan on generated datasets:
 
 ```bash
-cargo test --release --test perf_harness -- --ignored --nocapture
+just perf
 ```
 
 Each profile has a time limit you can tighten with `DEJAVIEW_PERF_SMALL_COLD_MS`, `DEJAVIEW_PERF_SMALL_WARM_MS`, and the matching `MEDIUM` and `LARGE` variables (milliseconds).
