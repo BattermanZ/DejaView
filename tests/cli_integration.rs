@@ -960,14 +960,12 @@ fn config_validate_tries_a_real_hardlink() {
     if shm.is_dir()
         && fs::metadata(shm).expect("shm").dev() != fs::metadata(&media).expect("media").dev()
     {
-        let other = shm.join(format!("dejaview_validate_{}", std::process::id()));
-        fs::create_dir_all(&other).expect("create shm downloads");
+        let other = TempDir::new_in(shm, "validate_downloads");
         run_ok(
             &root,
             &["config", "set-downloads", other.to_str().expect("str")],
         );
         let out = run_cmd(&root, &["config", "validate"]);
-        let _ = fs::remove_dir_all(&other);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(

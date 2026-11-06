@@ -3,7 +3,6 @@
 //! there is one copy of each.
 #![allow(dead_code)]
 
-use std::ffi::OsStr;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,10 +34,6 @@ impl TempDir {
         std::fs::create_dir_all(&path)
             .unwrap_or_else(|err| panic!("create temp dir {}: {err}", path.display()));
         TempDir { path }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 }
 
@@ -81,12 +76,6 @@ impl Deref for TempDir {
 impl AsRef<Path> for TempDir {
     fn as_ref(&self) -> &Path {
         &self.path
-    }
-}
-
-impl AsRef<OsStr> for TempDir {
-    fn as_ref(&self) -> &OsStr {
-        self.path.as_os_str()
     }
 }
 
