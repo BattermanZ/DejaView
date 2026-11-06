@@ -19,6 +19,18 @@ pub(crate) enum JobKind {
     LinkSelected(String),
 }
 
+impl JobKind {
+    /// A link run, of every reviewed row or one.
+    pub(crate) fn is_link(&self) -> bool {
+        matches!(self, JobKind::LinkAll | JobKind::LinkSelected(_))
+    }
+
+    /// What the log calls it: `Scan` or `Link`.
+    fn label(&self) -> &'static str {
+        if self.is_link() { "Link" } else { "Scan" }
+    }
+}
+
 /// The run being watched, live, and the last report.
 #[derive(Default)]
 pub(crate) struct RunState {
@@ -234,11 +246,7 @@ impl RunState {
                     self.report_before_link = None;
                     self.live_entries.clear();
                 }
-                let label = match kind {
-                    JobKind::Scan => "Scan",
-                    JobKind::LinkAll | JobKind::LinkSelected(_) => "Link",
-                };
-                let line = format!("{label} failed: {message}");
+                let line = format!("{} failed: {message}", kind.label());
                 self.latest_activity_message = Some(line.clone());
                 step.logs.push(line);
                 self.restore_reviewed_rows(&mut step);
@@ -285,7 +293,7 @@ impl RunState {
                 };
                 self.latest_activity_message = Some(line.clone());
                 step.logs.push(line);
-                if matches!(kind, JobKind::LinkAll | JobKind::LinkSelected(_)) && symlinked > 0 {
+                if kind.is_link() && symlinked > 0 {
                     step.logs.push(format!(
                         "{symlinked} of them as symlinks: each breaks if its library file is upgraded, renamed or deleted. See fallback_reason."
                     ));
@@ -295,8 +303,7 @@ impl RunState {
                         "{unreadable} file(s) or folder(s) could not be read; the log names each. Make them readable, or leave a folder out with `dejaview config set-exclude`."
                     ));
                 }
-                if matches!(kind, JobKind::LinkAll | JobKind::LinkSelected(_)) && link_failures > 0
-                {
+                if kind.is_link() && link_failures > 0 {
                     step.logs.push(format!(
                         "Link run had {link_failures} failure(s). Review failed rows for details."
                     ));
@@ -317,11 +324,7 @@ impl RunState {
         self.live_planned_actions = None;
         self.live_applied_actions = None;
         self.finish_live_run();
-        let label = match kind {
-            JobKind::Scan => "Scan",
-            JobKind::LinkAll | JobKind::LinkSelected(_) => "Link",
-        };
-        let line = format!("{label} failed: {message}");
+        let line = format!("{} failed: {message}", kind.label());
         self.latest_activity_message = Some(line.clone());
         step.logs.push(line);
         self.restore_reviewed_rows(&mut step);

@@ -423,10 +423,7 @@ impl App {
     }
 
     pub fn rows(&self) -> &[LinkReportEntry] {
-        if let Some(report) = &self.run.report {
-            return report.entries.as_slice();
-        }
-        self.run.live_entries.as_slice()
+        self.run.rows()
     }
 
     pub fn log_lines(&self) -> Vec<String> {
@@ -1073,11 +1070,10 @@ impl App {
         }
         job.cancel_requested = true;
         let _ = job.cancel.send(());
-        let message = match job.kind {
-            JobKind::Scan => "Cancelling scan; finished hashes stay cached.",
-            JobKind::LinkAll | JobKind::LinkSelected(_) => {
-                "Cancelling link; it stops before the next file."
-            }
+        let message = if job.kind.is_link() {
+            "Cancelling link; it stops before the next file."
+        } else {
+            "Cancelling scan; finished hashes stay cached."
         };
         self.run.latest_activity_message = Some(message.to_string());
         self.push_log(message.to_string());
@@ -2594,8 +2590,6 @@ mod tests {
                 .min_age,
             Some(900)
         );
-
-        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
@@ -2629,7 +2623,5 @@ mod tests {
                 .expect("save error")
                 .contains("Failed to save config")
         );
-
-        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }
