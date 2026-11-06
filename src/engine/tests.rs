@@ -83,6 +83,7 @@ fn test_root(path: &Path) -> RootId {
     RootId::of("downloads", path).unwrap_or(RootId {
         name: "downloads",
         path: path.to_path_buf(),
+        canonical: path.to_path_buf(),
         dev: u64::MAX,
         ino: u64::MAX,
     })
@@ -93,6 +94,7 @@ fn unrelated_root() -> RootId {
     RootId {
         name: "media",
         path: PathBuf::from("/nonexistent/media"),
+        canonical: PathBuf::from("/nonexistent/media"),
         dev: u64::MAX - 1,
         ino: u64::MAX - 1,
     }
@@ -269,6 +271,14 @@ fn replace_file_with_best_link_falls_back_to_symlink_on_hardlink_error() {
     assert!(fallback_reason.contains("hardlink failed"));
     assert!(fallback_reason.contains("symlink applied successfully"));
     assert!(fallback_reason.contains("temp hardlink"));
+    assert!(
+        fallback_reason.contains("simulated hardlink failure"),
+        "names the OS error: {fallback_reason}"
+    );
+    assert!(
+        fallback_reason.contains("fs.protected_hardlinks"),
+        "names the likely cause: {fallback_reason}"
+    );
     let meta = fs::symlink_metadata(&src).expect("source metadata");
     assert!(meta.file_type().is_symlink());
     assert_eq!(fs::read(&src).expect("read through symlink"), b"new");

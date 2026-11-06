@@ -57,6 +57,63 @@ pub fn ensure_roots_not_mounted_inside(
     collect::ensure_root_not_reached(&media, &downloads)
 }
 
+/// What one real hardlink from the library into downloads did.
+pub enum HardlinkProbe {
+    /// The library holds no file to try with.
+    NoFile,
+    Works {
+        file: std::path::PathBuf,
+    },
+    Fails {
+        file: std::path::PathBuf,
+        /// What a person can act on, from the OS error.
+        cause: &'static str,
+        error: String,
+    },
+}
+
+/// Hardlink the first library file found into downloads under a temp name, then
+/// remove it. This changes nothing in the library but that file's ctime, so
+/// its cache entry is read once more on the next scan.
+pub fn probe_hardlink(downloads: &std::path::Path, media: &std::path::Path) -> HardlinkProbe {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let file = walkdir::WalkDir::new(media)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_type().is_file()
+                && !entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".dejaview_"))
+        })
+        .map(walkdir::DirEntry::into_path);
+    let Some(file) = file else {
+        return HardlinkProbe::NoFile;
+    };
+    let probe = downloads.join(format!(
+        ".dejaview_validate_link.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    match std::fs::hard_link(&file, &probe) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            HardlinkProbe::Works { file }
+        }
+        Err(err) => {
+            let error = err.to_string();
+            let cause = linking::hardlink_failure_cause(&anyhow::Error::new(err))
+                .unwrap_or("the filesystem refused the hardlink");
+            HardlinkProbe::Fails { file, cause, error }
+        }
+    }
+}
+
 pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     let tui_events = options.tui_events;
     let result = run(config, options);
@@ -125,6 +182,24 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     )?;
     let files_seen = files.len();
     logger::info("run", format!("collected {} candidate files", files_seen));
+    for path in &metrics.dangling_symlinks {
+        logger::warn(
+            "scan",
+            format!(
+                "{} points into the library and no longer resolves",
+                path.display()
+            ),
+        );
+    }
+    if options.tui_events && !metrics.dangling_symlinks.is_empty() {
+        let _ = types::emit_tui_event(&TuiEvent::Log {
+            message: format!(
+                "{} symlink(s) in downloads point into the library and no longer resolve, such as {}. The report lists them.",
+                metrics.dangling_symlinks.len(),
+                metrics.dangling_symlinks[0].display()
+            ),
+        });
+    }
     if options.tui_events {
         let _ = types::emit_tui_event(&TuiEvent::Count {
             files_seen: Some(files_seen),
@@ -295,11 +370,13 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         );
     }
     if !machine_output {
+        report::print_dangling_symlinks(&metrics.dangling_symlinks);
         print_run_summary(
             files_seen,
             &metrics,
             planned_actions,
             applied_actions,
+            report::symlinked_count(&report_entries),
             &warnings,
         );
     }

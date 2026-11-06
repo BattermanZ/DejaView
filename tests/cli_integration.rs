@@ -883,3 +883,130 @@ fn library_bind_mounted_inside_downloads_is_refused() {
     drop(_downloads_mount);
     let _ = fs::remove_dir_all(&root);
 }
+
+fn configure_small_files(root: &Path, downloads: &Path, media: &Path) {
+    run_ok(
+        root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+    set_min_age_zero(root);
+}
+
+#[test]
+fn link_summary_says_how_many_downloads_became_symlinks() {
+    let root = unique_temp_dir("symlink_summary");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("a.mkv"), 5000, 1);
+    write_seeded(&media.join("a.mkv"), 5000, 1);
+    write_seeded(&downloads.join("b.mkv"), 6000, 2);
+    write_seeded(&media.join("b.mkv"), 6000, 2);
+    configure_small_files(&root, &downloads, &media);
+
+    let out = run_cmd(&root, &["link", "--symlink-only", "--no-progress"]);
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("2 of them as symlinks"), "stdout={stdout}");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn scans_list_symlinks_into_the_library_that_no_longer_resolve() {
+    let root = unique_temp_dir("dangling_symlinks");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    fs::create_dir_all(downloads.join("Show.S01")).expect("create downloads");
+    fs::create_dir_all(media.join("Show")).expect("create media");
+    // A link DejaView made, whose library file Sonarr has since upgraded away.
+    std::os::unix::fs::symlink(
+        "../../media/Show/e01.mkv",
+        downloads.join("Show.S01").join("e01.mkv"),
+    )
+    .expect("dangling symlink");
+    // A symlink pointing outside the library is none of DejaView's business.
+    std::os::unix::fs::symlink("/nonexistent/elsewhere", downloads.join("other.lnk"))
+        .expect("unrelated symlink");
+    configure_small_files(&root, &downloads, &media);
+
+    let out = run_cmd(&root, &["scan", "--json"]);
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse json");
+    let dangling = report["dangling_symlinks"]
+        .as_array()
+        .expect("dangling list");
+    assert_eq!(dangling.len(), 1, "{dangling:?}");
+    assert!(
+        dangling[0]
+            .as_str()
+            .expect("path")
+            .ends_with("Show.S01/e01.mkv")
+    );
+
+    let out = run_cmd(&root, &["scan", "--no-progress"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no longer resolve"), "stderr={stderr}");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn config_validate_tries_a_real_hardlink() {
+    let root = unique_temp_dir("validate_hardlink");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    fs::create_dir_all(&downloads).expect("create downloads");
+    write_seeded(&media.join("movie.mkv"), 5000, 1);
+    configure_small_files(&root, &downloads, &media);
+
+    let out = run_cmd(&root, &["config", "validate"]);
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("hardlinks work"), "stdout={stdout}");
+    let leftovers: Vec<_> = fs::read_dir(&downloads).expect("read").collect();
+    assert!(leftovers.is_empty(), "the probe link is removed");
+
+    // Downloads on another filesystem: the probe says why links will be symlinks.
+    let shm = Path::new("/dev/shm");
+    if shm.is_dir()
+        && fs::metadata(shm).expect("shm").dev() != fs::metadata(&media).expect("media").dev()
+    {
+        let other = shm.join(format!("dejaview_validate_{}", std::process::id()));
+        fs::create_dir_all(&other).expect("create shm downloads");
+        run_ok(
+            &root,
+            &["config", "set-downloads", other.to_str().expect("str")],
+        );
+        let out = run_cmd(&root, &["config", "validate"]);
+        let _ = fs::remove_dir_all(&other);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "a fallback is not a failure: {stderr}"
+        );
+        assert!(
+            stderr.contains("different filesystems"),
+            "stdout={stdout}\nstderr={stderr}"
+        );
+    }
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}

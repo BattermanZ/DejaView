@@ -40,6 +40,10 @@ pub struct RunReport {
     /// downloads folder reaches into the library.
     #[serde(default)]
     pub skipped_as_library_file: u64,
+    /// Symlinks in downloads that point into the library and no longer
+    /// resolve: their torrents cannot seed.
+    #[serde(default)]
+    pub dangling_symlinks: Vec<String>,
     pub warnings: WarningSummary,
     pub entries: Vec<LinkReportEntry>,
 }

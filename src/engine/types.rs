@@ -75,6 +75,8 @@ pub(super) struct RunMetrics {
     pub(super) skipped_by_min_size: u64,
     /// Downloads left alone as a library file seen through a second mount.
     pub(super) skipped_as_library_file: u64,
+    /// Symlinks in downloads that point into the library and no longer resolve.
+    pub(super) dangling_symlinks: Vec<PathBuf>,
 }
 
 #[derive(Clone)]

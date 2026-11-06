@@ -96,7 +96,7 @@ dejaview link --confirm
 | `dejaview link` | Find duplicates and replace each download copy with a link. |
 | `dejaview tui` | Open the terminal dashboard. |
 | `dejaview config show` | Print the configuration. |
-| `dejaview config validate` | Check that both folders exist and are separate, downloads is writable and media is readable. |
+| `dejaview config validate` | Check that both folders exist and are separate (also through a mount), downloads is writable and media is readable, and try one real hardlink from the library into downloads to say whether links will be hardlinks or symlinks, and why. |
 | `dejaview config set-downloads PATH` | Set the downloads folder. The path is stored resolved and absolute. |
 | `dejaview config set-media PATH` | Set the media folder. |
 | `dejaview config set-min-age SECONDS` | Skip files modified more recently than this. |
@@ -183,7 +183,7 @@ Files whose name starts with `.dejaview_` are never treated as duplicates.
 - **Check mergerfs's `inodecalc`.** DejaView recognises an existing hardlink by its inode number. The default, `inodecalc=hybrid-hash`, gives hardlinks one inode, which is what DejaView expects. With `path-hash`, every path gets its own inode, so already-linked pairs look like copies and get hashed on every run; at link time DejaView finds they are one file, changes nothing and reports them as `already-linked`. With `passthrough`, different files on different branches can report the same inode. DejaView only treats two paths as one file when their timestamps match as well, but `hybrid-hash` is the setting to use.
 - **Older mergerfs needs `use_ino`.** Versions without `inodecalc` give each path of a hardlinked file its own inode unless mounted with `use_ino`, with the same `already-linked` result on every run.
 - **`link-exdev` and `rename-exdev`.** mergerfs can answer a hardlink across disks with a symlink and report success. DejaView checks what was made and reports it as `symlink` with that reason, not as a hardlink.
-- **Hardlinks cannot cross mergerfs branches.** If the download and the library copy sit on different underlying disks, the hardlink fails and DejaView falls back to a symlink. The report shows `symlink` and the reason.
+- **Hardlinks cannot cross mergerfs branches.** If the download and the library copy sit on different underlying disks, the hardlink fails and DejaView falls back to a symlink. The report shows `symlink` and the reason, and the summary counts them. Such a symlink dangles once Sonarr or Radarr upgrades the library file; scans list those that do.
 - **Flaky connections.** If the folder walk hits errors, DejaView keeps the cache entries for paths it could not see, so a dropped connection does not force a full rehash on the next run.
 - **Docker.** Symlinks are relative, so they resolve the same inside a container as long as both folders are mounted with the same layout.
 
@@ -193,7 +193,7 @@ Files whose name starts with `.dejaview_` are never treated as duplicates.
 
 **`config validate` says the media path is inside the downloads path.** The two folders overlap, so a link run would rewrite files in your library. Point media at the library folder itself. The two can share a parent, such as `/srv/media` and `/srv/torrents`, but neither can contain the other.
 
-**`link` made symlinks instead of hardlinks.** The download and the library file are on different filesystems, or on different mergerfs branches. The `fallback_reason` field in the link report says which.
+**`link` made symlinks instead of hardlinks.** The summary says how many, and each entry's `fallback_reason` in the link report gives the cause and the OS error: different filesystems or mounts (two mergerfs disks, two Docker volumes), or not permitted (the library file belongs to another user and `fs.protected_hardlinks` lets only its owner hardlink it). `dejaview config validate` tries one real hardlink and says the same. A symlink breaks when Sonarr or Radarr upgrades, renames or deletes its library file; every scan and link lists the symlinks in downloads that point into the library and no longer resolve (`dangling_symlinks` in the `--json` report).
 
 **A pair failed with "could no longer read".** The library file belongs to another user and is closed to the download's owner or group, so after linking the torrent client could not read its own file. Give the torrent client and Sonarr or Radarr a shared group and group-readable files (umask 002), or make the library world-readable, then run again. ACLs and SELinux labels are not compared: in Docker with SELinux, a `:Z` label on the library mount relabels files the downloads container may then not read, so use `:z` on both.
 

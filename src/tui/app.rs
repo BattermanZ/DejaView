@@ -1009,6 +1009,13 @@ impl App {
                 let planned = report.planned_actions;
                 let applied = report.applied_actions;
                 let link_failures = report.warnings.link_errors;
+                let symlinked = report
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.status == "applied" && entry.method.as_deref() == Some("symlink")
+                    })
+                    .count();
                 self.selected_row = 0;
                 self.current_path = None;
                 self.active_workers.clear();
@@ -1028,6 +1035,11 @@ impl App {
                     JobKind::LinkSelected(_) => self.push_log(format!(
                         "Selected link finished. Applied actions: {applied}"
                     )),
+                }
+                if matches!(kind, JobKind::LinkAll | JobKind::LinkSelected(_)) && symlinked > 0 {
+                    self.push_log(format!(
+                        "{symlinked} of them as symlinks: each breaks if its library file is upgraded, renamed or deleted. See fallback_reason."
+                    ));
                 }
                 if matches!(kind, JobKind::LinkAll | JobKind::LinkSelected(_)) && link_failures > 0
                 {
@@ -1236,6 +1248,7 @@ mod tests {
             skipped_by_min_age: 0,
             skipped_by_min_size: 0,
             skipped_as_library_file: 0,
+            dangling_symlinks: Vec::new(),
             warnings: WarningSummary {
                 walk_errors: 0,
                 metadata_errors: 0,
@@ -1265,6 +1278,7 @@ mod tests {
             skipped_by_min_age: 0,
             skipped_by_min_size: 0,
             skipped_as_library_file: 0,
+            dangling_symlinks: Vec::new(),
             warnings: WarningSummary {
                 walk_errors: 0,
                 metadata_errors: 0,
@@ -1741,6 +1755,7 @@ mod tests {
             skipped_by_min_age: 0,
             skipped_by_min_size: 0,
             skipped_as_library_file: 0,
+            dangling_symlinks: Vec::new(),
             warnings: WarningSummary {
                 walk_errors: 0,
                 metadata_errors: 0,
@@ -1792,6 +1807,7 @@ mod tests {
                 skipped_by_min_age: 0,
                 skipped_by_min_size: 0,
                 skipped_as_library_file: 0,
+                dangling_symlinks: Vec::new(),
                 warnings: WarningSummary {
                     walk_errors: 0,
                     metadata_errors: 0,

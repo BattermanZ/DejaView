@@ -42,6 +42,8 @@ fn is_own_file(entry: &DirEntry) -> bool {
 pub(super) struct RootId {
     pub(super) name: &'static str,
     pub(super) path: PathBuf,
+    /// The path with symlinks resolved, or the path itself if it cannot be.
+    pub(super) canonical: PathBuf,
     pub(super) dev: u64,
     pub(super) ino: u64,
 }
@@ -53,10 +55,47 @@ impl RootId {
         Ok(RootId {
             name,
             path: path.to_path_buf(),
+            canonical: fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
             dev: meta.dev(),
             ino: meta.ino(),
         })
     }
+
+    fn contains(&self, path: &Path) -> bool {
+        path.starts_with(&self.path) || path.starts_with(&self.canonical)
+    }
+}
+
+/// `base` joined with `rel`, with `.` and `..` worked out on the text alone:
+/// a dangling symlink's destination cannot be resolved on disk.
+fn lexical_join(base: &Path, rel: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in base.join(rel).components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// A symlink in downloads that points into the library and no longer resolves:
+/// most likely a link DejaView made whose library file Sonarr or Radarr has
+/// since upgraded, renamed or deleted, so its torrent cannot seed.
+fn is_dangling_link_into(entry: &DirEntry, media: &RootId) -> bool {
+    if !entry.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(dest) = fs::read_link(entry.path()) else {
+        return false;
+    };
+    let parent = entry.path().parent().unwrap_or(Path::new("/"));
+    media.contains(&lexical_join(parent, &dest))
+        && matches!(fs::metadata(entry.path()), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Refuse a directory that is the other root seen through a second mount.
@@ -123,6 +162,10 @@ pub(super) fn collect_files(
         };
         if entry.file_type().is_dir() {
             ensure_not_other_root(entry.path(), root, other_root)?;
+            continue;
+        }
+        if in_downloads && is_dangling_link_into(&entry, other_root) {
+            metrics.dangling_symlinks.push(entry.path().to_path_buf());
             continue;
         }
         if !is_regular(&entry) || is_own_file(&entry) {

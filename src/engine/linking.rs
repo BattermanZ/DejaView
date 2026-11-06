@@ -220,6 +220,32 @@ fn ensure_link_keeps_read_access(src: &Path, tgt: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What a person reads when the download and the library file are on
+/// different devices, so no hardlink can join them.
+pub(super) const CROSS_DEVICE_REASON: &str = "cross-device: the download and the library file are on different filesystems or mounts, so no hardlink is possible";
+
+/// Why a hardlink failed, in words a person can act on, read from the OS error
+/// in the chain. None when no OS error is there.
+pub(super) fn hardlink_failure_cause(err: &anyhow::Error) -> Option<&'static str> {
+    use std::io::ErrorKind;
+    let io = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())?;
+    Some(match io.kind() {
+        ErrorKind::CrossesDevices => {
+            "different filesystems: the two files are on different disks or mounts, such as two mergerfs branches or two Docker volumes"
+        }
+        ErrorKind::PermissionDenied => {
+            "not permitted: the library file belongs to another user and fs.protected_hardlinks lets only its owner hardlink it, or the download's folder is not writable"
+        }
+        ErrorKind::ReadOnlyFilesystem => "the filesystem is mounted read-only",
+        ErrorKind::TooManyLinks => {
+            "the library file has as many hardlinks as its filesystem allows"
+        }
+        _ => "the filesystem refused the hardlink",
+    })
+}
+
 /// The downloads and media roots, resolved once per run.
 pub(super) struct CanonicalRoots {
     pub(super) downloads: PathBuf,
@@ -501,7 +527,10 @@ where
     })();
     result.map_err(|err| {
         let note = clean_up_temp(&tmp, "hardlink", req.src);
-        anyhow!("{err:#}; {note}")
+        match hardlink_failure_cause(&err) {
+            Some(cause) => anyhow!("{cause}. {err:#}; {note}"),
+            None => anyhow!("{err:#}; {note}"),
+        }
     })
 }
 
@@ -566,7 +595,7 @@ where
                 tgt.display()
             ),
         );
-        Some("cross-device; hardlink not possible".to_string())
+        Some(CROSS_DEVICE_REASON.to_string())
     };
 
     replace_with_symlink(&dir, req, &rename_fn)?;

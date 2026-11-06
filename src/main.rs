@@ -421,6 +421,9 @@ fn validate_config(config: &config::Config) -> Result<()> {
     }
 
     if failures.is_empty() {
+        if let (Some(downloads), Some(media)) = (&config.downloads, &config.media) {
+            report_hardlink_probe(downloads, media);
+        }
         println!("{} Configuration is valid.", "✔".green());
         Ok(())
     } else {
@@ -428,6 +431,27 @@ fn validate_config(config: &config::Config) -> Result<()> {
             eprintln!("{} {}", "✖".red(), failure);
         }
         Err(anyhow::anyhow!("configuration validation failed"))
+    }
+}
+
+/// Try one real hardlink and say what link runs will do. A failure is not a
+/// validation failure: the symlink fallback is the default (ADR 0001), but the
+/// person should know which cause applies and whether they can fix it.
+fn report_hardlink_probe(downloads: &std::path::Path, media: &std::path::Path) {
+    match engine::probe_hardlink(downloads, media) {
+        engine::HardlinkProbe::NoFile => {
+            println!("{} No library file to try a hardlink with yet.", "ℹ".cyan())
+        }
+        engine::HardlinkProbe::Works { file } => println!(
+            "{} A test hardlink of {} into downloads worked: hardlinks work, so link runs free space. On a mergerfs pool this tried one disk; files on others can still fall back to symlinks.",
+            "✔".green(),
+            file.display()
+        ),
+        engine::HardlinkProbe::Fails { file, cause, error } => eprintln!(
+            "{} A test hardlink of {} into downloads failed: {cause} ({error}). Link runs will make symlinks instead, and each breaks if Sonarr or Radarr upgrades, renames or deletes its library file.",
+            "⚠".yellow(),
+            file.display()
+        ),
     }
 }
 
