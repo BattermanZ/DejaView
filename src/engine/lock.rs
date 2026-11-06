@@ -99,20 +99,8 @@ pub fn acquire(downloads: &Path) -> Result<RunLock> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    fn temp_downloads(prefix: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "dejaview_lock_{prefix}_{}_{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("create dir");
-        dir
-    }
+    use crate::test_common::TempDir;
+    use std::time::Duration;
 
     fn hold(dir: &Path) -> File {
         let file = OpenOptions::new()
@@ -128,7 +116,7 @@ mod tests {
 
     #[test]
     fn a_lock_released_a_moment_later_is_taken() {
-        let dir = temp_downloads("brief");
+        let dir = TempDir::new("lock_brief");
         let held = hold(&dir);
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(60));
@@ -136,29 +124,26 @@ mod tests {
         });
         assert!(acquire(&dir).is_ok(), "waits out a release in progress");
         releaser.join().expect("releaser");
-        fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
     fn a_lock_still_held_is_reported_as_held() {
-        let dir = temp_downloads("held");
+        let dir = TempDir::new("lock_held");
         let _held = hold(&dir);
         let err = acquire(&dir).err().expect("held lock refuses");
         assert!(err.is::<LockHeld>(), "{err}");
-        fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
     fn a_lock_file_this_user_cannot_write_still_locks() {
         // Root made it 0644 on an earlier run; a run as another user can still
         // read it, which is all a lock needs.
-        let dir = temp_downloads("read_only");
+        let dir = TempDir::new("lock_read_only");
         let path = dir.join(LOCK_FILE);
         fs::write(&path, b"").expect("create lock file");
         let mut perms = fs::metadata(&path).expect("meta").permissions();
         perms.set_readonly(true);
         fs::set_permissions(&path, perms).expect("chmod 0444");
         assert!(acquire(&dir).is_ok());
-        fs::remove_dir_all(&dir).expect("cleanup");
     }
 }

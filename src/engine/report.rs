@@ -304,28 +304,6 @@ pub(super) fn planned_bytes(actions: &[LinkAction]) -> u64 {
         .sum()
 }
 
-/// `time` in UTC as RFC 3339, to the second: `2026-11-06T03:17:00Z`.
-pub(super) fn rfc3339_utc(time: std::time::SystemTime) -> String {
-    let secs = time
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
-    let (days, rest) = (secs / 86_400, secs % 86_400);
-    let (hour, minute, second) = (rest / 3600, rest % 3600 / 60, rest % 60);
-    // Days since 1970-01-01 to a civil date, by the well-known
-    // civil-from-days algorithm; every value here is non-negative.
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + u64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
 pub(super) fn build_report_entries(
     actions: &[LinkAction],
     link_mode: LinkMode,
@@ -369,8 +347,8 @@ pub(super) fn build_run_report(options: &ScanRunOptions<'_>, input: RunReportInp
         },
         outcome: input.outcome,
         version: env!("CARGO_PKG_VERSION").to_string(),
-        started_at: rfc3339_utc(input.started_at),
-        finished_at: rfc3339_utc(std::time::SystemTime::now()),
+        started_at: crate::human::rfc3339_utc(input.started_at),
+        finished_at: crate::human::rfc3339_utc(std::time::SystemTime::now()),
         downloads: input.downloads.display().to_string(),
         media: input.media.display().to_string(),
         link_mode: options.link_mode,

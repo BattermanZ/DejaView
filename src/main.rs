@@ -84,7 +84,9 @@ enum Commands {
         #[arg(long)]
         strict: bool,
     },
-    /// Preview the dashboard's logo
+    /// Preview the dashboard's logo, to judge it in a real terminal
+    // Left out of --help: it is for working on the dashboard.
+    #[command(hide = true)]
     TuiLogoPreview,
 }
 

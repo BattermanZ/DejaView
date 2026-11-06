@@ -2627,7 +2627,7 @@ fn a_report_says_when_and_how_its_run_ended() {
 
 #[test]
 fn report_times_are_rfc_3339_in_utc() {
-    let at = |secs| super::report::rfc3339_utc(UNIX_EPOCH + Duration::from_secs(secs));
+    let at = |secs| crate::human::rfc3339_utc(UNIX_EPOCH + Duration::from_secs(secs));
     assert_eq!(at(0), "1970-01-01T00:00:00Z");
     assert_eq!(at(951_782_400), "2000-02-29T00:00:00Z");
     assert_eq!(at(1_762_399_020), "2025-11-06T03:17:00Z");

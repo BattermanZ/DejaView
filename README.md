@@ -226,6 +226,8 @@ Cancelling a scan stops it almost at once, even partway through a large file, an
 
 The configuration lives in `~/.config/dejaview/config.json` (under `$XDG_CONFIG_HOME` when that is set). Change it with the `config` commands rather than by hand.
 
+On macOS the config and the log are both in `~/Library/Application Support/dejaview/`, and the `XDG_` variables are not read; `DEJAVIEW_CONFIG` and `DEJAVIEW_LOG` below still move them. DejaView builds on macOS, but only Linux is tested.
+
 Two environment variables move DejaView's own files, for a container or a service run as a user with no home folder:
 
 | Variable | Effect |
@@ -254,7 +256,7 @@ If the log cannot be written, DejaView warns once, naming the path, and runs wit
 | `<downloads>/.dejaview_link_report.json` | Every link run without `--report` that planned something. |
 | `<downloads>/.dejaview_tui_report.json` | When you press `R` in the dashboard. |
 | `<downloads>/.dejaview_lock` | Every scan, link and `cache cleanup-temp`, which lock it while they run. It stays, empty; deleting it between runs is harmless. |
-| `~/.local/state/dejaview/dejaview.log` | Every command (under `$XDG_STATE_HOME` when set, or at `$DEJAVIEW_LOG`). Once it passes 5 MiB it moves to `dejaview.log.1`, replacing the previous one, so the two together stay near 10 MiB. |
+| `~/.local/state/dejaview/dejaview.log` | Every command (under `$XDG_STATE_HOME` when set, or at `$DEJAVIEW_LOG`), one line per entry, stamped in UTC: `ts=2026-11-06T03:17:00.123Z level=WARN run=… op=cache msg="…"`. Once it passes 5 MiB it moves to `dejaview.log.1`, replacing the previous one, so the two together stay near 10 MiB. |
 
 Files whose name starts with `.dejaview_` are never treated as duplicates.
 
@@ -316,7 +318,7 @@ just perf
 
 Each profile has a time limit you can tighten with `DEJAVIEW_PERF_SMALL_COLD_MS`, `DEJAVIEW_PERF_SMALL_WARM_MS`, and the matching `MEDIUM` and `LARGE` variables (milliseconds).
 
-`dejaview tui-logo-preview` shows the dashboard's logo on its own, to judge it in a real terminal and font.
+`dejaview tui-logo-preview`, which `--help` leaves out, shows the dashboard's logo on its own, to judge it in a real terminal and font.
 
 ## License
 
