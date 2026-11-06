@@ -8,3 +8,9 @@
 
 # CodeGraph local index (machine-local, do not commit)
 .codegraph/
+
+# Machine-local agent context: one host's working preferences, not project convention
+AGENTS.local.md
+
+# Dev state from `just sandbox` and `just try`: the scratch library, config and log
+.dev/
