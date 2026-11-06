@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::config::{Config, load_config, save_config, validate_runtime_paths};
 use crate::engine::LinkMode;
-use crate::fsutil::normalize_runtime_dir;
+use crate::fsutil::{expand_home, normalize_runtime_dir};
 use crate::protocol::PlannedPair;
 
 use super::actions;
@@ -23,6 +23,8 @@ pub enum Overlay {
     JsonPreview(String),
     ConfigEditor(ConfigEditor),
     ConfirmLink(ConfirmLinkMode),
+    /// Clear the cache and scan again: every file is read again.
+    ConfirmRescan,
     BlockingNotice(String),
 }
 
@@ -71,9 +73,23 @@ impl RunningJob {
     }
 }
 
+/// What the last frame drawn had room for, which paging and scrolling go
+/// by. The view sets it as it draws.
+#[derive(Default)]
+pub struct ViewSizes {
+    /// Result rows the table shows at once.
+    pub result_rows: std::cell::Cell<usize>,
+    /// Lines an open Help or JSON overlay shows at once, and has in all.
+    pub overlay_rows: std::cell::Cell<usize>,
+    pub overlay_lines: std::cell::Cell<usize>,
+}
+
 pub struct App {
     pub strict: bool,
     selected_row: usize,
+    /// How far an open Help or JSON overlay is scrolled, in lines.
+    overlay_scroll: usize,
+    view: ViewSizes,
     pub overlay: Overlay,
     report: Option<RunReport>,
     /// The reviewed report, put aside while a link runs: restored if the run
@@ -98,6 +114,10 @@ pub struct App {
     live_applied_actions: Option<usize>,
     hash_progress_done: Option<usize>,
     hash_progress_total: Option<usize>,
+    /// Bytes the full pass has read, of all it will read, and when it began:
+    /// speed and time left come from them.
+    hash_bytes: Option<(u64, u64)>,
+    full_pass_started_at: Option<Instant>,
     active_workers: BTreeMap<usize, String>,
     job_started_at: Option<Instant>,
     last_run_duration: Option<Duration>,
@@ -112,6 +132,8 @@ impl App {
         Self {
             strict,
             selected_row: 0,
+            overlay_scroll: 0,
+            view: ViewSizes::default(),
             overlay: Overlay::None,
             report: None,
             report_before_link: None,
@@ -134,6 +156,8 @@ impl App {
             live_applied_actions: None,
             hash_progress_done: None,
             hash_progress_total: None,
+            hash_bytes: None,
+            full_pass_started_at: None,
             active_workers: BTreeMap::new(),
             job_started_at: None,
             last_run_duration: None,
@@ -191,10 +215,7 @@ impl App {
             .or_else(|| {
                 self.report.as_ref().map(|r| {
                     if r.mode == "link" {
-                        r.entries
-                            .iter()
-                            .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
-                            .count()
+                        r.entries.iter().filter(|entry| entry.is_planned()).count()
                     } else {
                         r.planned_actions
                     }
@@ -208,10 +229,7 @@ impl App {
             .or_else(|| {
                 self.report.as_ref().map(|r| {
                     if r.mode == "link" {
-                        r.entries
-                            .iter()
-                            .filter(|entry| entry.status.eq_ignore_ascii_case("applied"))
-                            .count()
+                        r.entries.iter().filter(|entry| entry.is_applied()).count()
                     } else {
                         r.applied_actions
                     }
@@ -220,21 +238,13 @@ impl App {
             .unwrap_or(0)
     }
 
+    /// What link runs freed: a download's bytes come back only once its
+    /// last path is replaced, which the run counts as it links.
     pub fn saved_bytes(&self) -> u64 {
         self.report
             .as_ref()
-            .map(|report| {
-                if report.mode != "link" {
-                    return 0;
-                }
-                report
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.status.eq_ignore_ascii_case("applied"))
-                    .map(|entry| entry.size)
-                    .sum()
-            })
-            .unwrap_or(0)
+            .filter(|report| report.mode == "link")
+            .map_or(0, |report| report.freed_bytes)
     }
 
     pub fn potential_saved_bytes(&self) -> u64 {
@@ -248,7 +258,7 @@ impl App {
                     report
                         .entries
                         .iter()
-                        .filter(|entry| !entry.status.eq_ignore_ascii_case("applied"))
+                        .filter(|entry| !entry.is_applied())
                         .map(|entry| entry.size)
                         .sum()
                 } else {
@@ -268,6 +278,14 @@ impl App {
 
     pub fn overlay(&self) -> &Overlay {
         &self.overlay
+    }
+
+    pub fn overlay_scroll(&self) -> usize {
+        self.overlay_scroll
+    }
+
+    pub fn view_sizes(&self) -> &ViewSizes {
+        &self.view
     }
 
     pub fn config_editor(&self) -> Option<&ConfigEditor> {
@@ -291,6 +309,16 @@ impl App {
             .unwrap_or_else(|| "<not set>".to_string())
     }
 
+    /// The downloads folder, which the table shows each download below.
+    pub fn downloads_root(&self) -> Option<&std::path::Path> {
+        self.downloads.as_deref()
+    }
+
+    /// The media folder, which the table shows each library file below.
+    pub fn media_root(&self) -> Option<&std::path::Path> {
+        self.media.as_deref()
+    }
+
     pub fn min_age_secs(&self) -> u64 {
         self.min_age.unwrap_or(0)
     }
@@ -300,11 +328,8 @@ impl App {
         self.report
             .iter()
             .flat_map(|report| &report.entries)
-            .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
-            .map(|entry| PlannedPair {
-                source: entry.source.clone(),
-                target: entry.target.clone(),
-            })
+            .filter(|entry| entry.is_planned())
+            .map(PlannedPair::of)
             .collect()
     }
 
@@ -362,7 +387,14 @@ impl App {
         if self.running_job.is_some() {
             if let (Some(done), Some(total)) = (self.hash_progress_done, self.hash_progress_total) {
                 return match self.current_phase.as_deref() {
-                    Some("hashing_full") => format!("{done} / {total} duplicate files verified"),
+                    Some("hashing_full") => {
+                        let mut label = format!("{done} / {total} duplicate files verified");
+                        if let Some(bytes) = self.full_pass_progress() {
+                            label.push_str("  |  ");
+                            label.push_str(&bytes);
+                        }
+                        label
+                    }
                     _ => format!("{done} / {total} files hashed"),
                 };
             }
@@ -396,6 +428,26 @@ impl App {
             self.planned_actions(),
             self.applied_actions()
         )
+    }
+
+    /// How far the full pass has read, how fast and how long it has left:
+    /// `12.3 GiB of 40.0 GiB  |  150.0 MiB/s  |  ETA 03:05`. Speed and time
+    /// left wait for a second of reading.
+    fn full_pass_progress(&self) -> Option<String> {
+        let (done, total) = self.hash_bytes?;
+        let format_bytes = super::view::format_bytes;
+        let mut label = format!("{} of {}", format_bytes(done), format_bytes(total));
+        let elapsed = self.full_pass_started_at?.elapsed();
+        if elapsed >= Duration::from_secs(1) && done > 0 {
+            let rate = done as f64 / elapsed.as_secs_f64();
+            let left = Duration::from_secs_f64(total.saturating_sub(done) as f64 / rate);
+            label.push_str(&format!(
+                "  |  {}/s  |  ETA {}",
+                format_bytes(rate as u64),
+                format_duration(left)
+            ));
+        }
+        Some(label)
     }
 
     pub fn last_log_line(&self) -> String {
@@ -460,13 +512,14 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
                     self.overlay = Overlay::None
                 }
-                _ => {}
+                _ => self.scroll_overlay(code),
             },
+            // j scrolls, as in the table; J, which opened it, closes it.
             Overlay::JsonPreview(_) => match code {
-                KeyCode::Esc | KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Char('q') => {
+                KeyCode::Esc | KeyCode::Char('J') | KeyCode::Char('q') => {
                     self.overlay = Overlay::None
                 }
-                _ => {}
+                _ => self.scroll_overlay(code),
             },
             Overlay::ConfigEditor(_) => self.handle_config_editor_key(code)?,
             Overlay::ConfirmLink(mode) => match code {
@@ -476,7 +529,7 @@ impl App {
                         ConfirmLinkMode::All => self.start_link_job(),
                         ConfirmLinkMode::Selected => {
                             if let Err(err) = self.start_selected_link_job() {
-                                self.push_log(format!("Selected link failed: {err}"));
+                                self.push_log(format!("Selected link failed: {err:#}"));
                             }
                         }
                     }
@@ -484,6 +537,19 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
                     self.overlay = Overlay::None;
                     self.push_log("Link run cancelled.".to_string());
+                }
+                _ => {}
+            },
+            Overlay::ConfirmRescan => match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.overlay = Overlay::None;
+                    if let Err(err) = self.start_rescan_job() {
+                        self.push_log(format!("Rescan failed: {err:#}"));
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
+                    self.overlay = Overlay::None;
+                    self.push_log("Rescan cancelled; the cache is kept.".to_string());
                 }
                 _ => {}
             },
@@ -503,16 +569,27 @@ impl App {
     fn handle_main_key(&mut self, code: KeyCode) -> Result<()> {
         match code {
             KeyCode::Char('q') => self.request_quit(),
-            KeyCode::Char('?') => self.overlay = Overlay::Help,
+            KeyCode::Char('?') => {
+                self.overlay_scroll = 0;
+                self.overlay = Overlay::Help;
+            }
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::PageDown => self.move_selection(self.page_rows()),
+            KeyCode::PageUp => self.move_selection(-self.page_rows()),
+            KeyCode::Home | KeyCode::Char('g') => self.move_selection(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => self.move_selection(isize::MAX / 2),
             KeyCode::Char('p') => self.toggle_path_mode(),
             KeyCode::Char('c') => self.request_cancel(),
             KeyCode::Char('e') => self.open_config_editor(),
             KeyCode::Char('S') | KeyCode::Char('s') => self.start_scan_job(),
+            // Clearing the cache costs a read of every file, hours on a
+            // network drive, and x sits next to c: ask first.
             KeyCode::Char('X') | KeyCode::Char('x') => {
-                if let Err(err) = self.start_rescan_job() {
-                    self.push_log(format!("Rescan failed: {err}"));
+                if self.running_job.is_some() {
+                    self.push_log("A run is already in progress.".to_string());
+                } else if self.paths_are_set_or_ask() {
+                    self.overlay = Overlay::ConfirmRescan;
                 }
             }
             KeyCode::Char('L') => {
@@ -528,7 +605,7 @@ impl App {
             KeyCode::Char('l') => {
                 if self
                     .selected_entry()
-                    .is_some_and(|entry| entry.status.eq_ignore_ascii_case("planned"))
+                    .is_some_and(|entry| entry.is_planned())
                 {
                     self.overlay = Overlay::ConfirmLink(ConfirmLinkMode::Selected);
                 } else {
@@ -539,12 +616,12 @@ impl App {
             }
             KeyCode::Char('R') | KeyCode::Char('r') => {
                 if let Err(err) = self.save_report() {
-                    self.push_log(format!("Save report failed: {err}"));
+                    self.push_log(format!("Save report failed: {err:#}"));
                 }
             }
             KeyCode::Char('J') => {
                 if let Err(err) = self.open_json_overlay() {
-                    self.push_log(format!("Open JSON preview failed: {err}"));
+                    self.push_log(format!("Open JSON preview failed: {err:#}"));
                 }
             }
             _ => {}
@@ -561,6 +638,32 @@ impl App {
         });
     }
 
+    /// How far PgUp and PgDn move: the rows the table showed last.
+    fn page_rows(&self) -> isize {
+        isize::try_from(self.view.result_rows.get().max(1)).unwrap_or(1)
+    }
+
+    /// Scroll an open Help or JSON overlay, within what the view drew.
+    fn scroll_overlay(&mut self, code: KeyCode) {
+        let page = self.view.overlay_rows.get().max(1);
+        let last = self
+            .view
+            .overlay_lines
+            .get()
+            .saturating_sub(self.view.overlay_rows.get());
+        let scroll = self.overlay_scroll.min(last);
+        self.overlay_scroll = match code {
+            KeyCode::Down | KeyCode::Char('j') => scroll + 1,
+            KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::Char(' ') => scroll + page,
+            KeyCode::PageUp => scroll.saturating_sub(page),
+            KeyCode::Home | KeyCode::Char('g') => 0,
+            KeyCode::End | KeyCode::Char('G') => last,
+            _ => scroll,
+        }
+        .min(last);
+    }
+
     fn move_selection(&mut self, delta: isize) {
         let rows = self.rows().len();
         if rows == 0 {
@@ -570,13 +673,31 @@ impl App {
 
         let current = self.selected_row as isize;
         let max = rows.saturating_sub(1) as isize;
-        let next = (current + delta).clamp(0, max);
+        let next = current.saturating_add(delta).clamp(0, max);
         self.selected_row = next as usize;
+    }
+
+    /// Open the path editor when a scan has nowhere to look, saying so in
+    /// the editor, and return false; true when both paths are set.
+    fn paths_are_set_or_ask(&mut self) -> bool {
+        if self.downloads.is_some() && self.media.is_some() {
+            return true;
+        }
+        self.open_config_editor();
+        self.set_config_editor_error(
+            "Set the downloads and media folders first: type each path, Tab to switch, Enter to save."
+                .to_string(),
+        );
+        self.push_log("Set the downloads and media folders before scanning.".to_string());
+        false
     }
 
     fn start_scan_job(&mut self) {
         if self.running_job.is_some() {
             self.push_log("A run is already in progress.".to_string());
+            return;
+        }
+        if !self.paths_are_set_or_ask() {
             return;
         }
         self.reset_live_run_state();
@@ -606,6 +727,9 @@ impl App {
     {
         if self.running_job.is_some() {
             self.push_log("A run is already in progress.".to_string());
+            return Ok(());
+        }
+        if !self.paths_are_set_or_ask() {
             return Ok(());
         }
 
@@ -650,11 +774,8 @@ impl App {
 
         let Some(pair) = self
             .selected_entry()
-            .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
-            .map(|entry| PlannedPair {
-                source: entry.source.clone(),
-                target: entry.target.clone(),
-            })
+            .filter(|entry| entry.is_planned())
+            .map(PlannedPair::of)
         else {
             self.push_log("Select a planned row before running a single-item link.".to_string());
             return Ok(());
@@ -773,13 +894,13 @@ impl App {
         let config = match self.normalized_config_from_editor(load_fn, &editor) {
             Ok(config) => config,
             Err(err) => {
-                self.set_config_editor_error(err.to_string());
+                self.set_config_editor_error(format!("{err:#}"));
                 return Ok(());
             }
         };
 
         if let Err(err) = save_fn(&config) {
-            self.set_config_editor_error(format!("Failed to save config: {err}"));
+            self.set_config_editor_error(format!("Failed to save config: {err:#}"));
             return Ok(());
         }
 
@@ -797,12 +918,18 @@ impl App {
         L: FnOnce() -> Result<Config>,
     {
         let mut config = load_fn()?;
-        config.downloads = Some(normalize_runtime_dir(std::path::Path::new(
-            editor.downloads.trim(),
-        ))?);
-        config.media = Some(normalize_runtime_dir(std::path::Path::new(
-            editor.media.trim(),
-        ))?);
+        let home = dirs::home_dir();
+        // Each error says which field it is about.
+        let folder = |field: &str, typed: &str| -> Result<PathBuf> {
+            let typed = typed.trim();
+            if typed.is_empty() {
+                return Err(anyhow::anyhow!("{field}: type the folder's path"));
+            }
+            normalize_runtime_dir(&expand_home(typed, home.as_deref()))
+                .map_err(|err| anyhow::anyhow!("{field}: {err:#}"))
+        };
+        config.downloads = Some(folder("Downloads", &editor.downloads)?);
+        config.media = Some(folder("Media", &editor.media)?);
         validate_runtime_paths(&config)?;
         Ok(config)
     }
@@ -888,7 +1015,7 @@ impl App {
                     }
                 }
                 Err(err) => {
-                    self.fail_running_job(kind, err.to_string());
+                    self.fail_running_job(kind, format!("{err:#}"));
                     return;
                 }
             }
@@ -936,6 +1063,8 @@ impl App {
     fn apply_tui_event(&mut self, kind: JobKind, event: TuiEvent) -> bool {
         match event {
             TuiEvent::Phase { phase } => {
+                self.hash_bytes = None;
+                self.full_pass_started_at = (phase == "hashing_full").then(Instant::now);
                 self.current_phase = Some(phase.clone());
                 self.current_path = None;
                 if phase.starts_with("hashing_") {
@@ -971,8 +1100,10 @@ impl App {
                 if let Some(phase) = phase {
                     self.current_phase = Some(phase);
                 }
-                self.current_path = Some(path.clone());
-                self.latest_activity_message = Some(format!("Working on {path}"));
+                // The current-file line shows it; the activity line keeps
+                // what the phase is doing, so it never names a file the run
+                // has long moved past.
+                self.current_path = Some(path);
                 false
             }
             TuiEvent::Count {
@@ -983,13 +1114,11 @@ impl App {
                 hash_progress_done,
                 hash_progress_total,
             } => {
+                // Progress goes to the activity line and the counters, never
+                // the Run Log: a line per step would push out what a person
+                // needs to read there, such as why a run failed.
                 if let Some(files_seen) = files_seen {
                     self.live_files_seen = Some(files_seen);
-                    if matches!(self.current_phase.as_deref(), Some("collecting"))
-                        && (files_seen == 1 || files_seen % 25 == 0)
-                    {
-                        self.push_log(format!("Collected {files_seen} file(s)"));
-                    }
                 }
                 if let Some(groups_found) = groups_found {
                     self.live_groups_found = Some(groups_found);
@@ -999,10 +1128,6 @@ impl App {
                 }
                 if let Some(applied_actions) = applied_actions {
                     self.live_applied_actions = Some(applied_actions);
-                    if matches!(self.current_phase.as_deref(), Some("applying")) {
-                        let planned = self.live_planned_actions.unwrap_or(applied_actions);
-                        self.push_log(format!("Applied {applied_actions} / {planned} action(s)"));
-                    }
                 }
                 if let Some(done) = hash_progress_done {
                     self.hash_progress_done = Some(done);
@@ -1022,15 +1147,19 @@ impl App {
                         }
                         _ => format!("Hashing files: {done} / {total}"),
                     });
-                    if done == 1 || done == total || done % 10 == 0 {
-                        self.push_log(self.latest_activity_message.clone().unwrap_or_default());
-                    }
                 }
                 false
             }
             TuiEvent::PlannedEntries { entries } => {
                 if !entries.is_empty() {
                     self.live_entries.extend(entries);
+                    // Groups finish in any order; keep the rows in the order
+                    // the finished report lists them, so they do not jump.
+                    // That order compares paths folder by folder, which a
+                    // string compare does not: `Show.S01/` sorts after
+                    // `Show/` as a path and before it as a string.
+                    self.live_entries
+                        .sort_by_cached_key(LinkReportEntry::row_order);
                     self.live_planned_actions = Some(self.live_entries.len());
                     self.latest_activity_message = Some(format!(
                         "Planning actions: {} queued",
@@ -1061,9 +1190,19 @@ impl App {
                 self.restore_reviewed_rows();
                 true
             }
-            TuiEvent::Error { message } => {
+            TuiEvent::Error { message, report } => {
                 self.running_job = None;
                 self.finish_live_run();
+                // A link --strict stopped partway reports which pairs it
+                // linked before the failure: show that, not the plan.
+                if let Some(report) = report {
+                    self.active_workers.clear();
+                    self.hash_progress_done = None;
+                    self.hash_progress_total = None;
+                    self.merge_report(kind.clone(), *report);
+                    self.report_before_link = None;
+                    self.live_entries.clear();
+                }
                 let label = match kind {
                     JobKind::Scan => "Scan",
                     JobKind::LinkAll | JobKind::LinkSelected(_) => "Link",
@@ -1074,27 +1213,42 @@ impl App {
                 self.restore_reviewed_rows();
                 true
             }
+            TuiEvent::HashBytes { done, total } => {
+                self.hash_bytes = Some((done, total));
+                false
+            }
+            // The runner checks it before passing anything on.
+            TuiEvent::Hello { .. } => false,
             TuiEvent::Done { report } => {
+                let report = *report;
                 let planned = report.planned_actions;
                 let applied = report.applied_actions;
                 let link_failures = report.warnings.link_errors;
+                let unreadable = report.warning_total() - link_failures;
+                let cancelled = report.outcome == crate::protocol::Outcome::Cancelled;
                 let symlinked = report
                     .entries
                     .iter()
                     .filter(|entry| entry.is_applied_symlink())
                     .count();
-                self.selected_row = 0;
                 self.current_path = None;
                 self.active_workers.clear();
                 self.hash_progress_done = None;
                 self.hash_progress_total = None;
                 self.merge_report(kind.clone(), report);
+                self.selected_row = match &kind {
+                    JobKind::LinkSelected(source) => self.next_planned_after(source),
+                    _ => 0,
+                };
                 self.report_before_link = None;
                 self.live_entries.clear();
                 self.running_job = None;
                 self.finish_live_run();
                 let line = match kind {
                     JobKind::Scan => format!("Scan finished. Planned actions: {planned}"),
+                    _ if cancelled => format!(
+                        "Link cancelled after {applied} of {planned} action(s); the rest stay planned."
+                    ),
                     JobKind::LinkAll => format!("Link finished. Applied actions: {applied}"),
                     JobKind::LinkSelected(_) => {
                         format!("Selected link finished. Applied actions: {applied}")
@@ -1107,6 +1261,11 @@ impl App {
                         "{symlinked} of them as symlinks: each breaks if its library file is upgraded, renamed or deleted. See fallback_reason."
                     ));
                 }
+                if unreadable > 0 {
+                    self.push_log(format!(
+                        "{unreadable} file(s) or folder(s) could not be read; the log names each. Make them readable, or leave a folder out with `dejaview config set-exclude`."
+                    ));
+                }
                 if matches!(kind, JobKind::LinkAll | JobKind::LinkSelected(_)) && link_failures > 0
                 {
                     self.push_log(format!(
@@ -1116,6 +1275,24 @@ impl App {
                 true
             }
         }
+    }
+
+    /// The row to select after a single-row link of `source`: the next
+    /// planned row after it, else the first planned row, else where it was,
+    /// so linking a list row by row needs no moving back.
+    fn next_planned_after(&self, source: &str) -> usize {
+        let rows = self.rows();
+        let linked = rows
+            .iter()
+            .position(|row| row.source == source)
+            .unwrap_or(self.selected_row);
+        let planned = |row: &&LinkReportEntry| row.is_planned();
+        rows.iter()
+            .enumerate()
+            .skip(linked + 1)
+            .find(|(_, row)| planned(row))
+            .or_else(|| rows.iter().enumerate().find(|(_, row)| planned(row)))
+            .map_or(linked.min(rows.len().saturating_sub(1)), |(index, _)| index)
     }
 
     fn save_report(&mut self) -> Result<()> {
@@ -1142,6 +1319,7 @@ impl App {
         };
 
         let json = serde_json::to_string_pretty(report)?;
+        self.overlay_scroll = 0;
         self.overlay = Overlay::JsonPreview(json);
         Ok(())
     }
@@ -1164,6 +1342,8 @@ impl App {
         self.live_entries.clear();
         self.hash_progress_done = None;
         self.hash_progress_total = None;
+        self.hash_bytes = None;
+        self.full_pass_started_at = None;
         self.active_workers.clear();
         self.last_run_duration = None;
         self.job_started_at = None;
@@ -1182,10 +1362,18 @@ impl App {
         match kind {
             JobKind::LinkSelected(_) => {
                 if let Some(existing) = &mut self.report {
+                    // A scan's report freed nothing; a link's adds up.
+                    let freed_before = if existing.mode == "link" {
+                        existing.freed_bytes
+                    } else {
+                        0
+                    };
                     for entry in &report.entries {
-                        if let Some(current) = existing.entries.iter_mut().find(|current| {
-                            current.source == entry.source && current.target == entry.target
-                        }) {
+                        if let Some(current) = existing
+                            .entries
+                            .iter_mut()
+                            .find(|current| current.same_pair(entry))
+                        {
                             *current = entry.clone();
                         } else {
                             existing.entries.push(entry.clone());
@@ -1199,19 +1387,24 @@ impl App {
                     existing.applied_actions = existing
                         .entries
                         .iter()
-                        .filter(|entry| entry.status.eq_ignore_ascii_case("applied"))
+                        .filter(|entry| entry.is_applied())
                         .count();
                     existing.planned_actions = existing
                         .entries
                         .iter()
-                        .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
+                        .filter(|entry| entry.is_planned())
                         .count();
-                    existing.total_saved_bytes =
-                        existing.entries.iter().map(|entry| entry.size).sum();
+                    existing.freed_bytes = freed_before + report.freed_bytes;
+                    existing.total_saved_bytes = existing.freed_bytes;
+                    existing.symlinked = existing
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.is_applied_symlink())
+                        .count();
                     existing.warnings.link_errors = existing
                         .entries
                         .iter()
-                        .filter(|entry| entry.status.eq_ignore_ascii_case("failed"))
+                        .filter(|entry| entry.is_failed())
                         .count() as u64;
                     self.live_files_seen = Some(existing.files_considered);
                     self.live_planned_actions = Some(existing.planned_actions);
@@ -1260,6 +1453,11 @@ impl App {
         self.hash_progress_total = Some(total);
     }
 
+    pub(crate) fn set_full_pass_for_test(&mut self, done: u64, total: u64, elapsed: Duration) {
+        self.hash_bytes = Some((done, total));
+        self.full_pass_started_at = Instant::now().checked_sub(elapsed);
+    }
+
     pub(crate) fn set_running_scan_for_test(&mut self) -> Receiver<()> {
         let (_tx, rx) = mpsc::channel();
         let (cancel_tx, cancel_rx) = mpsc::channel();
@@ -1269,6 +1467,14 @@ impl App {
 
     pub(crate) fn set_report_for_test(&mut self, report: RunReport) {
         self.report = Some(report);
+    }
+
+    pub(crate) fn toggle_path_mode_for_test(&mut self) {
+        self.toggle_path_mode();
+    }
+
+    pub(crate) fn handle_key_for_test(&mut self, code: KeyCode, mods: KeyModifiers) {
+        self.handle_key(code, mods).expect("key handling");
     }
 }
 
@@ -1336,6 +1542,7 @@ mod tests {
                 link_errors: 0,
             },
             entries: vec![],
+            ..Default::default()
         }
     }
 
@@ -1353,7 +1560,8 @@ mod tests {
             files_considered: 2,
             planned_actions: 2,
             applied_actions: 1,
-            total_saved_bytes: 30,
+            freed_bytes: 10,
+            total_saved_bytes: 10,
             skipped_by_min_age: 0,
             skipped_by_min_size: 0,
             skipped_by_exclude: 0,
@@ -1375,6 +1583,7 @@ mod tests {
                     method: Some("hardlink".to_string()),
                     fallback_reason: None,
                     error: None,
+                    ..Default::default()
                 },
                 LinkReportEntry {
                     source: "c".to_string(),
@@ -1384,8 +1593,10 @@ mod tests {
                     method: None,
                     fallback_reason: None,
                     error: Some("boom".to_string()),
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         });
 
         assert_eq!(app.saved_bytes(), 10);
@@ -1440,7 +1651,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.running_job = Some(RunningJob::new(JobKind::Scan, rx, mpsc::channel().0));
         tx.send(Ok(TuiEvent::Done {
-            report: sample_report(),
+            report: Box::new(sample_report()),
         }))
         .expect("send result");
 
@@ -1460,7 +1671,10 @@ mod tests {
         let mut report = sample_report();
         report.mode = "link".to_string();
         report.warnings.link_errors = 2;
-        tx.send(Ok(TuiEvent::Done { report })).expect("send result");
+        tx.send(Ok(TuiEvent::Done {
+            report: Box::new(report),
+        }))
+        .expect("send result");
 
         app.poll_running_job();
 
@@ -1531,6 +1745,7 @@ mod tests {
                 method: Some("try-hardlink".to_string()),
                 fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
                 error: None,
+                ..Default::default()
             }],
         }))
         .expect("send planned entry");
@@ -1548,6 +1763,150 @@ mod tests {
     }
 
     #[test]
+    fn live_rows_stay_in_download_path_order() {
+        let mut app = App::new(&Config::default(), false);
+        let entry = |source: &str| LinkReportEntry {
+            source: source.to_string(),
+            target: "/media/a.mkv".to_string(),
+            size: 10,
+            status: "planned".to_string(),
+            method: None,
+            fallback_reason: None,
+            error: None,
+            ..Default::default()
+        };
+        for source in ["/dl/c.mkv", "/dl/a.mkv", "/dl/b.mkv"] {
+            app.apply_tui_event(
+                JobKind::Scan,
+                TuiEvent::PlannedEntries {
+                    entries: vec![entry(source)],
+                },
+            );
+        }
+        let sources: Vec<_> = app.rows().iter().map(|row| row.source.as_str()).collect();
+        assert_eq!(sources, ["/dl/a.mkv", "/dl/b.mkv", "/dl/c.mkv"]);
+    }
+
+    #[test]
+    fn live_rows_keep_the_order_the_engine_gives_the_plan() {
+        let mut app = App::new(&Config::default(), false);
+        let entry = |source: &str| LinkReportEntry {
+            source: source.to_string(),
+            target: "/media/a.mkv".to_string(),
+            size: 10,
+            status: "planned".to_string(),
+            ..Default::default()
+        };
+        // As paths, Show/ sorts before Show.S01/; as strings, after.
+        for source in [
+            "/dl/Show.S01/e01.mkv",
+            "/dl/Show/e01.mkv",
+            "/dl/a/b.mkv",
+            "/dl/a.mkv",
+        ] {
+            app.apply_tui_event(
+                JobKind::Scan,
+                TuiEvent::PlannedEntries {
+                    entries: vec![entry(source)],
+                },
+            );
+        }
+        let mut paths: Vec<_> = app
+            .rows()
+            .iter()
+            .map(|row| PathBuf::from(&row.source))
+            .collect();
+        let shown = paths.clone();
+        paths.sort();
+        assert_eq!(shown, paths, "the engine's order, path by path");
+        assert_eq!(shown[0], PathBuf::from("/dl/Show/e01.mkv"));
+        assert_eq!(shown[2], PathBuf::from("/dl/a/b.mkv"));
+    }
+
+    #[test]
+    fn a_single_link_selects_the_next_planned_row() {
+        let mut app = App::new(&Config::default(), false);
+        let row = |source: &str, status: &str| LinkReportEntry {
+            source: source.to_string(),
+            target: format!("/media{source}"),
+            size: 10,
+            status: status.to_string(),
+            method: None,
+            fallback_reason: None,
+            error: None,
+            ..Default::default()
+        };
+        let mut scanned = sample_report();
+        scanned.entries = vec![
+            row("/dl/a.mkv", "planned"),
+            row("/dl/b.mkv", "applied"),
+            row("/dl/c.mkv", "planned"),
+            row("/dl/d.mkv", "planned"),
+        ];
+        app.report = Some(scanned);
+        app.selected_row = 2;
+        let mut linked = sample_report();
+        linked.mode = "link".to_string();
+        linked.entries = vec![row("/dl/c.mkv", "applied")];
+
+        app.apply_tui_event(
+            JobKind::LinkSelected("/dl/c.mkv".to_string()),
+            TuiEvent::Done {
+                report: Box::new(linked.clone()),
+            },
+        );
+        assert_eq!(app.selected_row(), 3, "the next planned row, d");
+
+        // From the last row, back to the first still planned.
+        linked.entries = vec![row("/dl/d.mkv", "applied")];
+        app.apply_tui_event(
+            JobKind::LinkSelected("/dl/d.mkv".to_string()),
+            TuiEvent::Done {
+                report: Box::new(linked),
+            },
+        );
+        assert_eq!(app.selected_row(), 0, "a");
+    }
+
+    #[test]
+    fn a_link_stopped_by_strict_shows_the_pairs_it_linked() {
+        let mut app = App::new(&Config::default(), false);
+        let row = |source: &str, status: &str| LinkReportEntry {
+            source: source.to_string(),
+            target: format!("/media{source}"),
+            size: 10,
+            status: status.to_string(),
+            method: None,
+            fallback_reason: None,
+            error: None,
+            ..Default::default()
+        };
+        let mut scanned = sample_report();
+        scanned.entries = vec![row("/dl/a.mkv", "planned"), row("/dl/b.mkv", "planned")];
+        app.report_before_link = Some(scanned);
+        let mut partial = sample_report();
+        partial.mode = "link".to_string();
+        partial.outcome = crate::protocol::Outcome::Failed;
+        partial.entries = vec![row("/dl/a.mkv", "applied"), row("/dl/b.mkv", "failed")];
+
+        assert!(app.apply_tui_event(
+            JobKind::LinkAll,
+            TuiEvent::Error {
+                message: "--strict stopped the run at its first failed link".to_string(),
+                report: Some(Box::new(partial)),
+            },
+        ));
+
+        let statuses: Vec<_> = app.rows().iter().map(|row| row.status.as_str()).collect();
+        assert_eq!(statuses, ["applied", "failed"]);
+        assert!(app.report_before_link.is_none());
+        assert!(
+            app.activity_message()
+                .starts_with("Link failed: --strict stopped")
+        );
+    }
+
+    #[test]
     fn a_link_that_fails_to_run_keeps_the_reviewed_rows() {
         let config = Config::default();
         let mut app = App::new(&config, false);
@@ -1560,6 +1919,7 @@ mod tests {
             method: Some("try-hardlink".to_string()),
             fallback_reason: None,
             error: None,
+            ..Default::default()
         }];
         // What start_link_job leaves behind: the reviewed report put aside
         // while the child runs.
@@ -1654,6 +2014,7 @@ mod tests {
                 method: Some("try-hardlink".to_string()),
                 fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
                 error: None,
+                ..Default::default()
             }],
         }))
         .expect("send planned entry");
@@ -1673,9 +2034,167 @@ mod tests {
         );
     }
 
+    /// A config whose paths are set, so a scan may start.
+    fn config_with_paths() -> Config {
+        Config {
+            downloads: Some(PathBuf::from("/nonexistent/downloads")),
+            media: Some(PathBuf::from("/nonexistent/media")),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn x_asks_before_clearing_the_cache() {
+        let mut app = App::new(&config_with_paths(), false);
+
+        app.handle_main_key(KeyCode::Char('x')).expect("key");
+        assert!(matches!(app.overlay, Overlay::ConfirmRescan));
+        assert!(app.running_job.is_none(), "nothing cleared or started yet");
+
+        app.handle_key(KeyCode::Char('n'), KeyModifiers::NONE)
+            .expect("key");
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.running_job.is_none());
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line.contains("the cache is kept"))
+        );
+
+        app.handle_main_key(KeyCode::Char('X')).expect("key");
+        assert!(matches!(app.overlay, Overlay::ConfirmRescan));
+    }
+
+    #[test]
+    fn the_full_pass_shows_bytes_speed_and_time_left() {
+        let mut app = App::new(&Config::default(), false);
+        app.set_running_scan_for_test();
+        app.apply_tui_event(
+            JobKind::Scan,
+            TuiEvent::Phase {
+                phase: "hashing_full".to_string(),
+            },
+        );
+        app.set_hash_progress_for_test(0, 2);
+        app.set_full_pass_for_test(500 << 20, 2000 << 20, Duration::from_secs(10));
+
+        let label = app.throughput_label();
+
+        assert!(
+            label.starts_with("0 / 2 duplicate files verified"),
+            "{label}"
+        );
+        assert!(label.contains("500.0 MiB of 2.0 GiB"), "{label}");
+        assert!(label.contains("50.0 MiB/s"), "{label}");
+        assert!(label.contains("ETA 00:30"), "{label}");
+    }
+
+    #[test]
+    fn hash_bytes_events_feed_the_full_pass_progress() {
+        let mut app = App::new(&Config::default(), false);
+        app.set_running_scan_for_test();
+        app.apply_tui_event(
+            JobKind::Scan,
+            TuiEvent::Phase {
+                phase: "hashing_full".to_string(),
+            },
+        );
+        app.set_hash_progress_for_test(0, 1);
+        app.apply_tui_event(
+            JobKind::Scan,
+            TuiEvent::HashBytes {
+                done: 1 << 30,
+                total: 4 << 30,
+            },
+        );
+        assert!(app.throughput_label().contains("1.0 GiB of 4.0 GiB"));
+    }
+
+    #[test]
+    fn scanning_without_paths_opens_the_path_editor() {
+        let mut app = App::new(&Config::default(), false);
+
+        app.handle_main_key(KeyCode::Char('S')).expect("key");
+
+        assert!(app.running_job.is_none(), "nowhere to scan");
+        let editor = app.config_editor().expect("the path editor opens");
+        assert!(
+            editor
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("Set the downloads and media folders")),
+            "{editor:?}"
+        );
+    }
+
+    #[test]
+    fn progress_stays_out_of_the_run_log() {
+        let mut app = App::new(&Config::default(), false);
+        let (tx, rx) = mpsc::channel();
+        app.running_job = Some(RunningJob::new(JobKind::Scan, rx, mpsc::channel().0));
+        let count = |files_seen, done, applied| TuiEvent::Count {
+            files_seen,
+            groups_found: None,
+            planned_actions: None,
+            applied_actions: applied,
+            hash_progress_done: done,
+            hash_progress_total: done.map(|_| 10),
+        };
+        tx.send(Ok(TuiEvent::Phase {
+            phase: "collecting".to_string(),
+        }))
+        .expect("send");
+        for n in [1, 25, 50] {
+            tx.send(Ok(count(Some(n), None, None))).expect("send");
+        }
+        tx.send(Ok(TuiEvent::Phase {
+            phase: "hashing_sample".to_string(),
+        }))
+        .expect("send");
+        for n in [1, 10] {
+            tx.send(Ok(count(None, Some(n), None))).expect("send");
+        }
+        tx.send(Ok(TuiEvent::Phase {
+            phase: "applying".to_string(),
+        }))
+        .expect("send");
+        tx.send(Ok(count(None, None, Some(1)))).expect("send");
+        let before = app.logs.len();
+
+        app.poll_running_job();
+
+        let added: Vec<_> = app.logs.iter().skip(before).collect();
+        assert!(
+            added.iter().all(|line| line.starts_with("Phase:")),
+            "only the phases: {added:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_event_leaves_the_activity_line_to_the_phase() {
+        let mut app = App::new(&Config::default(), false);
+        app.set_running_scan_for_test();
+        app.apply_tui_event(
+            JobKind::Scan,
+            TuiEvent::Phase {
+                phase: "collecting".to_string(),
+            },
+        );
+        app.apply_tui_event(
+            JobKind::Scan,
+            TuiEvent::File {
+                phase: Some("collecting".to_string()),
+                path: "/downloads/a.mkv".to_string(),
+            },
+        );
+
+        assert_eq!(app.activity_message(), "Phase: COLLECTING FILES");
+        assert_eq!(app.current_path(), Some("/downloads/a.mkv"));
+    }
+
     #[test]
     fn starting_run_clears_stale_report_rows() {
-        let config = Config::default();
+        let config = config_with_paths();
         let mut app = App::new(&config, false);
         app.report = Some(sample_report());
         app.selected_row = 1;
@@ -1689,7 +2208,7 @@ mod tests {
 
     #[test]
     fn rescan_clears_cache_then_starts_scan() {
-        let config = Config::default();
+        let config = config_with_paths();
         let mut app = App::new(&config, false);
 
         app.start_rescan_job_with(|| Ok(()))
@@ -1705,7 +2224,7 @@ mod tests {
 
     #[test]
     fn rescan_failure_does_not_start_job() {
-        let config = Config::default();
+        let config = config_with_paths();
         let mut app = App::new(&config, false);
 
         let err = app.start_rescan_job_with(|| Err(anyhow::anyhow!("boom")));
@@ -1833,6 +2352,7 @@ mod tests {
             method: None,
             fallback_reason: None,
             error: None,
+            ..Default::default()
         }
     }
 
@@ -1897,7 +2417,12 @@ mod tests {
         let mut linked = sample_report();
         linked.files_considered = 3;
 
-        assert!(app.apply_tui_event(JobKind::LinkAll, TuiEvent::Done { report: linked }));
+        assert!(app.apply_tui_event(
+            JobKind::LinkAll,
+            TuiEvent::Done {
+                report: Box::new(linked)
+            }
+        ));
 
         assert_eq!(app.live_files_seen, Some(7));
         assert_eq!(app.report.as_ref().map(|r| r.files_considered), Some(7));
@@ -1917,6 +2442,7 @@ mod tests {
             method: None,
             fallback_reason: None,
             error: None,
+            ..Default::default()
         };
         report.entries = vec![
             row("/downloads/a.mkv", "planned"),
@@ -1951,6 +2477,7 @@ mod tests {
             method: Some("try-hardlink".to_string()),
             fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
             error: None,
+            ..Default::default()
         }];
         app.report = Some(report);
 
@@ -1977,6 +2504,7 @@ mod tests {
             method: Some("try-hardlink".to_string()),
             fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
             error: None,
+            ..Default::default()
         }];
         report.planned_actions = 1;
         app.report = Some(report);
@@ -2026,6 +2554,7 @@ mod tests {
                         "tries hardlink first; may fall back to symlink".to_string(),
                     ),
                     error: None,
+                    ..Default::default()
                 },
                 LinkReportEntry {
                     source: "/downloads/b.mkv".to_string(),
@@ -2037,8 +2566,10 @@ mod tests {
                         "tries hardlink first; may fall back to symlink".to_string(),
                     ),
                     error: None,
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         });
 
         let (tx, rx) = mpsc::channel();
@@ -2048,7 +2579,7 @@ mod tests {
             mpsc::channel().0,
         ));
         tx.send(Ok(TuiEvent::Done {
-            report: RunReport {
+            report: Box::new(RunReport {
                 mode: "link".to_string(),
                 dry_run: false,
                 strict: false,
@@ -2076,8 +2607,10 @@ mod tests {
                     method: Some("hardlink".to_string()),
                     fallback_reason: None,
                     error: None,
+                    ..Default::default()
                 }],
-            },
+                ..Default::default()
+            }),
         }))
         .expect("send result");
 
@@ -2150,7 +2683,39 @@ mod tests {
             .expect("save flow should not hard fail");
 
         let editor = app.config_editor().expect("editor should stay open");
-        assert!(editor.error.is_some());
+        let error = editor.error.as_deref().expect("an error");
+        assert!(
+            error.starts_with("Downloads: cannot use /does/not/exist"),
+            "names the field and the path: {error}"
+        );
+    }
+
+    #[test]
+    fn the_path_editor_reads_a_leading_tilde_as_home() {
+        let Some(home) = dirs::home_dir().filter(|home| home.is_dir()) else {
+            return;
+        };
+        let mut app = App::new(&Config::default(), false);
+        app.overlay = Overlay::ConfigEditor(ConfigEditor {
+            downloads: "~".to_string(),
+            media: "/nonexistent/media".to_string(),
+            active_field: ConfigField::Media,
+            error: None,
+        });
+
+        app.save_config_from_editor_with(|| Ok(Config::default()), |_| Ok(()))
+            .expect("save flow should not hard fail");
+
+        // The home folder resolved; the media path is what fails.
+        let error = app
+            .config_editor()
+            .and_then(|editor| editor.error.clone())
+            .expect("an error");
+        assert!(
+            error.starts_with("Media:"),
+            "{error} (home {})",
+            home.display()
+        );
     }
 
     #[test]

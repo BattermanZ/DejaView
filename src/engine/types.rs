@@ -9,13 +9,9 @@ use super::cancel::CancelToken;
 use crate::protocol::TuiEvent;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum LinkMode {
-    #[default]
-    Best,
-    SymlinkOnly,
-}
+/// It lives with the report, which names it; the engine and the config use
+/// it from here.
+pub use crate::protocol::LinkMode;
 
 #[derive(Debug, Clone)]
 pub(super) struct FileInfo {
@@ -133,6 +129,8 @@ pub(super) struct RunWarnings {
 
 #[derive(Default, Clone)]
 pub(super) struct RunMetrics {
+    /// Files the walk found and kept, before hashing.
+    pub(super) files_seen: usize,
     pub(super) skipped_by_min_age: u64,
     pub(super) skipped_by_min_size: u64,
     /// Files and folders left out by name; a folder counts once.
@@ -141,6 +139,10 @@ pub(super) struct RunMetrics {
     pub(super) skipped_as_library_file: u64,
     /// Symlinks in downloads that point into the library and no longer resolve.
     pub(super) dangling_symlinks: Vec<PathBuf>,
+    /// Paths the walk could not read, each with whether it is in downloads:
+    /// a folder, or a file whose metadata failed. The cache keeps entries
+    /// under them, which this run could not see.
+    pub(super) unreadable: Vec<(PathBuf, bool)>,
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +159,9 @@ pub struct ScanRunOptions<'a> {
     pub strict: bool,
     pub report_path: Option<&'a Path>,
     pub json_output: bool,
+    /// Print nothing unless a link was made or something failed: a cron
+    /// job's mail then means something happened.
+    pub quiet: bool,
     pub show_progress: bool,
     pub require_confirm: bool,
     pub tui_events: bool,
@@ -168,7 +173,47 @@ pub struct ScanRunOptions<'a> {
     pub cancel: CancelToken,
 }
 
+/// Who reads what a run prints, which decides what it prints. Worked out
+/// once from the options, so no print site combines the flags itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Audience {
+    /// A person at a terminal: the plan, a summary, warnings and a verdict.
+    Person,
+    /// `--quiet`: a person or a cron job, told only of links made and
+    /// failures.
+    Quiet,
+    /// `--json`: a script reading one report on stdout.
+    Script,
+    /// `--tui-events`: the dashboard, reading events on stdout.
+    Dashboard,
+}
+
+impl Audience {
+    /// A person reads the terminal, quiet or not.
+    pub(super) fn is_person(self) -> bool {
+        matches!(self, Audience::Person | Audience::Quiet)
+    }
+
+    /// Everything a person may want is printed: the plan, the summary and
+    /// warnings that come back every run.
+    pub(super) fn is_chatty(self) -> bool {
+        self == Audience::Person
+    }
+}
+
 impl ScanRunOptions<'_> {
+    pub(super) fn audience(&self) -> Audience {
+        if self.tui_events {
+            Audience::Dashboard
+        } else if self.json_output {
+            Audience::Script
+        } else if self.quiet {
+            Audience::Quiet
+        } else {
+            Audience::Person
+        }
+    }
+
     /// Whether a planned action is one this run was asked to take.
     pub(super) fn selects(&self, action: &LinkAction) -> bool {
         (self.only_sources.is_empty() || self.only_sources.contains(&action.src))

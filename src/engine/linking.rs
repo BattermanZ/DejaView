@@ -238,7 +238,9 @@ fn read_access_refusal(
 
 /// What became of a planned pair that did not fail.
 enum PairOutcome {
-    Applied,
+    /// Replaced with a link. `freed` when the download was its file's last
+    /// path, so its bytes came back.
+    Applied { freed: bool },
     /// The download already was the library file; nothing changed.
     AlreadyLinked,
     /// Left alone on purpose, with the reason in the report.
@@ -652,14 +654,13 @@ where
                 logger::warn(
                     "link",
                     format!(
-                        "hardlink failed for {} -> {}: {}",
+                        "hardlink failed for {} -> {}: {err:#}",
                         src.display(),
                         tgt.display(),
-                        err
                     ),
                 );
                 Some(format!(
-                    "hardlink failed; symlink applied successfully; {err}"
+                    "hardlink failed; symlink applied successfully; {err:#}"
                 ))
             }
         }
@@ -774,6 +775,12 @@ pub(super) fn plan_hashed_group_actions(group: &[FileInfo]) -> Vec<LinkAction> {
         .collect()
 }
 
+/// The order every plan is shown, reported and applied in: by download path,
+/// then library path.
+pub(super) fn sort_actions(actions: &mut [LinkAction]) {
+    actions.sort_by(|a, b| a.src.cmp(&b.src).then_with(|| a.tgt.cmp(&b.tgt)));
+}
+
 pub(super) struct Plan {
     pub(super) actions: Vec<LinkAction>,
     /// Downloads left alone because they are a library file seen through a
@@ -791,23 +798,36 @@ pub(super) fn plan_actions(groups: &[Vec<FileInfo>]) -> Plan {
             actions.extend(plan_group_actions(&hashed_group));
         }
     }
+    // Groups come out of hash maps in no fixed order; a plan that changes
+    // order between runs cannot be diffed or reviewed twice.
+    sort_actions(&mut actions);
+    seen_through_second_mount.sort();
     Plan {
         actions,
         seen_through_second_mount,
     }
 }
 
-/// The table a person reads: one row per planned action.
-pub(super) fn action_table(actions: &[LinkAction]) -> Table {
+/// The table a person reads: one row per planned action, each path below
+/// its folder, which the caller prints once above it. The header is plain:
+/// colour codes would count as width and push the columns out of line.
+pub(super) fn action_table(actions: &[LinkAction], downloads: &Path, media: &Path) -> Table {
+    let below = |path: &Path, root: &Path| {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    };
     let mut table = Table::new();
     table
         .load_style(UTF8_FULL.with_rounded_corners())
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["Download".yellow(), "Media".yellow()]);
+        .set_header(vec!["Download", "Library file", "Size"]);
     for action in actions {
         table.add_row(vec![
-            action.src.to_string_lossy().to_string(),
-            action.tgt.to_string_lossy().to_string(),
+            below(&action.src, downloads),
+            below(&action.tgt, media),
+            super::report::format_size(action.size),
         ]);
     }
     table
@@ -817,19 +837,28 @@ pub(super) struct ApplyOptions<'a> {
     /// The downloads root: a download's folder must resolve inside it.
     pub(super) downloads: &'a Path,
     pub(super) strict: bool,
-    pub(super) json_output: bool,
     pub(super) tui_events: bool,
     pub(super) link_mode: LinkMode,
     pub(super) cancel: &'a CancelToken,
 }
 
-#[derive(Default)]
-pub(super) struct ApplyOutcome {
+/// What the apply loop did, counted: the report and the verdict line both
+/// take these.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Applied {
     pub(super) applied: usize,
     /// Pairs found at link time to be one file already; nothing changed.
     pub(super) already_linked: usize,
+    pub(super) already_linked_bytes: u64,
+    /// Bytes that came back: a download's, once its last path was replaced.
+    pub(super) freed_bytes: u64,
     /// Pairs left alone on purpose, such as for access; not failures.
     pub(super) skipped: usize,
+}
+
+#[derive(Default)]
+pub(super) struct ApplyOutcome {
+    pub(super) counts: Applied,
     pub(super) strict_error: Option<anyhow::Error>,
     /// Stopped between actions on request; actions not reached stay planned.
     pub(super) cancelled: bool,
@@ -845,13 +874,14 @@ pub(super) fn apply_actions(
     let ApplyOptions {
         downloads,
         strict,
-        json_output,
         tui_events,
         link_mode,
         cancel,
     } = *options;
     let mut applied_actions = 0usize;
     let mut already_linked = 0usize;
+    let mut already_linked_bytes = 0u64;
+    let mut freed_bytes = 0u64;
     let mut skipped = 0usize;
     let mut strict_link_error: Option<anyhow::Error> = None;
     let mut cancelled = false;
@@ -862,9 +892,6 @@ pub(super) fn apply_actions(
         return ApplyOutcome::default();
     }
 
-    if !json_output && !tui_events {
-        println!("{} Applying…", "▶".cyan());
-    }
     let roots = CanonicalRoots::new(downloads, media);
     // Resolved once per run, not once per pair.
     let canonical_media = fs::canonicalize(media);
@@ -907,6 +934,9 @@ pub(super) fn apply_actions(
             let tgt_meta = lstat(&action.tgt)?;
             refuse_target_outside_media_root(media, canonical_media, &action.tgt, &tgt_meta)?;
             ensure_target_snapshot_matches(&action.tgt, &tgt_meta, &action.tgt_snapshot)?;
+            // A download's bytes come back only with its last path: a
+            // cross-seeded sibling still holds them until it is replaced too.
+            let last_path = src_meta.nlink() == 1;
             if let Some(reason) =
                 read_access_refusal(&action.src, &src_meta, &action.tgt, &tgt_meta)
             {
@@ -939,49 +969,53 @@ pub(super) fn apply_actions(
             Ok(if linked.already_linked {
                 PairOutcome::AlreadyLinked
             } else {
-                PairOutcome::Applied
+                PairOutcome::Applied { freed: last_path }
             })
         })();
         let outcome = match apply_result {
             Ok(outcome) => outcome,
             Err(err) => {
                 warnings.link_errors += 1;
-                report_entries[index].status = "failed".to_string();
-                report_entries[index].error = Some(err.to_string());
+                // The whole chain: the outer context alone names the step,
+                // and the OS error that says why is in its cause.
+                let err = format!("{err:#}");
+                let entry = &mut report_entries[index];
+                entry.status = "failed".to_string();
+                // What the plan expected no longer applies to a pair that
+                // was not linked.
+                entry.method = None;
+                entry.fallback_reason = None;
+                entry.error = Some(err.clone());
                 logger::error(
                     "link",
                     format!(
-                        "failed {} -> {}: {}",
+                        "failed {} -> {}: {err}",
                         action.src.display(),
                         action.tgt.display(),
-                        err
                     ),
                 );
                 if tui_events {
                     let _ = emit_tui_event(&TuiEvent::Log {
                         message: format!(
-                            "Failed to apply {} -> {}: {}",
+                            "Failed to apply {} -> {}: {err}",
                             action.src.display(),
                             action.tgt.display(),
-                            err
                         ),
                     });
                 }
                 if strict {
                     strict_link_error = Some(anyhow!(
-                        "strict mode link failure for {} -> {}: {}",
+                        "--strict stopped the run at its first failed link, {} -> {}: {err}. The pairs before it are linked and the rest stay planned; the report lists each",
                         action.src.display(),
                         action.tgt.display(),
-                        err
                     ));
                     break;
                 } else {
                     eprintln!(
-                        "{} Failed to apply {} -> {}: {}",
+                        "{} Failed to apply {} -> {}: {err}",
                         "⚠".yellow(),
                         action.src.display(),
                         action.tgt.display(),
-                        err
                     );
                     continue;
                 }
@@ -994,13 +1028,12 @@ pub(super) fn apply_actions(
                 let _ = emit_tui_event(&TuiEvent::Log {
                     message: reason.clone(),
                 });
-            } else if !json_output {
-                eprintln!("{} {reason}", "⚠".yellow());
             }
             continue;
         }
         if matches!(outcome, PairOutcome::AlreadyLinked) {
             already_linked += 1;
+            already_linked_bytes += action.size;
             logger::warn(
                 "link",
                 format!(
@@ -1012,6 +1045,9 @@ pub(super) fn apply_actions(
             continue;
         }
         applied_actions += 1;
+        if matches!(outcome, PairOutcome::Applied { freed: true }) {
+            freed_bytes += action.size;
+        }
         replaced_inodes.insert((action.src_snapshot.dev, action.src_snapshot.inode));
         logger::info(
             "link",
@@ -1035,9 +1071,13 @@ pub(super) fn apply_actions(
     }
 
     ApplyOutcome {
-        applied: applied_actions,
-        already_linked,
-        skipped,
+        counts: Applied {
+            applied: applied_actions,
+            already_linked,
+            already_linked_bytes,
+            freed_bytes,
+            skipped,
+        },
         strict_error: strict_link_error,
         cancelled,
     }

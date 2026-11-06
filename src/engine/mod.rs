@@ -17,17 +17,17 @@ pub use lock::LockHeld;
 pub use types::LinkMode;
 pub use types::ScanRunOptions;
 
+use crate::protocol::Outcome;
 use crate::protocol::TuiEvent;
 use cache::{CacheKeys, load_cache, prune_cache, save_cache};
 use collect::{CollectOptions, collect_run_files, group_files_by_size};
 use hashing::{CHECKPOINT_EVERY, Checkpoint, HashOptions, Hashed, hash_groups_and_update_cache};
 use linking::{ApplyOptions, ApplyOutcome, apply_actions, plan_actions};
 use report::{
-    RunReportInput, build_report_entries, build_run_report, maybe_confirm_apply,
-    maybe_return_strict_errors, print_run_summary, print_space_summary, resolve_report_path,
-    try_write_run_report,
+    RunReportInput, build_report_entries, build_run_report, maybe_confirm_apply, planned_bytes,
+    print_run_summary, resolve_report_path, strict_failure, try_write_run_report,
 };
-use types::{Cache, LinkAction, RunMetrics, RunWarnings};
+use types::{Audience, Cache, LinkAction, RunMetrics, RunWarnings};
 
 use crate::config::{Config, cache_path};
 use crate::logger;
@@ -131,21 +131,86 @@ pub fn probe_hardlink(downloads: &std::path::Path, media: &std::path::Path) -> H
     }
 }
 
-pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
-    let tui_events = options.tui_events;
+/// How a scan or link that returned ended, for its exit code (ADR 0003).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunEnd {
+    /// It finished and nothing failed, including a run with nothing to do.
+    Clean,
+    /// It finished, but a file could not be read, hashed or linked: what
+    /// `--strict` would have stopped on.
+    WithFailures,
+    /// A link stopped on request partway; the pairs it linked stay linked.
+    Cancelled,
+}
+
+/// A run `--strict` stopped after building its report, which the error
+/// carries so the dashboard can show which pairs were linked before it.
+#[derive(Debug)]
+pub struct StoppedWithReport {
+    report: Box<crate::protocol::RunReport>,
+    error: anyhow::Error,
+}
+
+impl std::fmt::Display for StoppedWithReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.error)
+    }
+}
+
+impl std::error::Error for StoppedWithReport {}
+
+/// Open a `--tui-events` stream. The first event names the protocol, so the
+/// dashboard can refuse a binary that speaks another.
+pub fn open_tui_stream() {
+    let _ = types::emit_tui_event(&TuiEvent::Hello {
+        protocol: crate::protocol::PROTOCOL_VERSION,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    });
+}
+
+/// Close a `--tui-events` stream for a run that returned an error, from a
+/// config error before it started to a strict failure partway: exactly one
+/// final event, `cancelled` for a cancel and `error` for anything else, with
+/// the whole cause and the report when the run built one.
+pub fn close_tui_stream_on(err: &anyhow::Error) {
+    let event = if err.is::<Cancelled>() {
+        TuiEvent::Cancelled
+    } else {
+        TuiEvent::Error {
+            message: format!("{err:#}"),
+            report: err
+                .downcast_ref::<StoppedWithReport>()
+                .map(|stopped| stopped.report.clone()),
+        }
+    };
+    let _ = types::emit_tui_event(&event);
+}
+
+impl RunEnd {
+    /// The exit of a run that returned, from how it ended and whether
+    /// anything failed on the way. A run `--strict` stopped returns an
+    /// error instead, so `Failed` only reaches here with failures.
+    fn of(outcome: Outcome, failures: bool) -> Self {
+        match outcome {
+            Outcome::Cancelled => RunEnd::Cancelled,
+            Outcome::Complete | Outcome::Failed if failures => RunEnd::WithFailures,
+            Outcome::Complete | Outcome::Failed => RunEnd::Clean,
+        }
+    }
+}
+
+pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
     let result = run(config, options);
     if let Err(err) = &result
         && err.is::<Cancelled>()
     {
         logger::info("run", "cancelled by user before any change was made");
-        if tui_events {
-            let _ = types::emit_tui_event(&TuiEvent::Cancelled);
-        }
     }
     result
 }
 
-fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
+fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
+    let started_at = std::time::SystemTime::now();
     if options.json_output && options.tui_events {
         return Err(anyhow!("--json cannot be combined with --tui-events"));
     }
@@ -159,7 +224,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("Media path not set"))?;
     let min_age = std::time::Duration::from_secs(config.min_age.unwrap_or(0));
-    let machine_output = options.json_output || options.tui_events;
+    let audience = options.audience();
     logger::info(
         "run",
         format!(
@@ -199,10 +264,10 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     let Planned {
         files_seen,
         groups_found,
-        actions,
+        mut actions,
     } = match from_cache {
         Some(planned) => planned,
-        None => plan_by_walking(
+        None => match plan_by_walking(
             config,
             &options,
             &roots,
@@ -214,8 +279,21 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
             },
             &mut warnings,
             &mut metrics,
-        )?,
+        ) {
+            Ok(planned) => planned,
+            Err(err) => {
+                return Err(stopped_before_planning(
+                    err,
+                    &options,
+                    started_at,
+                    (downloads, media),
+                    metrics,
+                    warnings,
+                ));
+            }
+        },
     };
+    linking::sort_actions(&mut actions);
     if actions.len() < options.only_pairs.len() {
         let message = format!(
             "{} of the {} reviewed row(s) are no longer planned as shown, because a file changed since the scan; they are left alone. Scan again to review them.",
@@ -225,17 +303,17 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         logger::warn("run", &message);
         if options.tui_events {
             let _ = types::emit_tui_event(&TuiEvent::Log { message });
-        } else if !options.json_output {
+        } else if audience.is_chatty() {
             eprintln!("{} {message}", "⚠".yellow());
         }
     }
-    let total_saved_space = actions.iter().map(|action| action.size).sum();
+    let bytes_to_free = planned_bytes(&actions);
     let planned_actions = actions.len();
     logger::info(
         "run",
         format!(
             "planned {} action(s), potential_saved_bytes={}",
-            planned_actions, total_saved_space
+            planned_actions, bytes_to_free
         ),
     );
     if options.tui_events {
@@ -255,18 +333,14 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         });
     }
 
-    if !machine_output {
-        println!("\n{} Found duplicates:", "▶".cyan());
-        println!("{}", linking::action_table(&actions));
-        print_space_summary(actions.is_empty(), total_saved_space);
+    if audience.is_chatty() {
+        report::print_plan(&actions, downloads, media, bytes_to_free);
     }
-    let out_path = resolve_report_path(downloads, &options);
+    let out_path = resolve_report_path(downloads, &options, planned_actions);
     let mut report_entries = build_report_entries(&actions, options.link_mode);
 
     let ApplyOutcome {
-        applied: applied_actions,
-        already_linked,
-        skipped,
+        counts: applied,
         strict_error: strict_link_error,
         cancelled: apply_cancelled,
     } = if options.dry_run {
@@ -287,13 +361,15 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         }
         maybe_confirm_apply(options.require_confirm, planned_actions)?;
         logger::info("run", "starting apply phase");
+        if audience.is_chatty() && planned_actions > 0 {
+            println!("{} Linking…", "▶".cyan());
+        }
         apply_actions(
             &actions,
             media,
             &ApplyOptions {
                 downloads,
                 strict: options.strict,
-                json_output: options.json_output,
                 tui_events: options.tui_events,
                 link_mode: options.link_mode,
                 cancel: &options.cancel,
@@ -304,49 +380,67 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     };
     if apply_cancelled {
         let message = format!(
-            "Link cancelled after {applied_actions} of {planned_actions} action(s); the rest stay planned."
+            "Link cancelled after {} of {planned_actions} action(s); the rest stay planned.",
+            applied.applied
         );
         logger::info("run", &message);
         if options.tui_events {
             let _ = types::emit_tui_event(&TuiEvent::Log {
                 message: message.clone(),
             });
-        } else if !options.json_output {
+        } else if audience.is_person() {
             eprintln!("{} {message}", "⚠".yellow());
         }
     }
 
-    if skipped > 0 && !machine_output {
-        println!(
-            "{} Left alone {skipped} pair(s) on purpose; each entry's `error` in the report says why.",
-            "ℹ".cyan()
-        );
-    }
-    if already_linked > 0 && !machine_output {
-        println!(
-            "{} {already_linked} pair(s) already were one file; nothing changed. The filesystem gives one file different inode numbers: on mergerfs, mount with inodecalc=hybrid-hash, or use_ino on older versions.",
-            "ℹ".cyan()
-        );
-    }
-    if !machine_output {
+    if audience.is_chatty() {
+        // Each pair left alone on purpose, with why: the run decided it, so a
+        // person should see it, though nothing failed.
+        for reason in report_entries
+            .iter()
+            .filter(|entry| entry.is_skipped())
+            .filter_map(|entry| entry.error.as_deref())
+        {
+            eprintln!("{} {reason}", "⚠".yellow());
+        }
+        if applied.already_linked > 0 {
+            println!(
+                "{} {} pair(s) already were one file; nothing changed. The filesystem gives one file different inode numbers: on mergerfs, mount with inodecalc=hybrid-hash, or use_ino on older versions.",
+                "ℹ".cyan(),
+                applied.already_linked
+            );
+        }
         report::print_dangling_symlinks(&metrics.dangling_symlinks);
+    }
+    if audience.is_person() {
         print_run_summary(
             files_seen,
             &metrics,
-            planned_actions,
-            applied_actions,
             report::symlinked_count(&report_entries),
             &warnings,
+            audience,
         );
     }
 
+    let strict_error = strict_failure(strict_link_error, options.strict, &warnings);
+    let outcome = if strict_error.is_some() {
+        Outcome::Failed
+    } else if apply_cancelled {
+        Outcome::Cancelled
+    } else {
+        Outcome::Complete
+    };
     let report = build_run_report(
         &options,
         RunReportInput {
+            outcome,
+            started_at,
+            downloads,
+            media,
             files_seen,
             planned_actions,
-            applied_actions,
-            total_saved_space,
+            planned_bytes: bytes_to_free,
+            applied,
             metrics: metrics.clone(),
             warnings: warnings.clone(),
             entries: report_entries,
@@ -356,40 +450,97 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         logger::info("run", format!("writing report to {}", path.display()));
         try_write_run_report(path, &report);
     }
-
-    if let Err(err) = maybe_return_strict_errors(strict_link_error, options.strict, &warnings) {
-        if options.tui_events {
-            let _ = types::emit_tui_event(&TuiEvent::Error {
-                message: err.to_string(),
-            });
+    match audience {
+        // A script reading --json gets the report of a run --strict
+        // stopped too.
+        Audience::Script => println!("{}", serde_json::to_string_pretty(&report)?),
+        Audience::Person | Audience::Quiet if !options.dry_run => report::Verdict {
+            planned: planned_actions,
+            applied,
+            failed: warnings.link_errors,
+            symlinked: report.symlinked,
+            cancelled: apply_cancelled,
+            report: out_path.as_deref(),
         }
-        return Err(err);
-    }
-
-    let finished_mode = report.mode.clone();
-    let finished_planned = report.planned_actions;
-    let finished_applied = report.applied_actions;
-    let finished_warnings = report.warning_total();
-
-    if options.json_output {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else if options.tui_events {
-        let _ = types::emit_tui_event(&TuiEvent::Done { report });
-    } else if options.dry_run {
-        println!("{} Dry-run; no changes.", "ℹ".yellow());
-    }
-
-    if !machine_output {
-        println!("{} Done.", "✔".green());
+        .print(audience),
+        Audience::Person if planned_actions > 0 => println!(
+            "{} Scan only: nothing was changed. `dejaview link` links them.",
+            "ℹ".cyan()
+        ),
+        _ => {}
     }
     logger::info(
         "run",
         format!(
-            "finished mode={} planned={} applied={} warnings={}",
-            finished_mode, finished_planned, finished_applied, finished_warnings
+            "finished mode={} outcome={:?} planned={} applied={} warnings={}",
+            report.mode,
+            report.outcome,
+            report.planned_actions,
+            report.applied_actions,
+            report.warning_total()
         ),
     );
-    Ok(())
+
+    if let Some(error) = strict_error {
+        return Err(anyhow::Error::new(StoppedWithReport {
+            report: Box::new(report),
+            error,
+        }));
+    }
+
+    let end = RunEnd::of(outcome, report.warning_total() > 0);
+    if options.tui_events {
+        let _ = types::emit_tui_event(&TuiEvent::Done {
+            report: Box::new(report),
+        });
+    }
+    Ok(end)
+}
+
+/// A run `--strict` stopped while walking or hashing still answers a script
+/// with a report (ADR 0003): outcome `failed`, what the walk counted, no
+/// entries. It goes to `--report` when one was given, as `--json` when
+/// asked, and rides on the error to the dashboard. Any other error, a
+/// cancel or a refusal, is returned as it is.
+fn stopped_before_planning(
+    err: anyhow::Error,
+    options: &ScanRunOptions<'_>,
+    started_at: std::time::SystemTime,
+    (downloads, media): (&std::path::Path, &std::path::Path),
+    metrics: RunMetrics,
+    warnings: RunWarnings,
+) -> anyhow::Error {
+    if !options.strict || err.is::<Cancelled>() || report::warning_total(&warnings) == 0 {
+        return err;
+    }
+    let report = build_run_report(
+        options,
+        RunReportInput {
+            outcome: Outcome::Failed,
+            started_at,
+            downloads,
+            media,
+            files_seen: metrics.files_seen,
+            planned_actions: 0,
+            planned_bytes: 0,
+            applied: Default::default(),
+            metrics,
+            warnings,
+            entries: Vec::new(),
+        },
+    );
+    if let Some(path) = resolve_report_path(downloads, options, 0) {
+        try_write_run_report(&path, &report);
+    }
+    if options.audience() == Audience::Script
+        && let Ok(json) = serde_json::to_string_pretty(&report)
+    {
+        println!("{json}");
+    }
+    anyhow::Error::new(StoppedWithReport {
+        report: Box::new(report),
+        error: err,
+    })
 }
 
 /// The two roots of a run, as the filesystem knows them.
@@ -513,6 +664,7 @@ fn plan_by_walking(
         metrics,
     )?;
     let files_seen = files.len();
+    metrics.files_seen = files_seen;
     logger::info("run", format!("collected {} candidate files", files_seen));
     for path in &metrics.dangling_symlinks {
         logger::warn(
@@ -590,8 +742,16 @@ fn plan_by_walking(
         )
     });
     let mut pruned = 0;
-    if hash_result.is_ok() && warnings.walk_errors == 0 && warnings.metadata_errors == 0 {
-        pruned = prune_cache(&mut cache, &seen_paths);
+    if hash_result.is_ok() {
+        // A folder that could not be read keeps its entries; the rest of
+        // the cache still follows the trees, so one unreadable folder (a
+        // NAS's recycle bin) does not stop pruning for good.
+        let unreadable: Vec<String> = metrics
+            .unreadable
+            .iter()
+            .map(|(path, in_downloads)| keys.key(path, *in_downloads))
+            .collect();
+        pruned = prune_cache(&mut cache, &seen_paths, &unreadable);
         if pruned > 0 {
             logger::info(
                 "cache",
@@ -601,7 +761,7 @@ fn plan_by_walking(
     } else {
         logger::info(
             "cache",
-            "walk was incomplete; keeping entries for paths not seen this run",
+            "hashing stopped early; keeping entries for paths not seen this run",
         );
     }
     // Hashes finished before a cancel or a strict failure are valid: keep
@@ -676,10 +836,12 @@ fn report_second_mount_skips(
         skipped.len(),
         skipped[0].0.display()
     );
-    if options.tui_events {
-        let _ = types::emit_tui_event(&TuiEvent::Log { message });
-    } else if !options.json_output {
-        eprintln!("{} {message}", "⚠".yellow());
+    match options.audience() {
+        Audience::Dashboard => {
+            let _ = types::emit_tui_event(&TuiEvent::Log { message });
+        }
+        Audience::Person => eprintln!("{} {message}", "⚠".yellow()),
+        Audience::Quiet | Audience::Script => {}
     }
 }
 

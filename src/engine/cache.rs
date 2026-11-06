@@ -92,8 +92,8 @@ impl CacheKeys {
             (MEDIA_KEY_ROOT, &self.media)
         };
         match path.strip_prefix(root) {
-            Ok(rel) => format!("{name}/{}", rel.to_string_lossy()),
-            Err(_) => path.to_string_lossy().into_owned(),
+            Ok(rel) => format!("{name}/{}", lossless(rel)),
+            Err(_) => lossless(path),
         }
     }
 
@@ -127,12 +127,41 @@ impl CacheKeys {
     }
 }
 
+/// A path as a string that loses nothing: UTF-8 as it is, and each byte
+/// that is not as a NUL and two hex digits. No path holds a NUL, so two
+/// names that differ only in such bytes get different keys, where a lossy
+/// string gave them one; a UTF-8 path's key is what it always was.
+fn lossless(path: &Path) -> String {
+    use std::fmt::Write;
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = String::new();
+    for chunk in path.as_os_str().as_bytes().utf8_chunks() {
+        out.push_str(chunk.valid());
+        for byte in chunk.invalid() {
+            let _ = write!(out, "\0{byte:02x}");
+        }
+    }
+    out
+}
+
 /// Drop entries for paths this run did not see, so the cache follows the trees
-/// instead of growing with every file that ever passed through them. Returns how
-/// many entries were dropped.
-pub(super) fn prune_cache(cache: &mut Cache, seen: &HashSet<String>) -> usize {
+/// instead of growing with every file that ever passed through them. An entry
+/// for a path the walk could not read, or under a folder it could not, is
+/// kept: the file may well still be there. Returns how many entries were
+/// dropped.
+pub(super) fn prune_cache(
+    cache: &mut Cache,
+    seen: &HashSet<String>,
+    unreadable: &[String],
+) -> usize {
+    let under = |key: &str, path: &str| {
+        key == path
+            || key
+                .strip_prefix(path)
+                .is_some_and(|rest| path.ends_with('/') || rest.starts_with('/'))
+    };
     let before = cache.len();
-    cache.retain(|path, _| seen.contains(path));
+    cache.retain(|key, _| seen.contains(key) || unreadable.iter().any(|path| under(key, path)));
     before - cache.len()
 }
 
@@ -175,7 +204,9 @@ pub(super) fn audit_temp_artifacts(config: &Config) -> Result<Vec<std::path::Pat
             Ok(entry) => entry,
             Err(_) => continue,
         };
-        if !entry.file_type().is_file() {
+        // A run stopped between the symlink and the rename leaves a temp
+        // symlink, which is removed as a link, never followed.
+        if !(entry.file_type().is_file() || entry.file_type().is_symlink()) {
             continue;
         }
         let Some(name) = entry.file_name().to_str() else {

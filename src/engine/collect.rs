@@ -264,6 +264,7 @@ struct Found {
     skipped_by_min_age: u64,
     skipped_by_exclude: u64,
     dangling_symlinks: Vec<PathBuf>,
+    unreadable: Vec<PathBuf>,
 }
 
 impl Found {
@@ -275,11 +276,17 @@ impl Found {
         self.skipped_by_min_age += other.skipped_by_min_age;
         self.skipped_by_exclude += other.skipped_by_exclude;
         self.dangling_symlinks.extend(other.dangling_symlinks);
+        self.unreadable.extend(other.unreadable);
     }
 
     /// Hand the counts to the run and return the files, sorted by path so a
     /// run's order does not depend on which worker got where first.
-    fn finish(mut self, warnings: &mut RunWarnings, metrics: &mut RunMetrics) -> Vec<FileInfo> {
+    fn finish(
+        mut self,
+        in_downloads: bool,
+        warnings: &mut RunWarnings,
+        metrics: &mut RunMetrics,
+    ) -> Vec<FileInfo> {
         warnings.walk_errors += self.walk_errors;
         warnings.metadata_errors += self.metadata_errors;
         metrics.skipped_by_min_size += self.skipped_by_min_size;
@@ -287,6 +294,10 @@ impl Found {
         metrics.skipped_by_exclude += self.skipped_by_exclude;
         self.dangling_symlinks.sort();
         metrics.dangling_symlinks.extend(self.dangling_symlinks);
+        self.unreadable.sort();
+        metrics
+            .unreadable
+            .extend(self.unreadable.into_iter().map(|path| (path, in_downloads)));
         self.files.sort_by(|a, b| a.path.cmp(&b.path));
         self.files
     }
@@ -334,6 +345,14 @@ impl<'a> Walk<'a> {
 
     fn walk_error(&self, shared: &WalkShared, found: &mut Found, path: &Path, err: std::io::Error) {
         found.walk_errors += 1;
+        found.unreadable.push(path.to_path_buf());
+        logger::warn(
+            "scan",
+            format!(
+                "cannot read {}: {err}; what it holds is left out of this run. Make it readable, or add its name to the exclude list (`dejaview config set-exclude`)",
+                path.display()
+            ),
+        );
         if self.options.strict {
             shared.stop.set(anyhow!(
                 "walk error under {}: cannot read {}: {err}. Make it readable, add its name to the exclude list (`dejaview config set-exclude`), or run without --strict, which skips it with a warning",
@@ -419,6 +438,14 @@ impl<'a> Walk<'a> {
             Ok(meta) => meta,
             Err(err) => {
                 found.metadata_errors += 1;
+                found.unreadable.push(path.clone());
+                logger::warn(
+                    "scan",
+                    format!(
+                        "cannot read the metadata of {}: {err}; it is left out of this run. Make it readable, or add its name to the exclude list (`dejaview config set-exclude`)",
+                        path.display()
+                    ),
+                );
                 if self.options.strict {
                     shared
                         .stop
@@ -500,7 +527,7 @@ fn walk_roots(
                 .lock()
                 .map(|mut found| std::mem::take(&mut *found))
                 .unwrap_or_default();
-            found.finish(warnings, metrics)
+            found.finish(walk.in_downloads, warnings, metrics)
         })
         .collect();
     shared.stop.into_result()?;

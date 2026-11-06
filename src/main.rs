@@ -92,6 +92,9 @@ struct RunOutputArgs {
     /// Write run report JSON to this path
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Print nothing unless a link was made or something failed, as a cron job wants
+    #[arg(long, short = 'q', conflicts_with = "json")]
+    quiet: bool,
     /// Progress display mode
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
@@ -110,11 +113,11 @@ enum ProgressMode {
     Off,
 }
 
-fn progress_enabled(mode: ProgressMode, no_progress: bool, json: bool, tui_events: bool) -> bool {
-    if no_progress || json || tui_events {
+fn progress_enabled(output: &RunOutputArgs) -> bool {
+    if output.no_progress || output.json || output.quiet || output.tui_events {
         return false;
     }
-    match mode {
+    match output.progress {
         ProgressMode::Auto => std::io::stdout().is_terminal(),
         ProgressMode::On => true,
         ProgressMode::Off => false,
@@ -198,7 +201,7 @@ impl From<LinkModeArg> for LinkMode {
 
 fn main() -> ExitCode {
     match run_cli() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(err) if err.is::<engine::Cancelled>() => {
             eprintln!(
                 "{} Stopped before changing anything. The hashes finished so far are saved in the cache, so the next run starts from there.",
@@ -219,15 +222,47 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_cli() -> Result<()> {
-    let cli = Cli::parse();
+/// The exit code of a scan or link that returned (ADR 0003): 0 when nothing
+/// failed, 2 when it finished with failures `--strict` would have stopped on,
+/// and 1 for a link stopped on request partway, which did not finish.
+fn exit_code_of(end: engine::RunEnd) -> ExitCode {
+    match end {
+        engine::RunEnd::Clean => ExitCode::SUCCESS,
+        engine::RunEnd::WithFailures => ExitCode::from(2),
+        engine::RunEnd::Cancelled => ExitCode::FAILURE,
+    }
+}
+
+/// The command line, or the exit code for one that cannot run. clap would
+/// exit 2 on a usage error, which ADR 0003 keeps for a run that finished
+/// with failures: a script must not take a typo for a run that wrote its
+/// report. A usage error exits 1, as any run that could not start; help and
+/// version exit 0.
+fn parse_cli() -> std::result::Result<Cli, ExitCode> {
+    Cli::try_parse().map_err(|err| {
+        let _ = err.print();
+        if err.use_stderr() {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        }
+    })
+}
+
+fn run_cli() -> Result<ExitCode> {
+    let cli = match parse_cli() {
+        Ok(cli) => cli,
+        Err(code) => return Ok(code),
+    };
     let command_name = command_name(&cli.command);
     let (_log_session, log_place) = logger::init(command_name);
     match &log_place {
         Ok(place) => logger::info("main", format!("logger initialized at {place}")),
         Err(warning) => eprintln!("{} {warning}", "⚠".yellow()),
     }
-    let mut config = load_config()?;
+    // Loaded inside each command, so that for a dashboard's scan or link a
+    // broken config file ends the event stream like any other error.
+    let loaded = load_config();
 
     match cli.command {
         Commands::Scan {
@@ -236,31 +271,31 @@ fn run_cli() -> Result<()> {
             symlink_only,
             output,
         } => {
-            ensure_required_paths(&config)?;
-            if min_size.is_some() {
-                config.min_size = min_size;
-            }
-            engine::run_scan_with_options(
-                &config,
-                engine::ScanRunOptions {
-                    dry_run: true,
-                    strict,
-                    report_path: output.report.as_deref(),
-                    json_output: output.json,
-                    show_progress: progress_enabled(
-                        output.progress,
-                        output.no_progress,
-                        output.json,
-                        output.tui_events,
-                    ),
-                    require_confirm: false,
-                    tui_events: output.tui_events,
-                    link_mode: effective_link_mode(&config, symlink_only),
-                    only_sources: &[],
-                    only_pairs: &[],
-                    cancel: run_cancel_token(output.tui_events),
-                },
-            )?
+            let end = tui_stream(output.tui_events, || {
+                let mut config = loaded?;
+                ensure_required_paths(&config)?;
+                if min_size.is_some() {
+                    config.min_size = min_size;
+                }
+                engine::run_scan_with_options(
+                    &config,
+                    engine::ScanRunOptions {
+                        dry_run: true,
+                        strict,
+                        report_path: output.report.as_deref(),
+                        json_output: output.json,
+                        quiet: output.quiet,
+                        show_progress: progress_enabled(&output),
+                        require_confirm: false,
+                        tui_events: output.tui_events,
+                        link_mode: effective_link_mode(&config, symlink_only),
+                        only_sources: &[],
+                        only_pairs: &[],
+                        cancel: run_cancel_token(output.tui_events),
+                    },
+                )
+            })?;
+            return Ok(exit_code_of(end));
         }
         Commands::Link {
             strict,
@@ -271,144 +306,168 @@ fn run_cli() -> Result<()> {
             plan,
             output,
         } => {
-            ensure_required_paths(&config)?;
-            let only_pairs = match &plan {
-                Some(path) => read_plan(path)?,
-                None => Vec::new(),
-            };
-            let only_sources: Vec<PathBuf> = if only_pairs.is_empty() {
-                only_sources
-            } else {
-                only_pairs.iter().map(|(src, _)| src.clone()).collect()
-            };
-            if min_size.is_some() {
-                config.min_size = min_size;
-            }
-            engine::run_scan_with_options(
-                &config,
-                engine::ScanRunOptions {
-                    dry_run: false,
-                    strict,
-                    report_path: output.report.as_deref(),
-                    json_output: output.json,
-                    show_progress: progress_enabled(
-                        output.progress,
-                        output.no_progress,
-                        output.json,
-                        output.tui_events,
-                    ),
-                    require_confirm: confirm,
-                    tui_events: output.tui_events,
-                    link_mode: effective_link_mode(&config, symlink_only),
-                    only_sources: &only_sources,
-                    only_pairs: &only_pairs,
-                    cancel: run_cancel_token(output.tui_events),
-                },
-            )?
+            let end = tui_stream(output.tui_events, || {
+                let mut config = loaded?;
+                ensure_required_paths(&config)?;
+                let only_pairs = match &plan {
+                    Some(path) => read_plan(path)?,
+                    None => Vec::new(),
+                };
+                let only_sources: Vec<PathBuf> = if only_pairs.is_empty() {
+                    only_sources
+                } else {
+                    only_pairs.iter().map(|(src, _)| src.clone()).collect()
+                };
+                if min_size.is_some() {
+                    config.min_size = min_size;
+                }
+                engine::run_scan_with_options(
+                    &config,
+                    engine::ScanRunOptions {
+                        dry_run: false,
+                        strict,
+                        report_path: output.report.as_deref(),
+                        json_output: output.json,
+                        quiet: output.quiet,
+                        show_progress: progress_enabled(&output),
+                        require_confirm: confirm,
+                        tui_events: output.tui_events,
+                        link_mode: effective_link_mode(&config, symlink_only),
+                        only_sources: &only_sources,
+                        only_pairs: &only_pairs,
+                        cancel: run_cancel_token(output.tui_events),
+                    },
+                )
+            })?;
+            return Ok(exit_code_of(end));
         }
-        Commands::Config(args) => match args.command {
-            ConfigCommands::SetDownloads { path } => {
-                config.downloads = Some(normalize_runtime_dir(&path)?);
-                save_config(&config)?;
-                println!("{} Downloads path set.", "✔".green());
-            }
-            ConfigCommands::SetMedia { path } => {
-                config.media = Some(normalize_runtime_dir(&path)?);
-                save_config(&config)?;
-                println!("{} Media path set.", "✔".green());
-            }
-            ConfigCommands::Show => {
-                println!("{}", serde_json::to_string_pretty(&config)?);
-            }
-            ConfigCommands::SetMinAge { seconds } => {
-                config.min_age = Some(seconds);
-                save_config(&config)?;
-                println!("{} min_age set to {} seconds.", "✔".green(), seconds);
-            }
-            ConfigCommands::SetMinSize { bytes } => {
-                config.min_size = Some(bytes);
-                save_config(&config)?;
-                println!("{} min_size set to {} bytes.", "✔".green(), bytes);
-            }
-            ConfigCommands::SetThreads { count } => {
-                if count == 0 {
-                    return Err(anyhow::anyhow!(
-                        "threads must be at least 1: it is how many files are walked and quick-hashed at once; 16 suits a network drive"
-                    ));
+        Commands::Config(args) => {
+            let mut config = loaded?;
+            match args.command {
+                ConfigCommands::SetDownloads { path } => {
+                    config.downloads = Some(normalize_runtime_dir(&path)?);
+                    save_config(&config)?;
+                    println!("{} Downloads path set.", "✔".green());
                 }
-                config.threads = Some(count);
-                save_config(&config)?;
-                println!("{} threads set to {}.", "✔".green(), count);
-            }
-            ConfigCommands::SetFullThreads { count } => {
-                if count == 0 {
-                    return Err(anyhow::anyhow!(
-                        "full threads must be at least 1: it is how many files are read in full at once; use 2, or 1 for a single spinning disk"
-                    ));
+                ConfigCommands::SetMedia { path } => {
+                    config.media = Some(normalize_runtime_dir(&path)?);
+                    save_config(&config)?;
+                    println!("{} Media path set.", "✔".green());
                 }
-                config.full_threads = Some(count);
-                save_config(&config)?;
-                println!("{} full_threads set to {}.", "✔".green(), count);
-            }
-            ConfigCommands::SetExclude { patterns, default } => {
-                if default {
-                    config.exclude = None;
-                } else {
-                    config::check_exclude_patterns(&patterns)?;
-                    config.exclude = Some(patterns);
+                ConfigCommands::Show => {
+                    println!("{}", serde_json::to_string_pretty(&config)?);
                 }
-                save_config(&config)?;
-                let effective = config.effective_exclude();
-                if effective.is_empty() {
-                    println!("{} Walks now leave nothing out.", "✔".green());
-                } else {
-                    println!(
-                        "{} Walks now leave out: {}",
-                        "✔".green(),
-                        effective.join("  ")
-                    );
+                ConfigCommands::SetMinAge { seconds } => {
+                    config.min_age = Some(seconds);
+                    save_config(&config)?;
+                    println!("{} min_age set to {} seconds.", "✔".green(), seconds);
+                }
+                ConfigCommands::SetMinSize { bytes } => {
+                    config.min_size = Some(bytes);
+                    save_config(&config)?;
+                    println!("{} min_size set to {} bytes.", "✔".green(), bytes);
+                }
+                ConfigCommands::SetThreads { count } => {
+                    if count == 0 {
+                        return Err(anyhow::anyhow!(
+                            "threads must be at least 1: it is how many files are walked and quick-hashed at once; 16 suits a network drive"
+                        ));
+                    }
+                    config.threads = Some(count);
+                    save_config(&config)?;
+                    println!("{} threads set to {}.", "✔".green(), count);
+                }
+                ConfigCommands::SetFullThreads { count } => {
+                    if count == 0 {
+                        return Err(anyhow::anyhow!(
+                            "full threads must be at least 1: it is how many files are read in full at once; use 2, or 1 for a single spinning disk"
+                        ));
+                    }
+                    config.full_threads = Some(count);
+                    save_config(&config)?;
+                    println!("{} full_threads set to {}.", "✔".green(), count);
+                }
+                ConfigCommands::SetExclude { patterns, default } => {
+                    if default {
+                        config.exclude = None;
+                    } else {
+                        config::check_exclude_patterns(&patterns)?;
+                        config.exclude = Some(patterns);
+                    }
+                    save_config(&config)?;
+                    let effective = config.effective_exclude();
+                    if effective.is_empty() {
+                        println!("{} Walks now leave nothing out.", "✔".green());
+                    } else {
+                        println!(
+                            "{} Walks now leave out: {}",
+                            "✔".green(),
+                            effective.join("  ")
+                        );
+                    }
+                }
+                ConfigCommands::SetLinkMode { mode } => {
+                    config.link_mode = Some(mode.into());
+                    save_config(&config)?;
+                    println!("{} link mode set.", "✔".green());
+                }
+                ConfigCommands::Validate => validate_config(&config)?,
+            }
+        }
+        Commands::Cache(args) => {
+            let config = loaded?;
+            match args.command {
+                CacheCommands::Clear => {
+                    engine::clear_cache(&config)?;
+                    println!("{} Cache cleared.", "✔".green());
+                }
+                CacheCommands::Info => {
+                    let (path, entries) = engine::cache_info(&config)?;
+                    println!("Cache location: {}", path.display());
+                    println!("Cached entries: {}", entries);
+                }
+                CacheCommands::AuditTemp => {
+                    let paths = engine::audit_temp_artifacts(&config)?;
+                    println!("Temp artifacts: {}", paths.len());
+                    for path in paths {
+                        println!("{}", path.display());
+                    }
+                }
+                CacheCommands::CleanupTemp => {
+                    let paths = engine::cleanup_temp_artifacts(&config)?;
+                    println!("Removed temp artifacts: {}", paths.len());
+                    for path in paths {
+                        println!("{}", path.display());
+                    }
                 }
             }
-            ConfigCommands::SetLinkMode { mode } => {
-                config.link_mode = Some(mode.into());
-                save_config(&config)?;
-                println!("{} link mode set.", "✔".green());
-            }
-            ConfigCommands::Validate => validate_config(&config)?,
-        },
-        Commands::Cache(args) => match args.command {
-            CacheCommands::Clear => {
-                engine::clear_cache(&config)?;
-                println!("{} Cache cleared.", "✔".green());
-            }
-            CacheCommands::Info => {
-                let (path, entries) = engine::cache_info(&config)?;
-                println!("Cache location: {}", path.display());
-                println!("Cached entries: {}", entries);
-            }
-            CacheCommands::AuditTemp => {
-                let paths = engine::audit_temp_artifacts(&config)?;
-                println!("Temp artifacts: {}", paths.len());
-                for path in paths {
-                    println!("{}", path.display());
-                }
-            }
-            CacheCommands::CleanupTemp => {
-                let paths = engine::cleanup_temp_artifacts(&config)?;
-                println!("Removed temp artifacts: {}", paths.len());
-                for path in paths {
-                    println!("{}", path.display());
-                }
-            }
-        },
+        }
         Commands::Tui { strict } => {
-            tui::run(&config, strict)?;
+            tui::run(&loaded?, strict)?;
         }
         Commands::TuiLogoPreview => {
             tui::run_logo_preview()?;
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Run a scan or link, and when the dashboard drives it, frame its event
+/// stream: `hello` first, and for a run that fails, from a missing path to a
+/// strict failure, one `error` or `cancelled` last. A run that returns emits
+/// its own `done`.
+fn tui_stream<F>(tui_events: bool, run: F) -> Result<engine::RunEnd>
+where
+    F: FnOnce() -> Result<engine::RunEnd>,
+{
+    if tui_events {
+        engine::open_tui_stream();
+    }
+    let result = run();
+    if tui_events && let Err(err) = &result {
+        engine::close_tui_stream_on(err);
+    }
+    result
 }
 
 fn command_name(command: &Commands) -> &'static str {
@@ -484,11 +543,19 @@ fn read_plan(path: &std::path::Path) -> Result<Vec<(PathBuf, PathBuf)>> {
     }
     // A row given twice is linked once: the second would fail as changed.
     let mut seen = std::collections::HashSet::new();
-    Ok(pairs
-        .into_iter()
-        .map(|pair| (PathBuf::from(pair.source), PathBuf::from(pair.target)))
-        .filter(|pair| seen.insert(pair.clone()))
-        .collect())
+    let mut rows = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        let invalid =
+            |err: String| anyhow::anyhow!("the plan {} is not valid: {err}", path.display());
+        let row = (
+            protocol::path_from(&pair.source, pair.source_raw.as_deref()).map_err(invalid)?,
+            protocol::path_from(&pair.target, pair.target_raw.as_deref()).map_err(invalid)?,
+        );
+        if seen.insert(row.clone()) {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
 }
 
 fn effective_link_mode(config: &config::Config, symlink_only: bool) -> LinkMode {
@@ -555,7 +622,7 @@ fn validate_config(config: &config::Config) -> Result<()> {
         )
     {
         if let Err(err) = config::ensure_roots_disjoint(&downloads, &media) {
-            failures.push(err.to_string());
+            failures.push(format!("{err:#}"));
         } else if let Err(err) =
             engine::ensure_roots_not_mounted_inside(&downloads, &media, config.effective_exclude())
         {

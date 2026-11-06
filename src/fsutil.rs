@@ -4,12 +4,34 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// `path` resolved and absolute, which must be a folder. An error names the
+/// path, since the OS error alone ("No such file or directory") does not.
 pub fn normalize_runtime_dir(path: &Path) -> Result<PathBuf> {
-    let canonical = fs::canonicalize(path)?;
+    let canonical = fs::canonicalize(path).map_err(|err| {
+        anyhow!(
+            "cannot use {} as a folder: {err}; check the path, and that its drive is mounted",
+            path.display()
+        )
+    })?;
     if !canonical.is_dir() {
-        return Err(anyhow!("path is not a directory: {}", canonical.display()));
+        return Err(anyhow!(
+            "{} is a file, not a folder; give the folder that holds it",
+            canonical.display()
+        ));
     }
     Ok(canonical)
+}
+
+/// A path typed by a person, with a leading `~` standing for `home`, as a
+/// shell would read it. Only `~` and `~/...`; `~user` is left alone.
+pub fn expand_home(input: &str, home: Option<&Path>) -> PathBuf {
+    match (input.strip_prefix('~'), home) {
+        (Some(""), Some(home)) => home.to_path_buf(),
+        (Some(rest), Some(home)) if rest.starts_with('/') => {
+            home.join(rest.trim_start_matches('/'))
+        }
+        _ => PathBuf::from(input),
+    }
 }
 
 pub fn safe_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -72,6 +94,37 @@ mod tests {
             std::process::id(),
             ts
         ))
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_used_is_named_in_the_error() {
+        let missing = unique_temp_dir("missing").join("nope");
+        let err = normalize_runtime_dir(&missing).expect_err("missing folder");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&missing.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("No such file or directory"), "{message}");
+    }
+
+    #[test]
+    fn a_leading_tilde_is_the_home_folder() {
+        let home = Path::new("/home/someone");
+        assert_eq!(expand_home("~", Some(home)), PathBuf::from("/home/someone"));
+        assert_eq!(
+            expand_home("~/media/TV", Some(home)),
+            PathBuf::from("/home/someone/media/TV")
+        );
+        assert_eq!(
+            expand_home("~other/x", Some(home)),
+            PathBuf::from("~other/x")
+        );
+        assert_eq!(
+            expand_home("/srv/media", Some(home)),
+            PathBuf::from("/srv/media")
+        );
+        assert_eq!(expand_home("~/x", None), PathBuf::from("~/x"));
     }
 
     #[test]

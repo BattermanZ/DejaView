@@ -1,7 +1,9 @@
 use ratatui::layout::Alignment;
 use ratatui::prelude::*;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap,
+};
 
 use crate::tui::app::{App, ConfigEditor, ConfigField, ConfirmLinkMode, Overlay};
 use crate::tui::layout;
@@ -9,15 +11,53 @@ use crate::tui::model::LinkReportEntry;
 use crate::tui::theme::Theme;
 use crate::tui::wordmark;
 
-fn format_bytes(bytes: u64) -> String {
-    let units = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
+/// A size in binary units, as the CLI prints it: `4.9 KiB`.
+pub(crate) fn format_bytes(bytes: u64) -> String {
+    let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
     let mut value = bytes as f64;
     let mut idx = 0usize;
     while value >= 1024.0 && idx < units.len() - 1 {
         value /= 1024.0;
         idx += 1;
     }
-    format!("{value:.2} {}", units[idx])
+    if idx == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", units[idx])
+    }
+}
+
+/// A row's path as the table shows it: below its folder, or whole when the
+/// person asked for full paths with `p`.
+fn row_path<'a>(path: &'a str, root: Option<&std::path::Path>, expand: bool) -> &'a str {
+    if expand {
+        return path;
+    }
+    root.and_then(|root| std::path::Path::new(path).strip_prefix(root).ok())
+        .and_then(|rel| rel.to_str())
+        .filter(|rel| !rel.is_empty())
+        .unwrap_or(path)
+}
+
+/// Cut `path` to `width` characters, keeping its file name, which is what
+/// tells one episode from the next: the folders give way first, from the
+/// left. A file name too long on its own keeps its start, where a release
+/// names its title and episode; its end is a release group the rows share.
+fn trim_keep_name(path: &str, width: usize) -> String {
+    let count = path.chars().count();
+    if count <= width {
+        return path.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if name.chars().count() < width {
+        let tail: String = path.chars().skip(count - (width - 1)).collect();
+        return format!("…{tail}");
+    }
+    let start: String = name.chars().take(width - 1).collect();
+    format!("{start}…")
 }
 
 fn trim_middle(input: &str, max_len: usize) -> String {
@@ -45,10 +85,10 @@ fn trim_to_width(input: &str, width: u16) -> String {
 }
 
 fn status_chip_style(row: &LinkReportEntry, _is_selected: bool) -> Style {
-    if row.status.eq_ignore_ascii_case("failed") {
+    if row.is_failed() {
         return Theme::chip_danger();
     }
-    if row.status.eq_ignore_ascii_case("planned") || row.status.eq_ignore_ascii_case("skipped") {
+    if row.is_planned() || row.is_skipped() {
         return Theme::chip_pending();
     }
     if row
@@ -62,14 +102,14 @@ fn status_chip_style(row: &LinkReportEntry, _is_selected: bool) -> Style {
 }
 
 fn row_style(row: &LinkReportEntry, is_selected: bool) -> Style {
-    if row.status.eq_ignore_ascii_case("failed") {
+    if row.is_failed() {
         return if is_selected {
             Theme::result_row_selected().fg(Theme::danger().fg.unwrap_or(Color::Reset))
         } else {
             Theme::danger()
         };
     }
-    if row.status.eq_ignore_ascii_case("planned") || row.status.eq_ignore_ascii_case("skipped") {
+    if row.is_planned() || row.is_skipped() {
         return if is_selected {
             Theme::result_row_selected().fg(Theme::muted().fg.unwrap_or(Color::Reset))
         } else {
@@ -258,8 +298,17 @@ fn empty_results_lines() -> Vec<Line<'static>> {
     ]
 }
 
+/// A row's status in the STATE column, at most seven letters so the column
+/// stays narrow; OUTCOME and the Inspector say "ALREADY LINKED" in full.
+fn state_label(row: &LinkReportEntry) -> String {
+    if row.is_already_linked() {
+        return "ALREADY".to_string();
+    }
+    row.status.to_uppercase()
+}
+
 fn outcome_label(row: &LinkReportEntry) -> String {
-    if row.status.eq_ignore_ascii_case("already-linked") {
+    if row.is_already_linked() {
         return "ALREADY LINKED".to_string();
     }
     match row.method.as_deref() {
@@ -387,35 +436,59 @@ fn header_activity_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn footer_line() -> Line<'static> {
-    Line::from(vec![
-        Span::styled(" q ", Theme::badge()),
-        Span::styled("quit", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" e ", Theme::badge_accent()),
-        Span::styled("paths", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" S ", Theme::badge()),
-        Span::styled("scan", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" l ", Theme::badge()),
-        Span::styled("link one", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" L ", Theme::badge()),
-        Span::styled("link all", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" c ", Theme::badge()),
-        Span::styled("cancel", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" p ", Theme::badge()),
-        Span::styled("paths", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" j/k ", Theme::badge()),
-        Span::styled("rows", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" ? ", Theme::badge()),
-        Span::styled("help", Theme::muted()),
-    ])
+/// The footer's keys, in the order shown, each with how much it matters
+/// when the terminal is too narrow for all: `q` and `?` always stay, since
+/// Help lists the rest.
+const FOOTER_KEYS: [(&str, &str, u8); 9] = [
+    ("q", "quit", 0),
+    ("e", "paths", 3),
+    ("S", "scan", 1),
+    ("l", "link one", 2),
+    ("L", "link all", 2),
+    ("c", "cancel", 1),
+    ("p", "paths", 5),
+    ("j/k", "rows", 4),
+    ("?", "help", 0),
+];
+
+/// As many of the footer's keys as fit in `width`, dropping the least
+/// needed first.
+fn footer_line(width: u16) -> Line<'static> {
+    let cost = |(key, label, _): &(&str, &str, u8)| key.chars().count() + label.chars().count() + 4;
+    let mut shown: Vec<bool> = vec![true; FOOTER_KEYS.len()];
+    let total = |shown: &[bool]| -> usize {
+        FOOTER_KEYS
+            .iter()
+            .zip(shown)
+            .filter(|(_, shown)| **shown)
+            .map(|(key, _)| cost(key))
+            .sum()
+    };
+    for level in (1..=5).rev() {
+        if total(&shown) <= usize::from(width) {
+            break;
+        }
+        for (index, (_, _, priority)) in FOOTER_KEYS.iter().enumerate() {
+            if *priority == level {
+                shown[index] = false;
+            }
+        }
+    }
+    let mut spans = Vec::new();
+    for ((key, label, _), _) in FOOTER_KEYS.iter().zip(&shown).filter(|(_, shown)| **shown) {
+        spans.push(Span::styled(
+            format!(" {key} "),
+            if *key == "e" {
+                Theme::badge_accent()
+            } else {
+                Theme::badge()
+            },
+        ));
+        spans.push(Span::styled(label.to_string(), Theme::muted()));
+        spans.push(Span::raw("  "));
+    }
+    spans.pop();
+    Line::from(spans)
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -487,23 +560,31 @@ pub fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(Block::default().style(Theme::canvas()), area);
     let l = layout::dashboard(area);
 
-    render_header(frame, l.top, app);
+    if l.compact_header {
+        render_compact_header(frame, l.top, app);
+    } else {
+        render_header(frame, l.top, app);
+    }
 
-    let left_block = pane_block("Workspace", false);
-    let left_inner = left_block.inner(l.center_left);
-    let left = Paragraph::new(sidebar_lines(app, left_inner.width))
-        .block(left_block)
-        .style(Theme::panel())
-        .wrap(Wrap { trim: true });
-    frame.render_widget(left, l.center_left);
+    if let Some(sidebar) = l.center_left {
+        let left_block = pane_block("Workspace", false);
+        let left_inner = left_block.inner(sidebar);
+        let left = Paragraph::new(sidebar_lines(app, left_inner.width))
+            .block(left_block)
+            .style(Theme::panel())
+            .wrap(Wrap { trim: true });
+        frame.render_widget(left, sidebar);
+    }
 
     render_results(frame, l.center_main, app);
 
-    let details = Paragraph::new(inspector_lines(app))
-        .block(pane_block("Inspector", false))
-        .style(Theme::panel())
-        .wrap(Wrap { trim: true });
-    frame.render_widget(details, l.center_right);
+    if let Some(inspector) = l.center_right {
+        let details = Paragraph::new(inspector_lines(app))
+            .block(pane_block("Inspector", false))
+            .style(Theme::panel())
+            .wrap(Wrap { trim: true });
+        frame.render_widget(details, inspector);
+    }
 
     let log_block = pane_block("Run Log", false);
     let log_inner = log_block.inner(l.bottom_log);
@@ -516,31 +597,93 @@ pub fn render(frame: &mut Frame, app: &App) {
     .style(Theme::panel());
     frame.render_widget(log, l.bottom_log);
 
-    let footer = Paragraph::new(footer_line())
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Theme::line())
-                .style(Theme::canvas()),
-        )
+    let footer_block = Block::default()
+        .borders(if l.footer_border {
+            Borders::TOP
+        } else {
+            Borders::NONE
+        })
+        .border_style(Theme::line())
+        .style(Theme::canvas());
+    let footer = Paragraph::new(footer_line(l.footer.width))
+        .block(footer_block)
         .style(Theme::canvas());
     frame.render_widget(footer, l.footer);
 
     match app.overlay() {
         Overlay::None => {}
-        Overlay::Help => render_help_overlay(frame),
-        Overlay::JsonPreview(json) => render_json_overlay(frame, json),
+        Overlay::Help => render_help_overlay(frame, app),
+        Overlay::JsonPreview(json) => render_json_overlay(frame, app, json),
         Overlay::ConfigEditor(editor) => render_config_overlay(frame, editor),
         Overlay::ConfirmLink(mode) => render_confirm_link_overlay(frame, app, *mode),
+        Overlay::ConfirmRescan => render_confirm_rescan_overlay(frame),
         Overlay::BlockingNotice(message) => render_blocking_notice_overlay(frame, message),
     }
 }
 
+/// The counts the header's cards show, as one line for a short terminal.
+/// Too narrow for every count, the line drops FILES first, which the
+/// activity line repeats, then APPLIED, so the space counts stay whole.
+fn metrics_line(app: &App, width: u16) -> Line<'static> {
+    let counts = [
+        ("FILES", app.files_considered().to_string(), 2),
+        ("PLANNED", app.planned_actions().to_string(), 0),
+        ("APPLIED", app.applied_actions().to_string(), 1),
+        ("SAVED", format_bytes(app.saved_bytes()), 0),
+        ("TO SAVE", format_bytes(app.potential_saved_bytes()), 0),
+    ];
+    let separator = "  ";
+    let fits = |most: u8| {
+        let shown = counts.iter().filter(|(_, _, drop)| *drop <= most);
+        let text: usize = shown
+            .clone()
+            .map(|(label, value, _)| label.chars().count() + 1 + value.chars().count())
+            .sum();
+        text + separator.len() * shown.count().saturating_sub(1) <= usize::from(width)
+    };
+    let most = (0..=2).rev().find(|&most| fits(most)).unwrap_or(0);
+    let mut spans = Vec::new();
+    for (label, value, _) in counts.into_iter().filter(|(_, _, drop)| *drop <= most) {
+        spans.push(Span::styled(format!("{label} "), Theme::dim()));
+        spans.push(Span::styled(value, Theme::metric_number()));
+        spans.push(Span::raw(separator));
+    }
+    spans.pop();
+    Line::from(spans)
+}
+
+/// The header of a short or narrow terminal: one block, no wordmark, the
+/// counts on one line above the activity.
+fn render_compact_header(frame: &mut Frame, area: Rect, app: &App) {
+    let block = card_block("DejaView", true);
+    let inner = block.inner(area);
+    let mut lines = vec![metrics_line(app, inner.width)];
+    lines.extend(header_activity_lines(app, area.width));
+    lines.truncate(usize::from(inner.height));
+    frame.render_widget(
+        Paragraph::new(lines).block(block).style(Theme::card()),
+        area,
+    );
+}
+
+/// The widths of the five metric cards in `width` columns: each at least
+/// wide enough for its title, the rest shared out.
+fn metric_widths(width: u16) -> [u16; 5] {
+    let mut widths = [11u16, 11, 11, 13, 13];
+    let spare = width.saturating_sub(widths.iter().sum());
+    for (index, slot) in widths.iter_mut().enumerate() {
+        *slot += spare / 5 + u16::from(index < usize::from(spare % 5));
+    }
+    widths
+}
+
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-    let brand_width = area.width.saturating_sub(52).clamp(28, 60);
+    // The cards need 59 columns for their titles; the wordmark takes what
+    // is left, within reason.
+    let brand_width = area.width.saturating_sub(62).clamp(24, 60);
     let split = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(brand_width), Constraint::Min(52)])
+        .constraints([Constraint::Length(brand_width), Constraint::Min(59)])
         .split(area);
 
     let brand_block = Block::default()
@@ -573,13 +716,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 
     let metrics = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(16),
-            Constraint::Percentage(14),
-            Constraint::Percentage(14),
-            Constraint::Percentage(28),
-            Constraint::Percentage(28),
-        ])
+        .constraints(metric_widths(right[0].width).map(Constraint::Length))
         .split(right[0]);
 
     frame.render_widget(
@@ -620,17 +757,26 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Length(2), Constraint::Min(1)])
         .split(inner);
 
+    // The counts after the row count repeat the header's, so a narrow pane
+    // leaves them out rather than cutting them mid-word.
+    let phase = app.activity_phase();
+    let rows = format!("{} rows", app.rows().len());
+    let counts = format!(
+        "{rows}  |  {} files  |  {} planned  |  {} applied",
+        app.files_considered(),
+        app.planned_actions(),
+        app.applied_actions()
+    );
+    let room = usize::from(content[0].width).saturating_sub(phase.chars().count() + 2);
     let summary = Paragraph::new(Line::from(vec![
-        Span::styled(app.activity_phase(), Theme::title(true)),
+        Span::styled(phase, Theme::title(true)),
         Span::raw("  "),
         Span::styled(
-            format!(
-                "{} rows  |  {} files  |  {} planned  |  {} applied",
-                app.rows().len(),
-                app.files_considered(),
-                app.planned_actions(),
-                app.applied_actions()
-            ),
+            if counts.chars().count() <= room {
+                counts
+            } else {
+                rows
+            },
             Theme::muted(),
         ),
     ]))
@@ -645,21 +791,38 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let state_width = 12u16;
+    let state_width = 10u16;
+    let size_width = 9u16;
     let max_outcome_len = app
         .rows()
         .iter()
         .map(|row| outcome_label(row).chars().count())
         .max()
         .unwrap_or_else(|| "OUTCOME".chars().count());
-    let outcome_width = (max_outcome_len as u16 + 2).clamp(12, 18);
-    let source_width = content[1]
+    let outcome_width = (max_outcome_len as u16 + 1).clamp(8, 16);
+    let spacing = 1u16;
+    // The download is what tells rows apart, so it keeps its room: a narrow
+    // table leaves the outcome to the Inspector, and only a wide one shows
+    // the library file too.
+    let show_outcome = content[1].width >= 66;
+    let show_target = content[1].width >= 110;
+    let columns = 3 + u16::from(show_outcome) + u16::from(show_target);
+    let fixed = state_width + size_width + if show_outcome { outcome_width } else { 0 };
+    // The selected row's marker takes a column of its own on every row.
+    let marker_width = 2u16;
+    let flexible = content[1]
         .width
-        .saturating_sub(state_width)
-        .saturating_sub(outcome_width)
-        .saturating_sub(4);
+        .saturating_sub(marker_width + fixed + spacing * (columns - 1));
+    let (source_width, target_width) = if show_target {
+        let source = flexible * 11 / 20;
+        (source, flexible - source)
+    } else {
+        (flexible, 0)
+    };
     let visible_capacity = usize::from(content[1].height.saturating_sub(1));
+    app.view_sizes().result_rows.set(visible_capacity);
     let (start, end) = visible_row_window(app.rows().len(), app.selected_row(), visible_capacity);
+    let expand = app.expand_paths();
 
     let rows: Vec<Row> = app
         .rows()
@@ -669,21 +832,34 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         .take(end.saturating_sub(start))
         .map(|(idx, row)| {
             let is_selected = idx == app.selected_row();
-            Row::new(vec![
+            let style = row_style(row, is_selected);
+            let mut cells = vec![
                 Cell::from(Span::styled(
-                    format!(" {} ", row.status.to_uppercase()),
+                    format!(" {} ", state_label(row)),
                     status_chip_style(row, is_selected),
                 )),
                 Cell::from(Span::styled(
-                    trim_to_width(&row.source, source_width),
-                    row_style(row, is_selected),
+                    trim_keep_name(
+                        row_path(&row.source, app.downloads_root(), expand),
+                        usize::from(source_width),
+                    ),
+                    style,
                 )),
-                Cell::from(Span::styled(
-                    outcome_label(row),
-                    row_style(row, is_selected),
-                )),
-            ])
-            .style(if is_selected {
+                Cell::from(Span::styled(format_bytes(row.size), style)),
+            ];
+            if show_outcome {
+                cells.push(Cell::from(Span::styled(outcome_label(row), style)));
+            }
+            if show_target {
+                cells.push(Cell::from(Span::styled(
+                    trim_keep_name(
+                        row_path(&row.target, app.media_root(), expand),
+                        usize::from(target_width),
+                    ),
+                    style,
+                )));
+            }
+            Row::new(cells).style(if is_selected {
                 Theme::result_row_selected()
             } else {
                 Theme::result_row()
@@ -691,63 +867,129 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(state_width),
-            Constraint::Min(source_width.max(12)),
-            Constraint::Length(outcome_width),
-        ],
-    )
-    .header(Row::new(vec![
+    let mut widths = vec![
+        Constraint::Length(state_width),
+        Constraint::Length(source_width),
+        Constraint::Length(size_width),
+    ];
+    let mut header = vec![
         Cell::from(Span::styled("STATE", Theme::title(false))),
         Cell::from(Span::styled("SOURCE", Theme::title(false))),
-        Cell::from(Span::styled("OUTCOME", Theme::title(false))),
-    ]))
-    .style(Theme::panel())
-    .column_spacing(2);
-    frame.render_widget(table, content[1]);
+        Cell::from(Span::styled("SIZE", Theme::title(false))),
+    ];
+    if show_outcome {
+        widths.push(Constraint::Length(outcome_width));
+        header.push(Cell::from(Span::styled("OUTCOME", Theme::title(false))));
+    }
+    if show_target {
+        widths.push(Constraint::Length(target_width));
+        header.push(Cell::from(Span::styled("TARGET", Theme::title(false))));
+    }
+    // A marker and reverse video, so the selected row stands out on any
+    // terminal's colours, not only by a shade of background.
+    let table = Table::new(rows, widths)
+        .header(Row::new(header))
+        .style(Theme::panel())
+        .column_spacing(spacing)
+        .highlight_symbol("▶ ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .row_highlight_style(Theme::result_row_selected().add_modifier(Modifier::REVERSED));
+    let mut state = TableState::default().with_selected(app.selected_row().checked_sub(start));
+    frame.render_stateful_widget(table, content[1], &mut state);
 }
 
-fn render_help_overlay(frame: &mut Frame) {
-    let area = centered_rect(78, 72, frame.area());
-    frame.render_widget(Clear, area);
-    let help = Paragraph::new(
-        "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\np toggle compact/full paths\nj/k move rows\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nX clear cache and rescan\nl confirm and link selected row\nL confirm and run link-all job\nc cancel the running scan or link\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels",
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(Line::from(vec![Span::styled(" HELP ", Theme::title(true))]))
-            .style(Theme::popup())
-            .border_style(Theme::accent()),
-    )
-    .style(Theme::popup())
-    .wrap(Wrap { trim: true });
-    frame.render_widget(help, area);
+const HELP_TEXT: &str = "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\np toggle compact/full paths\nj/k or arrows move rows\nPgUp/PgDn move a page\ng/G or Home/End first and last row\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nX or x clear cache and rescan (asks first)\nl confirm and link selected row\nL confirm and run link-all job\nc cancel the running scan or link\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels";
+
+fn render_help_overlay(frame: &mut Frame, app: &App) {
+    let (area, lines) = dialog_for(frame.area(), 60, HELP_TEXT, 0);
+    render_scrolling_overlay(frame, app, area, lines, " HELP ", " ? or Esc close ");
 }
 
-fn render_json_overlay(frame: &mut Frame, json: &str) {
-    let area = centered_rect(90, 80, frame.area());
+fn render_json_overlay(frame: &mut Frame, app: &App, json: &str) {
+    let screen = frame.area();
+    let (area, lines) = dialog_for(screen, screen.width.saturating_sub(4).min(140), json, 0);
+    render_scrolling_overlay(frame, app, area, lines, " REPORT JSON ", " J or Esc close ");
+}
+
+/// An overlay that may be longer than the screen, scrolled by the app's
+/// keys: the view tells the app how many lines it has and shows at once.
+fn render_scrolling_overlay(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    lines: Vec<String>,
+    title: &str,
+    close: &str,
+) {
+    let shown = usize::from(area.height.saturating_sub(2));
+    let sizes = app.view_sizes();
+    sizes.overlay_rows.set(shown);
+    sizes.overlay_lines.set(lines.len());
+    let scroll = app.overlay_scroll().min(lines.len().saturating_sub(shown));
+    let mut hint = vec![];
+    if lines.len() > shown {
+        hint.push(Span::styled(
+            format!(
+                " {}-{} of {}  j/k PgUp/PgDn scroll ",
+                scroll + 1,
+                (scroll + shown).min(lines.len()),
+                lines.len()
+            ),
+            Theme::muted(),
+        ));
+    }
+    hint.push(Span::styled(close.to_string(), Theme::title(false)));
     frame.render_widget(Clear, area);
-    let body = Paragraph::new(json)
+    // The lines on screen, cut out here: Paragraph::scroll counts in u16,
+    // which a report of a few thousand entries outgrows.
+    let visible = lines[scroll..(scroll + shown).min(lines.len())].join("\n");
+    let body = Paragraph::new(visible)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(Line::from(vec![Span::styled(
-                    " REPORT JSON ",
+                    title.to_string(),
                     Theme::title(true),
                 )]))
+                .title_bottom(Line::from(hint).right_aligned())
                 .style(Theme::popup())
                 .border_style(Theme::accent()),
         )
-        .style(Theme::popup())
-        .wrap(Wrap { trim: false });
+        .style(Theme::popup());
     frame.render_widget(body, area);
 }
 
 fn render_config_overlay(frame: &mut Frame, editor: &ConfigEditor) {
-    let area = centered_rect(80, 55, frame.area());
+    let screen = frame.area();
+    let width = 90u16
+        .min(screen.width.saturating_sub(4))
+        .max(screen.width.min(20));
+    // The fields sit just inside the dialog's border.
+    let inner_width = usize::from(width.saturating_sub(2));
+    let status = editor
+        .error
+        .clone()
+        .unwrap_or_else(|| "Enter saves on the second field. Esc cancels.".to_string());
+    // The status box grows with its text, so a long error is read whole.
+    let status_lines = wrap_text(&status, inner_width.saturating_sub(2));
+    let tip = format!(
+        "Absolute paths to existing folders; ~ is your home folder. Both are checked before they are saved to {}.",
+        crate::config::config_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "the config file".to_string())
+    );
+    let tips = wrap_text(&tip, inner_width);
+    let status_height = u16::try_from(status_lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let tips_height = u16::try_from(tips.len()).unwrap_or(u16::MAX);
+    let height = (2 + 3 + 3 + status_height + tips_height).min(screen.height);
+    let area = Rect {
+        x: screen.x + (screen.width - width) / 2,
+        y: screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    };
     frame.render_widget(Clear, area);
 
     let sections = Layout::default()
@@ -755,8 +997,8 @@ fn render_config_overlay(frame: &mut Frame, editor: &ConfigEditor) {
         .constraints([
             Constraint::Length(3),
             Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(4),
+            Constraint::Length(status_height),
+            Constraint::Min(0),
         ])
         .margin(1)
         .split(area);
@@ -771,66 +1013,56 @@ fn render_config_overlay(frame: &mut Frame, editor: &ConfigEditor) {
         .border_style(Theme::accent());
     frame.render_widget(shell, area);
 
-    let downloads = Paragraph::new(editor.downloads.as_str())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Downloads")
-                .border_style(if editor.active_field == ConfigField::Downloads {
-                    Theme::accent()
-                } else {
-                    Theme::line()
-                }),
-        )
-        .style(Theme::input(editor.active_field == ConfigField::Downloads))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(downloads, sections[0]);
-
-    let media = Paragraph::new(editor.media.as_str())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Media")
-                .border_style(if editor.active_field == ConfigField::Media {
-                    Theme::accent()
-                } else {
-                    Theme::line()
-                }),
-        )
-        .style(Theme::input(editor.active_field == ConfigField::Media))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(media, sections[1]);
-
-    let status = Paragraph::new(
-        editor
-            .error
-            .clone()
-            .unwrap_or_else(|| "Enter saves on the second field. Esc cancels.".to_string()),
-    )
-    .style(if editor.error.is_some() {
-        Theme::danger()
-    } else {
-        Theme::muted()
-    })
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Status")
-            .border_style(Theme::line()),
+    let field = |title: &'static str, value: &str, active: bool| {
+        Paragraph::new(value.to_string())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(if active {
+                        Theme::accent()
+                    } else {
+                        Theme::line()
+                    }),
+            )
+            .style(Theme::input(active))
+    };
+    frame.render_widget(
+        field(
+            "Downloads",
+            &editor.downloads,
+            editor.active_field == ConfigField::Downloads,
+        ),
+        sections[0],
     );
+    frame.render_widget(
+        field(
+            "Media",
+            &editor.media,
+            editor.active_field == ConfigField::Media,
+        ),
+        sections[1],
+    );
+
+    let status = Paragraph::new(status_lines.join("\n"))
+        .style(if editor.error.is_some() {
+            Theme::danger()
+        } else {
+            Theme::muted()
+        })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Status")
+                .border_style(Theme::line()),
+        );
     frame.render_widget(status, sections[2]);
 
-    let tips = Paragraph::new(
-        "Use absolute paths to existing directories. The editor validates before saving to the repo config file.",
-    )
-    .style(Theme::muted())
-    .wrap(Wrap { trim: true });
+    let tips = Paragraph::new(tips.join("\n")).style(Theme::muted());
     frame.render_widget(tips, sections[3]);
 }
 
 fn render_confirm_link_overlay(frame: &mut Frame, app: &App, mode: ConfirmLinkMode) {
-    let area = centered_rect(70, 45, frame.area());
-    frame.render_widget(Clear, area);
     let (title, body) = match mode {
         ConfirmLinkMode::All => (
             " LINK ALL CONFIRMATION ",
@@ -862,7 +1094,9 @@ fn render_confirm_link_overlay(frame: &mut Frame, app: &App, mode: ConfirmLinkMo
         Span::styled(" n cancel ", Theme::title(false)),
     ])
     .right_aligned();
-    let body = Paragraph::new(body)
+    let (area, lines) = dialog_for(frame.area(), 76, &body, 0);
+    frame.render_widget(Clear, area);
+    let body = Paragraph::new(lines.join("\n"))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -871,15 +1105,41 @@ fn render_confirm_link_overlay(frame: &mut Frame, app: &App, mode: ConfirmLinkMo
                 .style(Theme::popup())
                 .border_style(Theme::accent()),
         )
-        .style(Theme::popup())
-        .wrap(Wrap { trim: true });
+        .style(Theme::popup());
+    frame.render_widget(body, area);
+}
+
+fn render_confirm_rescan_overlay(frame: &mut Frame) {
+    let text = "Clear the cache and scan again?\n\nEvery file in both folders is read again, as on a first run; on a network drive that can take hours. S scans reading only what changed.";
+    let (area, lines) = dialog_for(frame.area(), 64, text, 0);
+    frame.render_widget(Clear, area);
+    let prompt = Line::from(vec![
+        Span::styled(" y clear and scan ", Theme::title(true)),
+        Span::raw(" "),
+        Span::styled(" n cancel ", Theme::title(false)),
+    ])
+    .right_aligned();
+    let body = Paragraph::new(lines.join("\n"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Line::from(vec![Span::styled(
+                    " RESCAN FROM SCRATCH ",
+                    Theme::title(true),
+                )]))
+                .title_bottom(prompt)
+                .style(Theme::popup())
+                .border_style(Theme::accent()),
+        )
+        .style(Theme::popup());
     frame.render_widget(body, area);
 }
 
 fn render_blocking_notice_overlay(frame: &mut Frame, message: &str) {
-    let area = centered_rect(70, 35, frame.area());
+    let text = format!("{message}\n\nPress q, Esc, or Enter to dismiss.");
+    let (area, lines) = dialog_for(frame.area(), 70, &text, 0);
     frame.render_widget(Clear, area);
-    let body = Paragraph::new(format!("{message}\n\nPress q, Esc, or Enter to dismiss."))
+    let body = Paragraph::new(lines.join("\n"))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -890,29 +1150,72 @@ fn render_blocking_notice_overlay(frame: &mut Frame, message: &str) {
                 .style(Theme::popup())
                 .border_style(Theme::accent()),
         )
-        .style(Theme::popup())
-        .wrap(Wrap { trim: true });
+        .style(Theme::popup());
     frame.render_widget(body, area);
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
+/// `text` wrapped to `width` columns at spaces; a word longer than a line is
+/// cut across lines, and each line of `text` starts a new one, keeping its
+/// indent on every line it wraps to, as JSON needs.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        let body = paragraph.trim_start_matches(' ');
+        let indent = (paragraph.len() - body.len()).min(width / 2);
+        let first = lines.len();
+        let width = width - indent;
+        let mut line = String::new();
+        for word in body.split(' ') {
+            let mut word: Vec<char> = word.chars().collect();
+            let used = line.chars().count();
+            if used > 0 && used + 1 + word.len() > width {
+                lines.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            loop {
+                let room = width.saturating_sub(line.chars().count());
+                if word.len() <= room {
+                    break;
+                }
+                if room == 0 {
+                    lines.push(std::mem::take(&mut line));
+                    continue;
+                }
+                line.extend(word.drain(..room));
+                lines.push(std::mem::take(&mut line));
+            }
+            line.extend(word);
+        }
+        lines.push(line);
+        for line in &mut lines[first..] {
+            line.insert_str(0, &" ".repeat(indent));
+        }
+    }
+    lines
+}
 
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
+/// The area of a dialog for `text`: at most `max_width` columns wide and as
+/// tall as the wrapped text needs plus `extra_rows`, within the screen and
+/// centred on it. Returns the area and the wrapped lines.
+fn dialog_for(screen: Rect, max_width: u16, text: &str, extra_rows: u16) -> (Rect, Vec<String>) {
+    let width = max_width
+        .min(screen.width.saturating_sub(4))
+        .max(screen.width.min(20));
+    let lines = wrap_text(text, usize::from(width.saturating_sub(2)));
+    let wanted = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2 + extra_rows);
+    let height = wanted.min(screen.height);
+    let area = Rect {
+        x: screen.x + (screen.width - width) / 2,
+        y: screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    };
+    (area, lines)
 }
 
 #[cfg(test)]
@@ -929,6 +1232,7 @@ mod tests {
             method: Some("symlink".to_string()),
             fallback_reason: Some("cross-device".to_string()),
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(status_chip_style(&row, false), Theme::chip_success_alt());
@@ -944,6 +1248,7 @@ mod tests {
             method: Some("try-hardlink".to_string()),
             fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(outcome_label(&row), "TRY HARDLINK");
@@ -960,6 +1265,7 @@ mod tests {
             method: Some("try-hardlink".to_string()),
             fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(row_style(&row, false), Theme::muted());
@@ -975,6 +1281,7 @@ mod tests {
             method: Some("hardlink".to_string()),
             fallback_reason: None,
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(row_style(&row, true).bg, Theme::result_row_selected().bg);
@@ -1100,7 +1407,8 @@ mod tests {
             files_considered: 2,
             planned_actions: 2,
             applied_actions: 1,
-            total_saved_bytes: 30,
+            freed_bytes: 10,
+            total_saved_bytes: 10,
             skipped_by_min_age: 0,
             skipped_by_min_size: 0,
             skipped_by_exclude: 0,
@@ -1122,6 +1430,7 @@ mod tests {
                     method: Some("hardlink".to_string()),
                     fallback_reason: None,
                     error: None,
+                    ..Default::default()
                 },
                 LinkReportEntry {
                     source: "c".to_string(),
@@ -1131,12 +1440,14 @@ mod tests {
                     method: None,
                     fallback_reason: None,
                     error: None,
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         });
 
-        assert_eq!(format_bytes(app.saved_bytes()), "10.00 B");
-        assert_eq!(format_bytes(app.potential_saved_bytes()), "20.00 B");
+        assert_eq!(format_bytes(app.saved_bytes()), "10 B");
+        assert_eq!(format_bytes(app.potential_saved_bytes()), "20 B");
     }
 
     #[test]
@@ -1150,6 +1461,7 @@ mod tests {
             method: Some("try-hardlink".to_string()),
             fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
             error: None,
+            ..Default::default()
         };
         app.set_report_for_test(crate::protocol::RunReport {
             mode: "scan".to_string(),
@@ -1172,6 +1484,7 @@ mod tests {
                 link_errors: 0,
             },
             entries: vec![planned("/downloads/a.mkv"), planned("/downloads/b.mkv")],
+            ..Default::default()
         });
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
@@ -1221,7 +1534,9 @@ mod tests {
                 method: Some("try-hardlink".to_string()),
                 fallback_reason: None,
                 error: None,
+                ..Default::default()
             }],
+            ..Default::default()
         });
         for mode in [ConfirmLinkMode::All, ConfirmLinkMode::Selected] {
             let backend = ratatui::backend::TestBackend::new(80, 24);
@@ -1306,5 +1621,441 @@ mod tests {
         assert_eq!(visible_row_window(10, 9, 4), (6, 10));
         assert_eq!(visible_row_window(3, 9, 4), (0, 3));
         assert_eq!(visible_row_window(3, 0, 0), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod row_tests {
+    use super::*;
+    use crate::protocol::{RunReport, WarningSummary};
+
+    #[test]
+    fn a_trimmed_path_keeps_its_file_name() {
+        assert_eq!(trim_keep_name("a/b.mkv", 20), "a/b.mkv");
+        assert_eq!(
+            trim_keep_name("Show.S01/Show.S01E05.mkv", 18),
+            "…1/Show.S01E05.mkv"
+        );
+        // A name longer than the column keeps its start: title and episode.
+        assert_eq!(
+            trim_keep_name("Show/Show.Name.S01E05.1080p.WEB-DL-GROUP.mkv", 17),
+            "Show.Name.S01E05…"
+        );
+        assert_eq!(trim_keep_name("abc", 0), "");
+    }
+
+    #[test]
+    fn a_row_path_is_shown_below_its_folder_unless_expanded() {
+        let root = std::path::Path::new("/srv/torrents");
+        assert_eq!(
+            row_path("/srv/torrents/a/b.mkv", Some(root), false),
+            "a/b.mkv"
+        );
+        assert_eq!(
+            row_path("/srv/torrents/a/b.mkv", Some(root), true),
+            "/srv/torrents/a/b.mkv"
+        );
+        assert_eq!(
+            row_path("/elsewhere/b.mkv", Some(root), false),
+            "/elsewhere/b.mkv"
+        );
+        assert_eq!(
+            row_path("/srv/torrents/a/b.mkv", None, false),
+            "/srv/torrents/a/b.mkv"
+        );
+    }
+
+    /// A scan of `episodes` downloads under a long downloads folder.
+    pub(super) fn app_with_episodes(episodes: u32) -> App {
+        let downloads = "/tmp/claude-0/-home-user/a-very-long-session-folder/downloads";
+        let config = crate::config::Config {
+            downloads: Some(std::path::PathBuf::from(downloads)),
+            media: Some(std::path::PathBuf::from("/srv/media")),
+            ..crate::config::Config::default()
+        };
+        let mut app = App::new(&config, false);
+        let entries = (1..=episodes)
+            .map(|n| LinkReportEntry {
+                source: format!(
+                    "{downloads}/Show.Name.S01.1080p.WEB-DL.H.264-GROUP/Show.Name.S01E{n:02}.1080p.WEB-DL.H.264-GROUP.mkv"
+                ),
+                target: format!("/srv/media/TV/Show Name/Season 1/Show Name S01E{n:02}.mkv"),
+                size: 1_500_000_000,
+                status: "planned".to_string(),
+                method: Some("try-hardlink".to_string()),
+                fallback_reason: None,
+                error: None,
+                ..Default::default()
+            })
+            .collect();
+        app.set_report_for_test(RunReport {
+            mode: "scan".to_string(),
+            planned_actions: episodes as usize,
+            warnings: WarningSummary::default(),
+            entries,
+            ..RunReport::default()
+        });
+        app
+    }
+
+    pub(super) fn screen(app: &App, cols: u16, rows: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(cols, rows);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| render(frame, app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..rows)
+            .map(|y| {
+                (0..cols)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn rows_of_a_season_can_be_told_apart() {
+        let app = app_with_episodes(3);
+        let text = screen(&app, 120, 40);
+        for n in 1..=3 {
+            assert!(text.contains(&format!("S01E0{n}")), "episode {n}:\n{text}");
+        }
+        assert!(text.contains("SIZE") && text.contains("1.4 GiB"), "{text}");
+        assert!(
+            row_lines(&text)
+                .iter()
+                .all(|row| !row.contains("a-very-long-session-folder")),
+            "the downloads folder is not repeated in the rows:\n{text}"
+        );
+    }
+
+    /// The table's row lines: those with a row's state chip, which the
+    /// column pads with spaces (the PLANNED card's title is followed by its
+    /// border).
+    fn row_lines(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter(|line| line.contains(" PLANNED  "))
+            .collect()
+    }
+
+    #[test]
+    fn a_wide_table_shows_the_library_file_and_p_shows_full_paths() {
+        let mut app = app_with_episodes(2);
+        let text = screen(&app, 400, 40);
+        let rows = row_lines(&text);
+        assert_eq!(rows.len(), 2, "{text}");
+        assert!(text.contains("TARGET"), "{text}");
+        assert!(
+            rows[1].contains("TV/Show Name/Season 1/Show Name S01E02.mkv"),
+            "{text}"
+        );
+        assert!(!rows[1].contains("/srv/media"), "below its folder: {text}");
+
+        app.toggle_path_mode_for_test();
+        let text = screen(&app, 400, 40);
+        let rows = row_lines(&text);
+        assert!(
+            rows[1].contains("/srv/media/TV/Show Name/Season 1"),
+            "{text}"
+        );
+        assert!(rows[1].contains("/downloads/Show.Name.S01.1080p"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::row_tests::{app_with_episodes, screen};
+    use super::*;
+
+    #[test]
+    fn a_short_terminal_keeps_counts_log_and_help_and_drops_the_wordmark() {
+        let app = app_with_episodes(12);
+        for (cols, rows) in [(60, 20), (80, 24)] {
+            let text = screen(&app, cols, rows);
+            assert!(!text.contains('█'), "{cols}x{rows}: no wordmark\n{text}");
+            assert!(text.contains("PLANNED 12"), "{cols}x{rows}: counts\n{text}");
+            assert!(text.contains("Run Log"), "{cols}x{rows}: log\n{text}");
+            assert!(text.contains("? help"), "{cols}x{rows}: footer\n{text}");
+            for n in 1..=3 {
+                assert!(
+                    text.contains(&format!("S01E0{n}")),
+                    "{cols}x{rows}: rows told apart\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_sidebar_and_inspector_give_way_on_a_narrow_terminal() {
+        let app = app_with_episodes(3);
+        let wide = screen(&app, 120, 40);
+        assert!(wide.contains("Workspace") && wide.contains("Inspector"));
+        let medium = screen(&app, 80, 24);
+        assert!(!medium.contains("Workspace") && medium.contains("Inspector"));
+        let narrow = screen(&app, 60, 20);
+        assert!(!narrow.contains("Workspace") && !narrow.contains("Inspector"));
+    }
+
+    #[test]
+    fn metric_titles_are_never_cut() {
+        let app = app_with_episodes(3);
+        for (cols, rows) in [(100, 30), (120, 40), (200, 50)] {
+            let text = screen(&app, cols, rows);
+            for title in [" FILES ", " PLANNED ", " APPLIED ", " SAVED ", " TO SAVE "] {
+                assert!(text.contains(title), "{cols}x{rows}: {title}\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_dialog_is_as_tall_as_its_text() {
+        let screen_area = Rect::new(0, 0, 120, 40);
+        let (area, lines) = dialog_for(screen_area, 70, "One short line.", 0);
+        assert_eq!(lines, ["One short line."]);
+        assert_eq!((area.width, area.height), (70, 3));
+        // Never past the screen.
+        let (area, _) = dialog_for(Rect::new(0, 0, 30, 5), 70, &"word ".repeat(80), 0);
+        assert!(area.width <= 30 && area.height <= 5, "{area:?}");
+    }
+
+    #[test]
+    fn text_wraps_at_spaces_and_cuts_a_word_too_long_for_a_line() {
+        assert_eq!(wrap_text("one two three", 7), ["one two", "three"]);
+        assert_eq!(wrap_text("a\n\nb", 10), ["a", "", "b"]);
+        assert_eq!(
+            wrap_text("{\n  \"key\": \"one two\"\n}", 12),
+            ["{", "  \"key\":", "  \"one two\"", "}"]
+        );
+        assert_eq!(wrap_text("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        for line in wrap_text("media path is inside /a/very/long/path/that/goes/on", 12) {
+            assert!(line.chars().count() <= 12, "{line}");
+        }
+    }
+
+    #[test]
+    fn the_footer_keeps_quit_and_help_however_narrow() {
+        for width in [20u16, 40, 60, 80, 120] {
+            let line = footer_line(width).to_string();
+            assert!(
+                line.contains("q quit") && line.contains("? help"),
+                "{width}: {line}"
+            );
+            assert!(
+                line.chars().count() <= usize::from(width).max(17),
+                "{width}: {line}"
+            );
+        }
+        assert!(footer_line(120).to_string().contains("j/k rows"));
+    }
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::row_tests::{app_with_episodes, screen};
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key_for_test(code, KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn the_selected_row_carries_a_marker() {
+        let mut app = app_with_episodes(3);
+        press(&mut app, KeyCode::Down);
+        let text = screen(&app, 80, 24);
+        let marked: Vec<_> = text.lines().filter(|line| line.contains('▶')).collect();
+        assert_eq!(marked.len(), 1, "{text}");
+        assert!(marked[0].contains("S01E02"), "{text}");
+    }
+
+    #[test]
+    fn paging_keys_move_a_screen_and_to_either_end() {
+        let mut app = app_with_episodes(50);
+        screen(&app, 80, 24);
+        let page = app.view_sizes().result_rows.get();
+        assert!(page > 1);
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.selected_row(), page);
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.selected_row(), 49);
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(app.selected_row(), 49 - page);
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.selected_row(), 0);
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.selected_row(), 49);
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.selected_row(), 0);
+    }
+
+    #[test]
+    fn the_json_preview_scrolls_to_its_last_entry_and_j_does_not_close_it() {
+        let mut app = app_with_episodes(40);
+        press(&mut app, KeyCode::Char('J'));
+        let text = screen(&app, 80, 24);
+        assert!(!text.contains("S01E40"), "the start first:\n{text}");
+        press(&mut app, KeyCode::Char('j'));
+        assert!(
+            matches!(app.overlay(), Overlay::JsonPreview(_)),
+            "j scrolls"
+        );
+        press(&mut app, KeyCode::End);
+        let text = screen(&app, 80, 24);
+        assert!(
+            text.contains("S01E40") && text.lines().any(|line| line.contains("│  ]")),
+            "the end of the report:\n{text}"
+        );
+        press(&mut app, KeyCode::Char('J'));
+        assert!(matches!(app.overlay(), Overlay::None));
+    }
+
+    #[test]
+    fn help_scrolls_to_its_end_on_a_small_terminal() {
+        let mut app = app_with_episodes(1);
+        press(&mut app, KeyCode::Char('?'));
+        let text = screen(&app, 80, 24);
+        assert!(!text.contains("Esc cancels"), "{text}");
+        press(&mut app, KeyCode::Char('G'));
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("Esc cancels"), "{text}");
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.overlay(), Overlay::None));
+    }
+}
+
+#[cfg(test)]
+mod rescan_tests {
+    use super::row_tests::{app_with_episodes, screen};
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn the_rescan_question_fits_a_small_terminal() {
+        let mut app = app_with_episodes(1);
+        app.handle_key_for_test(KeyCode::Char('x'), KeyModifiers::NONE);
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("RESCAN FROM SCRATCH"), "{text}");
+        assert!(
+            text.contains("y clear and scan") && text.contains("n cancel"),
+            "{text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::row_tests::screen;
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn the_path_editor_names_the_config_file_and_shows_a_long_error_whole() {
+        let mut app = App::new(&crate::config::Config::default(), false);
+        app.handle_key_for_test(KeyCode::Char('e'), KeyModifiers::NONE);
+        let long =
+            "/tmp/claude-0/-home-user/fd53d022-d0e1-4c5b-9a7e-1f2e3d4c5b6a/downloads/library";
+        for c in long.chars() {
+            app.handle_key_for_test(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        app.handle_key_for_test(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_key_for_test(KeyCode::Enter, KeyModifiers::NONE);
+
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("config.json"), "{text}");
+        assert!(!text.contains("repo config file"), "{text}");
+        let error_lines = text
+            .lines()
+            .skip_while(|line| !line.contains("Status"))
+            .take_while(|line| !line.contains('└'))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(error_lines.contains("Downloads: cannot use"), "{text}");
+        assert!(
+            error_lines.contains("library"),
+            "the end of the path: {text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod long_overlay_tests {
+    use super::row_tests::{app_with_episodes, screen};
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn a_report_longer_than_65535_lines_scrolls_to_its_end() {
+        let mut app = app_with_episodes(7000);
+        app.handle_key_for_test(KeyCode::Char('J'), KeyModifiers::NONE);
+        screen(&app, 80, 24);
+        assert!(app.view_sizes().overlay_lines.get() > usize::from(u16::MAX));
+        app.handle_key_for_test(KeyCode::End, KeyModifiers::NONE);
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("S01E7000"), "the last entry:\n{text}");
+        assert!(text.lines().any(|line| line.contains("│  ]")), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod real_terminal_tests {
+    use super::row_tests::{app_with_episodes, screen};
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn a_narrow_header_keeps_the_space_counts_whole() {
+        let mut app = app_with_episodes(3);
+        app.set_report_for_test(crate::protocol::RunReport {
+            mode: "scan".to_string(),
+            files_considered: 123_456,
+            planned_actions: 3,
+            total_saved_bytes: 4_500_000_000,
+            ..Default::default()
+        });
+        let text = screen(&app, 60, 20);
+        let counts = text.lines().nth(1).expect("the counts line");
+        assert!(counts.contains("TO SAVE 4.2 GiB"), "{text}");
+        assert!(counts.contains("PLANNED 3"), "{text}");
+        assert!(!counts.contains("FILES"), "FILES gives way first: {counts}");
+        let wide = screen(&app, 80, 24);
+        assert!(
+            wide.lines()
+                .nth(1)
+                .is_some_and(|line| line.contains("FILES")),
+            "{wide}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_results_line_drops_the_repeated_counts_rather_than_cut_them() {
+        let app = app_with_episodes(3);
+        let text = screen(&app, 60, 20);
+        let line = text
+            .lines()
+            .find(|line| line.contains("READY TO REVIEW") && line.contains("rows"))
+            .expect("the results line");
+        assert!(!line.contains("files"), "{line}");
+        let wide = screen(&app, 200, 50);
+        assert!(
+            wide.contains("3 rows  |  0 files  |  3 planned  |  0 applied"),
+            "{wide}"
+        );
+    }
+
+    #[test]
+    fn the_path_editor_has_no_blank_rows_under_its_tip() {
+        let mut app = App::new(&crate::config::Config::default(), false);
+        app.handle_key_for_test(KeyCode::Char('e'), KeyModifiers::NONE);
+        let text = screen(&app, 80, 24);
+        let lines: Vec<&str> = text.lines().collect();
+        let tip_end = lines
+            .iter()
+            .position(|line| line.contains("config.json"))
+            .expect("the tip's last line");
+        // The editor's bottom-left corner, in its own column, right below.
+        assert_eq!(
+            lines[tip_end + 1].chars().nth(2),
+            Some('└'),
+            "the tip's last line sits on the border:\n{text}"
+        );
     }
 }

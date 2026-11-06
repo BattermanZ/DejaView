@@ -4,6 +4,10 @@
 
 ### After upgrading
 
+- A scan or link that finishes with a file it could not read, hash or link now exits with code 2, where it exited 0, a link run stopped partway by Ctrl+C, SIGTERM or the dashboard's cancel exits 1, and a command line DejaView cannot read, such as an unknown option, exits 1 where it exited 2. A cron line that alerts on any non-zero code now alerts on those runs; the report and the log say which file failed and why. [#5]
+- `total_saved_bytes` in a link run's report is what the run freed, where it was every planned path's size, failed ones included; in a scan's it counts a cross-seeded download once. `planned_bytes` and `freed_bytes` give both. [#5]
+- Files whose names are not valid UTF-8 are hashed once more on the first run, since their cache entries are now keyed by their exact bytes; every other entry is kept as it is. [#5]
+- A link run that planned nothing leaves `.dejaview_link_report.json` as it was, so it keeps the last run that did something. Before, every link run overwrote it, with an empty report when there was nothing to do. A path given with `--report` is still always written. [#5]
 - A scan, link or `cache cleanup-temp` that finds another run going exits with code 3 and changes nothing. A cron line that alerts on any non-zero code should treat 3 as nothing to report; the README's cron example does. [#3]
 - A report entry's `status` can now also be `already-linked` (the download already was the library file, so nothing changed; such pairs used to be reported as `applied`) or `skipped` (left alone on purpose, with the reason in `error`). A script that counts statuses should know both. [#3]
 - A pair that mergerfs's `link-exdev` option turned into a symlink is reported with `method` `symlink`, where it used to say `hardlink`. [#3]
@@ -15,6 +19,8 @@
 
 ### Added
 
+- `--quiet` (`-q`) on `scan` and `link` prints nothing unless the run linked something or something failed, so a cron job mails only when something happened. The README's cron example uses it. [#5]
+- The report says how its run ended (`outcome`: `complete`, `cancelled` or `failed`), when (`started_at`, `finished_at`), with what (`version`, `downloads`, `media`, `link_mode`), how many downloads became symlinks (`symlinked`) and how many pairs already were one file (`already_linked`, `already_linked_bytes`). [#5]
 - `dejaview config set-full-threads N` sets how many files are read in full at once. [#4]
 - `dejaview config set-exclude [PATTERN]...` sets the file and folder names every walk leaves out, as globs, with everything under them. The report counts what the list left out in `skipped_by_exclude`, the summary says how many, and the log names each. [#4]
 - `DEJAVIEW_CONFIG` sets the config file's path and `DEJAVIEW_LOG` the log's, or `-` for stderr, for containers and services run as a user with no home folder. [#3]
@@ -25,6 +31,7 @@
 
 ### Changed
 
+- `scan` and `link` print the downloads and media folders once and each path below its folder, with a size column, where every row repeated both absolute paths. A link run ends with one line saying what it did, such as `Linked 7 of 8, 8.0 MiB freed, 1 failed: see <report>`, naming any downloads that became symlinks, and a run that finds nothing says `No duplicates found.` over no table. Before, a run with failed links still ended with "Potential space saved" and "Done", and none said how much space it freed. Sizes are in KiB, MiB and GiB. [#5]
 - A scan or link run from the dashboard reports which file it is on and how many it has found or hashed up to ten times a second, instead of once for every file, which on a large library sent the dashboard hundreds of thousands of updates. [#4]
 - Hashing makes fewer round trips to a network drive: quick and full hashes read exactly the bytes they hash, where each spent one or two more reads finding the end of the file, and a full hash reads 8 MiB at a time instead of 1 MiB. [#4]
 - Linking makes fewer round trips to a network drive: each link looks up the library file once, where it looked it up four times, and the download once instead of twice. [#4]
@@ -38,6 +45,21 @@
 
 ### Fixed
 
+- A file whose name is not valid UTF-8 can be linked from the dashboard, and two names that differ only in such bytes are told apart: a report entry gives such a path's bytes in hex in `source_raw` or `target_raw`, and the cache keys each name apart. Before, `l` and `L` linked nothing for such a file, its report rows could not be told apart, and the cache kept one entry for both names, so both were hashed again on every run. [#5]
+- `cache audit-temp` and `cache cleanup-temp` find a temporary symlink left beside a download by a run stopped partway, and remove the link without touching the library file it points at. Before, they listed and removed only temporary files. [#5]
+- A folder DejaView cannot read, such as a NAS's recycle bin, no longer stops the cache from forgetting files that are gone: entries under that folder are kept and the rest are dropped as usual. Before, one unreadable folder kept every stale entry for good. The log now names each path a walk could not read, and why. [#5]
+- Verifying large files shows progress in bytes, with the speed and the time left, in the dashboard (`12.3 GiB of 40.0 GiB  |  150.0 MiB/s  |  ETA 03:05`) and on the CLI's progress bar. Before, both counted whole files, so a 60 GB remux sat at "0 / 8" for minutes, and a read that failed or that a cancel stopped was counted as verified. [#5]
+- `config set-downloads` and `config set-media` name the path they could not use, where they said only "No such file or directory". The dashboard's path editor reads `~` as the home folder, says which field an error is about, shows a long error whole, and names the config file it saves to. [#5]
+- In the dashboard, `x` and `X` ask before clearing the cache, which means reading every file again. Before, `x`, next to `c` and in no list of keys, cleared it at once. [#5]
+- In the dashboard, the selected row carries a marker and reverse video, `PgUp`, `PgDn`, `g`, `G`, `Home` and `End` move through the rows, and Help and the JSON preview scroll with the same keys, so a report of hundreds of entries can be read to its end; `j` no longer closes the preview. After `l` links a row, the selection moves to the next planned row instead of back to the first. [#5]
+- The dashboard fits an 80x24 terminal, and works down to 60x20: below 30 rows the header gives up the wordmark for one line of counts, below 100 columns the Workspace sidebar gives way and below 70 the Inspector, the dialogs are as tall as their text, the metric titles are never cut, and the footer always keeps `? help`. Before, at 80x24 the dialogs cut off their own prompt, Help stopped halfway and the Run Log had one line; at 60x20 the footer and the log disappeared. [#5]
+- The dashboard's rows can be told apart: each shows its download below the downloads folder, cut so the file name stays, with its size, and on a wide terminal the library file too. Before, every row showed the same start of its absolute path, so a season's episodes looked alike and, at 60 columns, showed only `/`. `p` switches the table between these and full paths. [#5]
+- The dashboard's Run Log keeps to what a person needs to read: progress counts ("Collected 25 file(s)", "Hashing files: 10 / 40", "Applied 3 / 8") stay on the activity line, which no longer names a file the run has moved past. Scanning before the paths are set opens the path editor, where it used to fail with "downloads path not set". [#5]
+- In the dashboard, a scan or link that fails, from a missing path to `--strict` stopping on a file it could not read, shows its error in one line, and a link `--strict` stopped partway shows which rows it linked and which failed. Before, a failure while hashing showed the run's raw error output, a backtrace included, and a link stopped partway left every row planned. [#5]
+- A dashboard left open while DejaView is upgraded keeps working: it runs scans and links with the binary it was started from, and refuses, asking to be restarted, a binary that speaks another version of its event stream. Before, once the binary was replaced on disk, every run failed. [#5]
+- A failed pair's `error` in the report keeps the OS error, such as "Read-only file system", where it said only which step failed, and its `method` and `fallback_reason` no longer claim the planned hardlink. [#5]
+- `--json --strict` prints the report before stopping on a failure, and a path given with `--report` is written, whether the failure came while walking, hashing or linking; a run stopped before it planned anything reports outcome `failed` with no entries. Before, it printed nothing on stdout and wrote no report. [#5]
+- Planned pairs come in download path order in the table, the report, `--json` and the dashboard. Before, the order changed on every run, so two reports could not be compared, and the dashboard's rows reshuffled when a scan finished. [#5]
 - Ctrl+C, SIGTERM (a cron timeout, `docker stop`) or SIGHUP stops a scan or link before its next file and keeps the hashes it finished; a second Ctrl+C stops at once. Before, it ended the process on the spot and every hash of the run was lost, so a first run over a network drive that was interrupted started over from nothing. A run started under `nohup` still ignores hang-ups. [#4]
 - While hashing, the cache is saved every five minutes, so a run killed outright (SIGKILL, a power cut, a container stopped without grace) loses at most that much hashing. Before, it was saved only once hashing ended. [#4]
 - A cache file that cannot be read or parsed is named in the log with the reason before DejaView starts over with an empty one. Before, it was replaced silently, and the next run hashed the whole library again with no explanation. [#4]
@@ -57,3 +79,4 @@
 
 [#3]: https://github.com/BattermanZ/DejaView/pull/3
 [#4]: https://github.com/BattermanZ/DejaView/pull/4
+[#5]: https://github.com/BattermanZ/DejaView/pull/5
