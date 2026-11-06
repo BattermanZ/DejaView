@@ -28,7 +28,7 @@ Ask before acting on these:
 
 1. Decided: the symlink fallback stays the default (`docs/adr/0001-a-download-that-cannot-be-hardlinked-becomes-a-symlink.md`). S3's other fixes stand.
 2. Decided: files under 1 MiB are skipped by default, empty files always (`docs/adr/0002-files-under-1-mib-are-left-alone.md`). This settles the size floor in S2 and P1.
-3. New dependencies need approval (AGENTS.md): a signal handler for Ctrl+C/SIGTERM (`signal-hook` or `ctrlc`, P5), optionally `jwalk` for the parallel walk (P3, can be done with rayon instead), optionally `libc` for `flock`/`fadvise` (C2; note `std::fs::File::try_lock` exists from Rust 1.89 while the MSRV is 1.88).
+3. Decided: add `ctrlc` with its `termination` feature, so SIGINT and SIGTERM cancel a CLI run and keep its hashes (P5). No `jwalk`: the parallel walk uses rayon, already a dependency (P3). No `libc`: set `rust-version = "1.89"` and take the lock with `std::fs::File::try_lock` (C2); the `fadvise` hint (P9) goes with it.
 4. Change what the CLI returns: a distinct exit code for "finished with failures", and timestamped reports instead of one overwritten file.
 
 ## Findings
@@ -81,7 +81,7 @@ Severity: High, Medium, Low. Evidence tags: **[verified]** reproduced in the mai
 **C2. Medium. No lock against concurrent runs.** **[reproduced]**
 - Where: `src/engine/mod.rs:131-174`, `report.rs:117-128`, `cache.rs:108-121`.
 - Two `link` runs over 300 pairs: no data damage, but 129/171 and 171/129 spurious "source changed" failures, both exit 0, and the second overwrote the first's report. The cache is last-writer-wins (atomic, but hashes are lost). `cache cleanup-temp` during a run can delete an in-flight temp link and force a symlink fallback.
-- Fix (small): a non-blocking exclusive lock on `<downloads>/.dejaview.lock` for scan, link and cleanup-temp; exit with a clear message and a distinct code when held. Fix the README cron line too (absolute binary path, `flock -n`, stdout to /dev/null, dated `--report`).
+- Fix (small): a non-blocking exclusive lock (`File::try_lock`, decision 3) on `<downloads>/.dejaview.lock` for scan, link and cleanup-temp; exit with a clear message and a distinct code when held. Fix the README cron line too (absolute binary path, `flock -n`, stdout to /dev/null, dated `--report`).
 
 **C3. Medium. Reports and errors don't match what happened.** **[reproduced]**
 - Where: `src/engine/mod.rs:186` (total computed before apply), `report.rs:117` (one fixed path), `report.rs:130-160`, `linking.rs:252, 306, 476-479, 500-505`, `mod.rs:297-312`, `hashing.rs:316, 400`.
@@ -145,7 +145,7 @@ Measured by the reviewer on a 93,730-file library shaped like a Jellyfin/Kodi li
 **P3. High. The folder walk is single-threaded and is the floor for every run.** **[reproduced]**
 - Where: `collect.rs:49-120` (WalkDir, one statx per file at :64).
 - Real mergerfs: 4.2-5.7 s for 93.7k files vs 0.23 s on ext4. Prototype parallel walk (rayon over `read_dir` plus `symlink_metadata`): serial 5.25 s, 4 threads 1.45 s, 16 threads 0.67 s. Sim: serial 65 s, 16 threads 4.0 s.
-- Fix (medium): parallel walk with its own concurrency (default about 16, not tied to CPU count); walk downloads and media at the same time; keep walk/metadata error counts, strict errors and cancel checks.
+- Fix (medium): parallel walk on rayon (decision 3) with its own concurrency (default about 16, not tied to CPU count); walk downloads and media at the same time; keep walk/metadata error counts, strict errors and cancel checks.
 
 **P4. Medium. One thread setting for two kinds of I/O.** **[reproduced in sim]**
 - Where: `main.rs:176-180` (rayon global pool, CPU count), `hashing.rs:282`, `:365`.
@@ -155,7 +155,7 @@ Measured by the reviewer on a 93,730-file library shaped like a Jellyfin/Kodi li
 **P5. Medium-High. Ctrl+C, SIGTERM or a cron timeout on a CLI run throws away every finished hash.** **[reproduced]**
 - Where: `main.rs:321-327` (cancel token wired only for `--tui-events`), `mod.rs:146-174` (cache saved once, after hashing).
 - A first run over copied pairs can take hours on a NAS; any interruption restarts from zero.
-- Fix: catch SIGINT/SIGTERM and call `CancelToken::cancel` (needs a dependency, see decisions); also save the cache periodically during the full pass (every few minutes or N GB).
+- Fix: catch SIGINT/SIGTERM and call `CancelToken::cancel` (with `ctrlc`, decision 3); also save the cache periodically during the full pass (every few minutes or N GB).
 
 **P6. Medium. TUI single-row link and link-all repeat the whole walk.** **[reproduced]**
 - Where: `src/tui/actions.rs:127-148`, `src/engine/mod.rs:99-145`.
@@ -231,9 +231,9 @@ All reproduced by rendering the TUI in a pty with pyte at 60x20, 80x24, 100x30, 
 
 **M1. High value. Stringly-typed values.** "planned" appears at 17 sites, "applied" at 11, "try-hardlink" at 10; each of the 5 phase strings at 5-10 sites; 20 `eq_ignore_ascii_case` comparisons. Where: `src/protocol.rs`, `src/engine/report.rs:130-185`, `linking.rs:471-478`, `src/tui/app.rs`, `view/mod.rs`. Replace with enums (`Mode`, `EntryStatus`, `LinkMethod`, `Phase`) with serde renames so the JSON stays byte-identical; add a golden test serialising a RunReport and a few TuiEvents against checked-in JSON; merge `RunWarnings`/`WarningSummary` and the duplicate `warning_total` and `format_size`/`format_bytes`. About 300 mechanical lines, low risk.
 
-**M2. High value. Releases and MSRV.** The real minimum Rust is exactly 1.88 (`cargo +1.88 build/test --locked` passes; 1.87 fails: ratatui 0.30.2, comfy-table, darling and instability need 1.88; let-chains need 1.88). Debian 13's rustc 1.85 can't build it. `cargo build --release --target x86_64-unknown-linux-musl` works out of the box (60 s, 3.3 MB static binary); aarch64-musl from x86 fails in blake3's C build without a cross sysroot. Recommend: `rust-version = "1.88"` in Cargo.toml; tag v0.1.0; a tag-triggered workflow building x86_64 and aarch64 `*-unknown-linux-musl` (aarch64 on `ubuntu-24.04-arm` or with cross), stripped, with sha256sums, attached to a GitHub Release; README install section using it; `[profile.release]` with `strip = true`, `lto = "thin"`. Optional container: `FROM scratch` plus the binary, `ENV XDG_CONFIG_HOME=/config XDG_STATE_HOME=/config`, run with `--user PUID:PGID`, mount `/data` with the same layout as the torrent client and *arrs, schedule from the host. Needs C4 first.
+**M2. High value. Releases and MSRV.** The real minimum Rust is exactly 1.88 (`cargo +1.88 build/test --locked` passes; 1.87 fails: ratatui 0.30.2, comfy-table, darling and instability need 1.88; let-chains need 1.88). Debian 13's rustc 1.85 can't build it. `cargo build --release --target x86_64-unknown-linux-musl` works out of the box (60 s, 3.3 MB static binary); aarch64-musl from x86 fails in blake3's C build without a cross sysroot. Recommend: `rust-version = "1.89"` in Cargo.toml (decision 3, for the lock); tag v0.1.0; a tag-triggered workflow building x86_64 and aarch64 `*-unknown-linux-musl` (aarch64 on `ubuntu-24.04-arm` or with cross), stripped, with sha256sums, attached to a GitHub Release; README install section using it; `[profile.release]` with `strip = true`, `lto = "thin"`. Optional container: `FROM scratch` plus the binary, `ENV XDG_CONFIG_HOME=/config XDG_STATE_HOME=/config`, run with `--user PUID:PGID`, mount `/data` with the same layout as the torrent client and *arrs, schedule from the host. Needs C4 first.
 
-**M3. Medium. CI hardening.** CI uses `@stable` with `-D warnings`, so a new Rust release can break an unrelated change. Pin the toolchain in `rust-toolchain.toml`; add `--locked` to clippy and test; add a `cargo +1.88 check --locked --all-targets` job; add a weekly cargo-audit job (prebuilt via `taiki-e/install-action`). cargo-audit 0.22.2 currently reports 0 vulnerabilities across 228 lockfile crates. The lockfile's apparent duplicates (syn 1, nix 0.29, bitflags 1, thiserror 1) come only from ratatui's termwiz backend, which isn't compiled (a clean release build compiles 112 crates).
+**M3. Medium. CI hardening.** CI uses `@stable` with `-D warnings`, so a new Rust release can break an unrelated change. Pin the toolchain in `rust-toolchain.toml`; add `--locked` to clippy and test; add a `cargo +1.89 check --locked --all-targets` job; add a weekly cargo-audit job (prebuilt via `taiki-e/install-action`). cargo-audit 0.22.2 currently reports 0 vulnerabilities across 228 lockfile crates. The lockfile's apparent duplicates (syn 1, nix 0.29, bitflags 1, thiserror 1) come only from ratatui's termwiz backend, which isn't compiled (a clean release build compiles 112 crates).
 
 **M4. Medium. Test gaps.**
 - Done in `just test`, which reruns the unit tests as `nobody` under root. A bare `cargo test` as root still reports the five as `ok`.
