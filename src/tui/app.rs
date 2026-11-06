@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
-use crate::config::{Config, load_config, save_config, validate_runtime_paths};
+use crate::config::{Config, load_config, save_config};
 use crate::engine::LinkMode;
 use crate::fsutil::{expand_home, normalize_runtime_dir};
 use crate::protocol::{Counts, Mode, Outcome, Phase, PlannedPair};
@@ -994,7 +994,7 @@ impl App {
         };
         config.downloads = Some(folder("Downloads", &editor.downloads)?);
         config.media = Some(folder("Media", &editor.media)?);
-        validate_runtime_paths(&config)?;
+        crate::config::check(&config)?;
         Ok(config)
     }
 

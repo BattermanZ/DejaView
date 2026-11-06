@@ -2,10 +2,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::*;
 use std::io::IsTerminal;
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod config;
 mod engine;
@@ -573,81 +571,32 @@ fn effective_link_mode(config: &config::Config, symlink_only: bool) -> LinkMode 
 }
 
 fn ensure_required_paths(config: &config::Config) -> Result<()> {
-    config::validate_runtime_paths(config)
+    config::check(config)?;
+    Ok(())
 }
 
+/// `config validate`: the check every run makes, then a walk of both folders
+/// for a second mount, then one real hardlink. Every problem is listed.
 fn validate_config(config: &config::Config) -> Result<()> {
-    let mut failures = Vec::new();
-
-    match &config.downloads {
-        Some(path) => {
-            if !path.exists() {
-                failures.push(format!("downloads path does not exist: {}", path.display()));
-            } else if !path.is_dir() {
-                failures.push(format!(
-                    "downloads path is not a directory: {}",
-                    path.display()
-                ));
-            } else {
-                match probe_directory_writable(path) {
-                    Ok(_) => {}
-                    Err(err) => failures.push(format!(
-                        "downloads path is not writable (needed for cache/link ops): {} ({err})",
-                        path.display()
-                    )),
-                }
+    let failures = match config::check(config) {
+        Ok(folders) => match engine::ensure_roots_not_mounted_inside(
+            &folders.downloads,
+            &folders.media,
+            config.effective_exclude(),
+        ) {
+            Ok(()) => {
+                report_hardlink_probe(&folders.downloads, &folders.media);
+                println!("{} Configuration is valid.", "✔".green());
+                return Ok(());
             }
-        }
-        None => failures.push(
-            "downloads path not set; run: dejaview config set-downloads /path/to/downloads"
-                .to_string(),
-        ),
+            Err(err) => vec![format!("{err:#}")],
+        },
+        Err(config::Problems(problems)) => problems,
+    };
+    for failure in &failures {
+        eprintln!("{} {}", "✖".red(), failure);
     }
-
-    match &config.media {
-        Some(path) => {
-            if !path.exists() {
-                failures.push(format!("media path does not exist: {}", path.display()));
-            } else if !path.is_dir() {
-                failures.push(format!("media path is not a directory: {}", path.display()));
-            } else if let Err(err) = fs::read_dir(path) {
-                failures.push(format!(
-                    "media path is not readable (needed for scan/hash): {} ({err})",
-                    path.display()
-                ));
-            }
-        }
-        None => failures
-            .push("media path not set; run: dejaview config set-media /path/to/media".to_string()),
-    }
-
-    if let (Some(downloads), Some(media)) = (&config.downloads, &config.media)
-        && let (Ok(downloads), Ok(media)) = (
-            normalize_runtime_dir(downloads),
-            normalize_runtime_dir(media),
-        )
-    {
-        if let Err(err) = config::ensure_roots_disjoint(&downloads, &media) {
-            failures.push(format!("{err:#}"));
-        } else if let Err(err) =
-            engine::ensure_roots_not_mounted_inside(&downloads, &media, config.effective_exclude())
-        {
-            failures.push(format!("{err:#}"));
-        }
-    }
-
-    if failures.is_empty() {
-        if let (Some(downloads), Some(media)) = (&config.downloads, &config.media) {
-            report_hardlink_probe(downloads, media);
-        }
-        println!("{} Configuration is valid.", "✔".green());
-        Ok(())
-    } else {
-        for failure in &failures {
-            eprintln!("{} {}", "✖".red(), failure);
-        }
-        Err(anyhow::anyhow!("configuration validation failed"))
-    }
+    Err(anyhow::anyhow!("configuration validation failed"))
 }
 
 /// Try one real hardlink and say what link runs will do. A failure is not a
@@ -676,25 +625,6 @@ fn report_hardlink_probe(downloads: &std::path::Path, media: &std::path::Path) {
     }
 }
 
-fn probe_directory_writable(path: &std::path::Path) -> Result<()> {
-    let probe = path.join(format!(
-        ".dejaview_validate_{}.{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)?;
-    file.write_all(b"probe")?;
-    file.sync_all()?;
-    fs::remove_file(&probe)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,8 +632,6 @@ mod tests {
     use std::fs;
 
     #[cfg(unix)]
-    use std::os::unix::fs::symlink;
-
     #[test]
     fn parses_scan_command() {
         let cli = Cli::try_parse_from(["dejaview", "scan", "--strict"]).expect("parse scan");
@@ -921,29 +849,6 @@ mod tests {
         match cli.command {
             Commands::TuiLogoPreview => {}
             _ => panic!("expected logo preview command"),
-        }
-    }
-
-    #[test]
-    fn probe_directory_writable_does_not_follow_existing_symlink() {
-        #[cfg(not(unix))]
-        {
-            return;
-        }
-
-        #[cfg(unix)]
-        {
-            let root = TempDir::new("probe_symlink");
-            let victim = root.join("victim");
-            fs::write(&victim, b"keep").expect("write victim");
-            let link = root.join(format!(".dejaview_validate_{}.{}", std::process::id(), 1u8));
-            symlink(&victim, &link).expect("create symlink");
-
-            for _ in 0..16 {
-                probe_directory_writable(&root).expect("probe should succeed");
-            }
-
-            assert_eq!(fs::read(&victim).expect("read victim"), b"keep");
         }
     }
 }
