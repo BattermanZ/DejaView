@@ -1,225 +1,225 @@
 # DejaView
 
-**DejaView** is a Rust-based CLI utility designed to detect and replace duplicate media files across separate folders (e.g., a download directory and an organised media library). It scans for exact duplicates by file size and BLAKE3 hash, then replaces redundant copies in the download tree with hardlinks to the canonical file in the media library, falling back to relative symlinks when the two live on different devices. A persistent JSON cache speeds up subsequent runs by skipping unchanged files.
+Find files in your downloads folder that are byte-for-byte copies of files in your media library, and replace each copy with a hardlink to the library file.
 
----
+This is for the usual torrent plus Sonarr/Radarr setup, where a finished download keeps seeding from the downloads folder while the library holds its own copy. When an import copied instead of hardlinking, that file is stored twice. DejaView finds those pairs by content, not by name, and turns the download into a hardlink, so the data is stored once and the torrent client keeps seeding. It never writes to the library.
 
-## Features
+```text
+$ dejaview scan
+▶ Found duplicates:
+╭──────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────╮
+│ Download                                                         ┆ Media                                       │
+╞══════════════════════════════════════════════════════════════════╪═════════════════════════════════════════════╡
+│ /srv/torrents/complete/Arrival.2016.1080p/Arrival.2016.1080p.mkv ┆ /srv/media/Movies/Arrival (2016).mkv        │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ /srv/torrents/complete/Show.S01/Show.S01E01.mkv                  ┆ /srv/media/TV/Show/Season 1/Show S01E01.mkv │
+╰──────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────╯
+💾 Potential space saved: 6.10 MB
+ℹ Files considered: 6
+ℹ Skipped by min-age: 0
+ℹ Planned actions: 2
+ℹ Dry-run; no changes.
+✔ Done.
+```
 
-*   **Size-prefiltered, hash-verified duplicates**: Groups files by size and confirms duplicates using BLAKE3 hashes.
-*   **Two-phase hashing**: Uses a fast sample hash to quickly filter out non-duplicates, then performs a full hash only on potential matches.
-*   **Persistent cache**: Stores `(path, size, mtime, hash)` in `.dejaview_cache.json` to skip rehashing unchanged files.
-*   **Hardlink first, symlink fallback**: Prefers hardlinks to reclaim space with no dangling references, and falls back to relative symlinks across devices (portable if the directory structure is mounted identically, which matters for Docker setups).
-*   **Concurrency**: Utilises Rayon to parallelise hashing across multiple CPU cores.
-*   **Progress UI**: Combines `indicatif` spinners and bars for a responsive terminal experience.
-*   **Table output**: Renders a dynamic, wrapped table of planned replacements using `comfy_table` and ANSI colours.
-*   **Interactive TUI mode**: Keyboard-first dashboard powered by `ratatui` for scan/review/link workflows.
-*   **Space saved calculation**: Reports the total disk space that would be saved by linking duplicates.
+There is also a terminal dashboard, `dejaview tui`, for scanning, reviewing and linking row by row.
 
----
+## What you get
 
-## Installation
+- **Matching by content.** Files are grouped by size, then compared with BLAKE3 hashes: a quick hash of the first and last MiB, and a full hash only when quick hashes collide. Names and folders play no part.
+- **Hardlink first.** On the same filesystem the download becomes a hardlink and the space comes back. Across filesystems, or if the hardlink fails, DejaView falls back to a relative symlink and records why in the report.
+- **Cheap repeat runs.** A cache in the downloads folder remembers hashes. Hardlinked paths are hashed once, and an already-linked pair with no other file of the same size is not read at all, so rescanning a library that the *arr apps already hardlink costs very little.
+- **Dry run by default.** `scan` only shows the plan. `link` changes files, and `link --confirm` asks first.
+- **Reports.** `--json` prints a run summary for scripts, and every `link` run writes a JSON report of what it changed.
+- **Terminal dashboard.** Live progress per hashing thread, link one row or all of them, and cancel a running scan or link with `c`.
 
-1.  Ensure you have Rust and Cargo installed (via [rustup](https://rustup.rs/)).
+## Who it is for
 
-2.  Install the `dejaview` binary onto your PATH:
+You keep a downloads folder and a separate media library, and you want each file the two share to take the space of one copy.
 
-    ```bash
-    cargo install --path .
-    ```
+What it is not:
 
-    Or build without installing, then run from `./target/release/dejaview`:
+- Not a general duplicate finder. It only acts on a file in downloads that has an identical file in media. Duplicates inside the library, or inside downloads with no library copy, are left alone.
+- Not an organiser. It never renames, moves or deletes a file outright; it replaces a download with a link to identical content.
+- Not for Windows. It relies on Unix file metadata (inodes and hardlinks).
 
-    ```bash
-    cargo build --release
-    ```
+## Safety model
 
----
+- **The library is read-only to DejaView.** Every replaced file is in downloads, and a link run refuses any source that resolves inside the media folder.
+- **Downloads and media must be separate folders.** If one is inside the other, or both are the same folder (also through a symlink), `scan`, `link`, `config validate` and the TUI path editor refuse to run.
+- **Each replacement is atomic.** DejaView creates the link under a temporary name next to the download, then renames it over the download. An interrupted run leaves either the old file or the link, plus at worst a `.dejaview_*.tmp.*` file that `dejaview cache cleanup-temp` removes.
+- **Nothing changes behind its back.** Right before replacing a file, it checks the size, timestamps and inode of both files again and skips the pair if either changed since the scan. It also refuses a target that is a symlink or sits outside the media folder.
+- **`scan` leaves your files alone.** It does write its cache, `.dejaview_cache.json`, in the downloads folder, so downloads must be writable.
 
-## Usage
+## Quick start
 
-DejaView is controlled via subcommands: `dejaview <subcommand> [args...]`. The examples below assume the binary is on your PATH (see Installation).
+You need a Rust toolchain ([rustup](https://rustup.rs/)). From a clone of this repository:
 
-### 1. Initial Configuration (One-Time Setup)
+```bash
+cargo install --path .
+```
 
-Before running any scans or links, you need to tell DejaView where your downloads and media folders are. This is stored in a configuration file (`~/.config/dejaview/config.json`) so you only need to do it once.
+Point DejaView at your two folders:
 
-*   **Set Downloads Path:**
-    ```bash
-    dejaview config set-downloads /path/to/your/downloads
-    ```
+```bash
+dejaview config set-downloads /srv/torrents
+```
 
-*   **Set Media Path:**
-    ```bash
-    dejaview config set-media /path/to/your/media
-    ```
+```bash
+dejaview config set-media /srv/media
+```
 
-*   **Show Current Configuration:**
-    ```bash
-    dejaview config show
-    ```
+```bash
+dejaview config validate
+```
 
-*   **Set Minimum File Age (seconds):**
-    ```bash
-    dejaview config set-min-age 0
-    ```
-
-*   **Set Worker Threads:**
-    ```bash
-    dejaview config set-threads 4
-    ```
-
-*   **Validate Configuration and Access:**
-    ```bash
-    dejaview config validate
-    ```
-
-### 2. Scanning for Duplicates (Dry Run)
-
-This command will scan your configured directories for duplicates and report them, including the potential space savings. No files will be modified.
+See what it would do, then do it:
 
 ```bash
 dejaview scan
 ```
 
-Machine-readable scan output for automation:
-
-```bash
-dejaview scan --json --no-progress --report /tmp/dejaview-scan.json
-```
-
-### 3. Linking Duplicates
-
-This command will perform the actual file operations: deleting duplicates in your downloads folder and replacing them with symbolic links to the media folder.
-
-```bash
-dejaview link
-```
-
-Prompt before applying changes (interactive terminals):
-
 ```bash
 dejaview link --confirm
 ```
 
-Machine-readable link output for automation:
+## Usage
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `dejaview scan` | Find duplicates and print the plan. Changes no files except the cache. |
+| `dejaview link` | Find duplicates and replace each download copy with a link. |
+| `dejaview tui` | Open the terminal dashboard. |
+| `dejaview config show` | Print the configuration. |
+| `dejaview config validate` | Check that both folders exist and are separate, downloads is writable and media is readable. |
+| `dejaview config set-downloads PATH` | Set the downloads folder. The path is stored resolved and absolute. |
+| `dejaview config set-media PATH` | Set the media folder. |
+| `dejaview config set-min-age SECONDS` | Skip files modified more recently than this. |
+| `dejaview config set-threads N` | Set the number of hashing threads. |
+| `dejaview config set-link-mode best\|symlink-only` | Choose hardlink with symlink fallback, or symlinks only. |
+| `dejaview cache info` | Show where the cache is and how many entries it holds. |
+| `dejaview cache clear` | Delete the cache. The next scan hashes everything again. |
+| `dejaview cache audit-temp` | List temporary link files left in downloads by an interrupted run. |
+| `dejaview cache cleanup-temp` | Delete them. |
+
+### Options for scan and link
+
+| Option | Effect |
+|---|---|
+| `--json` | Print the run summary as JSON on stdout. Turns progress output off. |
+| `--report PATH` | Also write the summary to PATH. Without it, `link` writes `.dejaview_link_report.json` in downloads and `scan` writes nothing. |
+| `--progress auto\|on\|off` | Progress bars. `auto` (the default) shows them on a terminal. |
+| `--no-progress` | Same as `--progress off`. |
+| `--strict` | Exit with an error if any file could not be read, hashed or linked. |
+| `--symlink-only` | Use symlinks for this run, never hardlinks. |
+| `--confirm` | `link` only. Ask before changing anything. Needs a terminal and cannot be combined with `--json`. |
+
+For a cron job:
 
 ```bash
-dejaview link --json --no-progress --report /tmp/dejaview-link.json
+dejaview link --json --no-progress --report /var/log/dejaview-link.json
 ```
 
-### 4. Cache Management
-
-DejaView uses a cache to speed up subsequent runs. You can manage it with these commands:
-
-*   **Clear Cache:**
-    ```bash
-    dejaview cache clear
-    ```
-
-*   **Show Cache Info:**
-    ```bash
-    dejaview cache info
-    ```
-
-### 5. Interactive TUI
-
-Launch the terminal dashboard:
+### Terminal dashboard
 
 ```bash
 dejaview tui
 ```
 
-Use strict mode for in-TUI scan/link actions:
+Add `--strict` to run the dashboard's scans and links in strict mode.
 
-```bash
-dejaview tui --strict
-```
+| Key | Action |
+|---|---|
+| `S` | Scan |
+| `X` | Clear the cache, then scan |
+| `l` | Link the selected row (asks first) |
+| `L` | Link every planned row (asks first) |
+| `c` | Cancel the running scan or link |
+| `j` / `k` or arrows | Move the selection |
+| `e` | Edit the downloads and media paths |
+| `p` | Show full or shortened paths |
+| `R` | Save the current report to `.dejaview_tui_report.json` in downloads |
+| `J` | Show the current report as JSON |
+| `?` | Help |
+| `q` | Close an overlay, or quit when no run is active |
 
-Default keybinds:
-*   `S`: run scan
-*   `L`: run link
-*   `j` / `k` or arrows: move result selection
-*   `tab`: cycle focused pane
-*   `R`: save current report JSON
-*   `J`: open report JSON overlay
-*   `?`: help
-*   `q`: quit
+Cancelling a scan stops it almost at once, even partway through a large file, and keeps every hash already finished in the cache, so the next scan picks up where it stopped. Cancelling a link stops before the next file: files already linked stay linked and the rest stay planned. Quitting is blocked while a run is active, so cancel first.
 
----
+Linking a single row runs a full scan first. With a warm cache that is quick; on a cold cache it takes as long as any scan.
 
-## Output and Progress Modes
+## Configuration
 
-`scan` and `link` support the same output controls:
+The configuration lives in `~/.config/dejaview/config.json` (under `$XDG_CONFIG_HOME` when that is set). Change it with the `config` commands rather than by hand.
 
-*   `--json`: print a machine-readable JSON run summary to stdout.
-*   `--report <path>`: write the same run summary JSON to a file.
-*   `--progress <auto|on|off>`: control progress UI behaviour (default `auto`).
-*   `--no-progress`: shortcut for `--progress off` (useful for scripts/CI).
-*   `--confirm` (link only): require explicit interactive confirmation before applying actions.
+| Setting | Default | Purpose |
+|---|---|---|
+| `downloads` | unset | Folder whose duplicates get replaced. Must be writable. |
+| `media` | unset | The library. Read, never written. |
+| `min_age` | `0` | Seconds. Files modified more recently are skipped, which keeps DejaView away from files a client is still writing. |
+| `threads` | number of CPUs | Hashing threads. Lower it if parallel reads thrash spinning disks. |
+| `link_mode` | `best` | `best` hardlinks and falls back to relative symlinks. `symlink-only` always uses relative symlinks. |
 
-When `--json` is enabled, progress UI is automatically disabled so stdout remains parseable JSON.
-`link --confirm` cannot be combined with `--json`.
+### Files DejaView writes
 
----
+| File | When |
+|---|---|
+| `<downloads>/.dejaview_cache.json` | Every scan and link. Entries for files that no longer exist are dropped after each complete run. |
+| `<downloads>/.dejaview_link_report.json` | Every link run without `--report`. |
+| `<downloads>/.dejaview_tui_report.json` | When you press `R` in the dashboard. |
+| `~/.local/state/dejaview/dejaview.log` | Every command (under `$XDG_STATE_HOME` when set). It only appends and is never rotated, so delete it when it gets large. |
+
+Files whose name starts with `.dejaview_` are never treated as duplicates.
+
+## mergerfs and network drives
+
+- **Check mergerfs's `inodecalc`.** DejaView recognises an existing hardlink by its inode number. The default, `inodecalc=hybrid-hash`, gives hardlinks one inode, which is what DejaView expects. With `path-hash`, every path gets its own inode, so already-linked pairs look like copies and get hashed and relinked on every run. Nothing is lost, but it wastes reads. With `passthrough`, different files on different branches can report the same inode. DejaView only treats two paths as one file when their timestamps match as well, but `hybrid-hash` is the setting to use.
+- **Hardlinks cannot cross mergerfs branches.** If the download and the library copy sit on different underlying disks, the hardlink fails and DejaView falls back to a symlink. The report shows `symlink` and the reason.
+- **Flaky connections.** If the folder walk hits errors, DejaView keeps the cache entries for paths it could not see, so a dropped connection does not force a full rehash on the next run.
+- **Docker.** Symlinks are relative, so they resolve the same inside a container as long as both folders are mounted with the same layout.
+
+## Troubleshooting
+
+**`dejaview: command not found` after installing.** Older builds installed the binary as `DejaView`. Run `cargo uninstall DejaView`, then `cargo install --path .` again, and check that `~/.cargo/bin` is on your `PATH`.
+
+**`config validate` says the media path is inside the downloads path.** The two folders overlap, so a link run would rewrite files in your library. Point media at the library folder itself. The two can share a parent, such as `/srv/media` and `/srv/torrents`, but neither can contain the other.
+
+**`link` made symlinks instead of hardlinks.** The download and the library file are on different filesystems, or on different mergerfs branches. The `fallback_reason` field in the link report says which.
+
+**A pair failed with "source changed since planning".** The download changed between the scan and the link, usually because a client was still writing it. Run again later, or raise `min_age`.
+
+**Files named `.dejaview_hardlink.tmp.*` or `.dejaview_link.tmp.*` in downloads.** A link run was killed in the middle of a replacement. `dejaview cache audit-temp` lists them and `dejaview cache cleanup-temp` deletes them.
+
+**A scan reads a file it read before.** A cache entry is valid only while the file's size, modification time, change time and inode stay the same. A link run or a `chmod` changes the change time, so that file is hashed once more.
 
 ## How it works
 
-1.  **File collection**: Recursively scans both the configured download and media directories, skipping symlinks and files younger than the `min-age` setting (default: 0 seconds).
-2.  **Duplicate grouping**: Buckets files by size; only buckets with more than one file enter the hashing phase.
-3.  **Two-phase Hashing**: 
-    *   **Phase 1 (Sample Hash):** For files in a group, a fast BLAKE3 hash is computed using only the first and last megabyte of the file.
-    *   **Phase 2 (Full Hash):** Only if multiple files share the same sample hash, a full BLAKE3 digest is computed for each of them to confirm true duplication. This significantly reduces the number of full file reads.
-4.  **Cache update**: Writes updated `(path, size, mtime, hash)` entries to `.dejaview_cache.json` in the download root.
-5.  **Duplicate resolution**: Builds a table of `(download path, media path)` pairs for identical files.
-6.  **Link replacement**: (Only for `link` command) Replaces download duplicates with hardlinks when possible, and falls back to relative symlinks when required.
+1. Walk both folders without following symlinks. Skip files younger than `min_age` and DejaView's own files.
+2. Group files by size. Paths that are already the same file count once, and a group that is all one file is skipped.
+3. Quick hash (BLAKE3 of the first and last MiB) of each remaining file, unless every file in the group is already cached.
+4. Full BLAKE3 hash of the files whose quick hashes collide.
+5. In each set of identical files, the first media file by path is the target. Every download copy that is not already a link to it gets an action.
+6. `link` only: check both files again, link to a temporary name, rename it over the download.
 
----
+[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) has diagrams of the pipeline and the link decision.
 
-## Best Practices
-
-*   **Maintain mount consistency** for relative symlinks (e.g., Docker bind `/mnt/mediazilla` identically).
-*   **Run `scan` first** to preview changes before running `link`.
-*   **Clear cache** periodically by running `dejaview cache clear` if your directory structure drastically changes or if you suspect cache inconsistencies.
-*   **Schedule via cron or invoke manually** after media imports for automated cleanup.
-
----
-
-## Performance Harness
-
-DejaView includes an ignored integration benchmark harness with regression thresholds across dataset sizes.
-
-Run all profiles (small/medium/large):
+## Development
 
 ```bash
-cargo test --test perf_harness -- --ignored --nocapture
+cargo test
 ```
 
-Run one profile:
+An ignored performance harness times a cold and a warm scan on generated datasets:
 
 ```bash
-cargo test --test perf_harness perf_medium_dataset -- --ignored --nocapture
+cargo test --release --test perf_harness -- --ignored --nocapture
 ```
 
-Thresholds are configurable via environment variables (milliseconds):
+Each profile has a time limit you can tighten with `DEJAVIEW_PERF_SMALL_COLD_MS`, `DEJAVIEW_PERF_SMALL_WARM_MS`, and the matching `MEDIUM` and `LARGE` variables (milliseconds).
 
-*   `DEJAVIEW_PERF_SMALL_COLD_MS`
-*   `DEJAVIEW_PERF_SMALL_WARM_MS`
-*   `DEJAVIEW_PERF_MEDIUM_COLD_MS`
-*   `DEJAVIEW_PERF_MEDIUM_WARM_MS`
-*   `DEJAVIEW_PERF_LARGE_COLD_MS`
-*   `DEJAVIEW_PERF_LARGE_WARM_MS`
-
-Example with stricter medium thresholds:
-
-```bash
-DEJAVIEW_PERF_MEDIUM_COLD_MS=5000 \
-DEJAVIEW_PERF_MEDIUM_WARM_MS=2500 \
-cargo test --test perf_harness perf_medium_dataset -- --ignored --nocapture
-```
-
----
+`dejaview tui-logo-preview` shows the wordmark variants the dashboard chooses between.
 
 ## License
 
-GNU General Public License v3.0 (GPL-3.0). See `LICENSE`.
+GNU General Public License v3.0. See [LICENSE](LICENSE).
