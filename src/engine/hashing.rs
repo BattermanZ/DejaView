@@ -4,6 +4,7 @@ use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::current_thread_index;
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::io::{Read, Seek, SeekFrom};
@@ -55,17 +56,34 @@ fn sample_digest(path: &Path, size: u64) -> Result<[u8; 32]> {
     sample_digest_from(&mut file, size)
 }
 
+/// Bytes a full hash reads at a time. Each read is a round trip to a network
+/// drive, so fewer, larger reads keep closer to its bandwidth.
+const FULL_CHUNK: usize = 8 << 20;
+
+thread_local! {
+    /// One quick-hash buffer per worker, reused for every file it reads.
+    static SAMPLE_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; SAMPLE_BYTES as usize]);
+    /// One full-hash buffer per worker.
+    static FULL_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; FULL_CHUNK]);
+}
+
+/// BLAKE3 of the first and last [`SAMPLE_BYTES`] of a file of `size` bytes,
+/// or of all of it when it is no bigger. It reads exactly the bytes it
+/// hashes: the size is known, so no read is spent finding the end of file.
 fn sample_digest_from<R: Read + Seek>(reader: &mut R, size: u64) -> Result<[u8; 32]> {
     let mut hasher = Hasher::new();
-    let mut buf = vec![0u8; 1 << 20];
-    let n = read_up_to(reader, &mut buf)?;
-    hasher.update(&buf[..n]);
-    if size > buf.len() as u64 {
-        let offset = size - buf.len() as u64;
-        reader.seek(SeekFrom::Start(offset))?;
-        let n = read_up_to(reader, &mut buf)?;
+    let want = size.min(SAMPLE_BYTES) as usize;
+    SAMPLE_BUF.with_borrow_mut(|buf| -> Result<()> {
+        let buf = &mut buf[..want];
+        let n = read_up_to(reader, buf)?;
         hasher.update(&buf[..n]);
-    }
+        if size > SAMPLE_BYTES {
+            reader.seek(SeekFrom::Start(size - SAMPLE_BYTES))?;
+            let n = read_up_to(reader, buf)?;
+            hasher.update(&buf[..n]);
+        }
+        Ok(())
+    })?;
     Ok(hasher.finalize().into())
 }
 
@@ -113,22 +131,23 @@ fn emit_hash_progress(done: usize, total: usize, tui_events: bool) {
     }
 }
 
-/// Full BLAKE3 of a file, checking for cancellation between 1 MiB chunks so a
+/// Full BLAKE3 of a file, checking for cancellation between chunks so a
 /// cancel does not wait for a large file to finish.
 pub(super) fn full_digest(path: &Path, cancel: &CancelToken) -> Result<String> {
     #[cfg(test)]
     read_log::record(path);
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut hasher = Hasher::new();
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        cancel.check()?;
-        let n = read_up_to(&mut file, &mut buf)?;
-        if n == 0 {
-            break;
+    FULL_BUF.with_borrow_mut(|buf| -> Result<()> {
+        loop {
+            cancel.check()?;
+            let n = read_up_to(&mut file, buf)?;
+            if n == 0 {
+                return Ok(());
+            }
+            hasher.update(&buf[..n]);
         }
-        hasher.update(&buf[..n]);
-    }
+    })?;
     Ok(hasher.finalize().to_hex().to_string())
 }
 
@@ -835,6 +854,43 @@ mod tests {
                 return Err(std::io::ErrorKind::Interrupted.into());
             }
             self.inner.read(buf)
+        }
+    }
+
+    /// Counts the reads that reach it.
+    struct CountedReads<R> {
+        inner: R,
+        reads: usize,
+    }
+
+    impl<R: Read> Read for CountedReads<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            self.inner.read(buf)
+        }
+    }
+
+    impl<R: Seek> Seek for CountedReads<R> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    #[test]
+    fn a_quick_hash_reads_only_the_bytes_it_hashes() {
+        for size in [4096usize, SAMPLE_BYTES as usize, 3 * SAMPLE_BYTES as usize] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 253) as u8).collect();
+            let mut counted = CountedReads {
+                inner: std::io::Cursor::new(data.clone()),
+                reads: 0,
+            };
+            let digest = sample_digest_from(&mut counted, size as u64).expect("digest");
+            let expected_reads = if size as u64 > SAMPLE_BYTES { 2 } else { 1 };
+            assert_eq!(counted.reads, expected_reads, "size {size}");
+            if size as u64 <= SAMPLE_BYTES {
+                // Read whole, so it is the file's full BLAKE3.
+                assert_eq!(digest, *blake3::hash(&data).as_bytes());
+            }
         }
     }
 
