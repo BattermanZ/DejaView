@@ -1941,3 +1941,38 @@ fn the_full_pass_reports_its_progress_in_bytes() {
     assert_eq!(last["done"], last["total"], "the pass ends complete");
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+#[test]
+fn a_leftover_temp_symlink_is_listed_and_removed_without_touching_its_target() {
+    let root = unique_temp_dir("temp_symlink");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&media.join("movie.mkv"), 4096, 3);
+    fs::create_dir_all(downloads.join("Movie")).expect("create download folder");
+    configure_small_files(&root, &downloads, &media);
+    // What a run killed between the symlink and the rename leaves behind.
+    let leftover = downloads.join("Movie").join(".dejaview_link.tmp.123.456");
+    std::os::unix::fs::symlink("../../media/movie.mkv", &leftover).expect("make leftover");
+
+    let out = run_cmd(&root, &["cache", "audit-temp"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(".dejaview_link.tmp.123.456"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    run_ok(&root, &["cache", "cleanup-temp"]);
+    assert!(
+        fs::symlink_metadata(&leftover).is_err(),
+        "the leftover is gone"
+    );
+    assert_eq!(
+        fs::metadata(media.join("movie.mkv"))
+            .expect("library file")
+            .len(),
+        4096,
+        "the library file it pointed at is untouched"
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}

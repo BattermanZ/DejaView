@@ -44,6 +44,7 @@
 
 ### Fixed
 
+- `cache audit-temp` and `cache cleanup-temp` find a temporary symlink left beside a download by a run stopped partway, and remove the link without touching the library file it points at. Before, they listed and removed only temporary files. [#5]
 - A folder DejaView cannot read, such as a NAS's recycle bin, no longer stops the cache from forgetting files that are gone: entries under that folder are kept and the rest are dropped as usual. Before, one unreadable folder kept every stale entry for good. The log now names each path a walk could not read, and why. [#5]
 - Verifying large files shows progress in bytes, with the speed and the time left, in the dashboard (`12.3 GiB of 40.0 GiB  |  150.0 MiB/s  |  ETA 03:05`) and on the CLI's progress bar. Before, both counted whole files, so a 60 GB remux sat at "0 / 8" for minutes, and a read stopped by a cancel was counted as verified. [#5]
 - `config set-downloads` and `config set-media` name the path they could not use, where they said only "No such file or directory". The dashboard's path editor reads `~` as the home folder, says which field an error is about, shows a long error whole, and names the config file it saves to. [#5]

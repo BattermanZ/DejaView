@@ -187,7 +187,9 @@ pub(super) fn audit_temp_artifacts(config: &Config) -> Result<Vec<std::path::Pat
             Ok(entry) => entry,
             Err(_) => continue,
         };
-        if !entry.file_type().is_file() {
+        // A run stopped between the symlink and the rename leaves a temp
+        // symlink, which is removed as a link, never followed.
+        if !(entry.file_type().is_file() || entry.file_type().is_symlink()) {
             continue;
         }
         let Some(name) = entry.file_name().to_str() else {
