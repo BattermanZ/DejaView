@@ -137,15 +137,17 @@ fn write_line(level: &str, op: &str, message: &str) {
     if let Ok(mut slot) = logger_slot().lock()
         && let Some(state) = slot.as_mut()
     {
-        let _ = writeln!(
-            state.sink,
-            "ts={} level={} run={} op={} msg=\"{}\"",
+        // One write per line: the file is opened for appending, so a line
+        // lands whole, and a log on a network drive costs one round trip.
+        let line = format!(
+            "ts={} level={} run={} op={} msg=\"{}\"\n",
             timestamp_secs(),
             level,
             state.run_id,
             op,
             escaped
         );
+        let _ = state.sink.write_all(line.as_bytes());
         let _ = state.sink.flush();
     }
 }

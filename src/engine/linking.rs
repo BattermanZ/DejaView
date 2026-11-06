@@ -17,9 +17,24 @@ use super::cancel::CancelToken;
 use super::types::emit_tui_event;
 use super::types::{FileInfo, FileSnapshot, LinkAction, LinkMode, RunWarnings};
 
+/// The target guard by path alone, as the tests drive it.
+#[cfg(test)]
 pub(super) fn ensure_target_within_media_root(media_root: &Path, target: &Path) -> Result<()> {
     let target_meta =
         fs::symlink_metadata(target).with_context(|| format!("metadata {}", target.display()))?;
+    let canonical_media = fs::canonicalize(media_root)
+        .with_context(|| format!("canonicalize {}", media_root.display()))?;
+    ensure_target_within_media_root_with(media_root, &canonical_media, target, &target_meta)
+}
+
+/// Refuse a target that is a symlink or lies outside the media root, given
+/// the target's `lstat` and the media root resolved once per run.
+fn ensure_target_within_media_root_with(
+    media_root: &Path,
+    canonical_media: &Path,
+    target: &Path,
+    target_meta: &fs::Metadata,
+) -> Result<()> {
     if target_meta.file_type().is_symlink() {
         return Err(anyhow!(
             "refusing to link to symlink target: {}",
@@ -31,12 +46,10 @@ pub(super) fn ensure_target_within_media_root(media_root: &Path, target: &Path) 
         return Ok(());
     }
 
-    let canonical_media = fs::canonicalize(media_root)
-        .with_context(|| format!("canonicalize {}", media_root.display()))?;
     let canonical_target =
         fs::canonicalize(target).with_context(|| format!("canonicalize {}", target.display()))?;
 
-    if !canonical_target.starts_with(&canonical_media) {
+    if !canonical_target.starts_with(canonical_media) {
         return Err(anyhow!(
             "refusing to link to target outside media root: {}",
             target.display()
@@ -49,7 +62,11 @@ pub(super) fn ensure_target_within_media_root(media_root: &Path, target: &Path) 
 /// The library is never written to: refuse any source that resolves inside the
 /// media root, whatever the planner produced. The final path component is not
 /// resolved, so a source that is itself a symlink is judged by where it lives.
-pub(super) fn ensure_source_outside_media_root(media_root: &Path, source: &Path) -> Result<()> {
+pub(super) fn ensure_source_outside_media_root(
+    media_root: &Path,
+    canonical_media: &Path,
+    source: &Path,
+) -> Result<()> {
     let refuse = || {
         anyhow!(
             "refusing to replace a file inside the media root: {}",
@@ -65,9 +82,7 @@ pub(super) fn ensure_source_outside_media_root(media_root: &Path, source: &Path)
         .ok_or_else(|| anyhow!("source path has no parent: {}", source.display()))?;
     let canonical_parent =
         fs::canonicalize(parent).with_context(|| format!("canonicalize {}", parent.display()))?;
-    let canonical_media = fs::canonicalize(media_root)
-        .with_context(|| format!("canonicalize {}", media_root.display()))?;
-    if canonical_parent.starts_with(&canonical_media) {
+    if canonical_parent.starts_with(canonical_media) {
         return Err(refuse());
     }
 
@@ -84,9 +99,9 @@ pub(super) fn snapshot_from_file_info(file: &FileInfo) -> FileSnapshot {
     }
 }
 
-fn snapshot_path(path: &Path) -> Result<FileSnapshot> {
-    let meta = fs::metadata(path).with_context(|| format!("metadata {}", path.display()))?;
-    Ok(FileSnapshot::of(&meta))
+/// The file at `path` itself, not what a symlink there points to.
+fn lstat(path: &Path) -> Result<fs::Metadata> {
+    fs::symlink_metadata(path).with_context(|| format!("metadata {}", path.display()))
 }
 
 /// The source must be the file the plan saw. One exception: when this run has
@@ -96,10 +111,11 @@ fn snapshot_path(path: &Path) -> Result<FileSnapshot> {
 /// and inode still match.
 fn ensure_source_snapshot_matches(
     path: &Path,
+    meta: &fs::Metadata,
     expected: &FileSnapshot,
     replaced_inodes: &HashSet<(u64, u64)>,
 ) -> Result<()> {
-    let current = snapshot_path(path)?;
+    let current = FileSnapshot::of(meta);
     if expected.matches_source(&current) {
         return Ok(());
     }
@@ -121,9 +137,12 @@ fn ensure_source_snapshot_matches(
     ))
 }
 
-fn ensure_target_snapshot_matches(path: &Path, expected: &FileSnapshot) -> Result<()> {
-    let current = snapshot_path(path)?;
-    if !expected.matches_target(&current) {
+fn ensure_target_snapshot_matches(
+    path: &Path,
+    meta: &fs::Metadata,
+    expected: &FileSnapshot,
+) -> Result<()> {
+    if !expected.matches_target(&FileSnapshot::of(meta)) {
         return Err(anyhow!(
             "target changed since planning; rerun scan before linking: {}",
             path.display()
@@ -193,12 +212,15 @@ pub(super) fn read_access_lost(download: Access, library: Access) -> Option<Stri
 
 /// Why this pair must be left alone for access, or None to go ahead. A skip is
 /// a decision, not a failure: the run carries on, `--strict` included.
-fn read_access_refusal(src: &Path, tgt: &Path) -> Result<Option<String>> {
-    let download =
-        Access::of(&fs::metadata(src).with_context(|| format!("metadata {}", src.display()))?);
-    let library =
-        Access::of(&fs::metadata(tgt).with_context(|| format!("metadata {}", tgt.display()))?);
-    Ok(read_access_lost(download, library).map(|who| {
+fn read_access_refusal(
+    src: &Path,
+    src_meta: &fs::Metadata,
+    tgt: &Path,
+    tgt_meta: &fs::Metadata,
+) -> Option<String> {
+    let download = Access::of(src_meta);
+    let library = Access::of(tgt_meta);
+    read_access_lost(download, library).map(|who| {
         format!(
             "left alone: once linked, {who} could no longer read {}, so the torrent client would stop seeding it. The download is {}; the library file {} is {}. Let that user or group read the library file (a shared group for the torrent client and Sonarr or Radarr, files 0664 or 0644), then run again.",
             src.display(),
@@ -206,7 +228,7 @@ fn read_access_refusal(src: &Path, tgt: &Path) -> Result<Option<String>> {
             tgt.display(),
             library.describe()
         )
-    }))
+    })
 }
 
 /// What became of a planned pair that did not fail.
@@ -609,9 +631,9 @@ where
     let src_dev = fs::metadata(&dir.path)
         .with_context(|| format!("metadata of the folder of {}", src.display()))?
         .dev();
-    let tgt_dev = fs::metadata(tgt)
-        .with_context(|| format!("metadata {}", tgt.display()))?
-        .dev();
+    // The caller checked the library file still matches the plan, device
+    // included.
+    let tgt_dev = req.tgt_snapshot.dev;
 
     let fallback_reason = if src_dev == tgt_dev {
         match replace_with_hardlink(&dir, req, &hard_link_fn, &rename_fn) {
@@ -835,6 +857,8 @@ pub(super) fn apply_actions(
         println!("{} Applying…", "▶".cyan());
     }
     let roots = CanonicalRoots::new(downloads, media);
+    // Resolved once per run, not once per pair.
+    let canonical_media = fs::canonicalize(media);
 
     for (index, action) in actions.iter().enumerate() {
         if cancel.is_cancelled() {
@@ -856,11 +880,24 @@ pub(super) fn apply_actions(
                     action.tgt.display()
                 ),
             );
-            ensure_source_outside_media_root(media, &action.src)?;
-            ensure_source_snapshot_matches(&action.src, &action.src_snapshot, &replaced_inodes)?;
-            ensure_target_within_media_root(media, &action.tgt)?;
-            ensure_target_snapshot_matches(&action.tgt, &action.tgt_snapshot)?;
-            if let Some(reason) = read_access_refusal(&action.src, &action.tgt)? {
+            let canonical_media = canonical_media.as_ref().map_err(|err| {
+                anyhow!("cannot resolve the media folder {}: {err}", media.display())
+            })?;
+            ensure_source_outside_media_root(media, canonical_media, &action.src)?;
+            // One lstat of each file serves every check below.
+            let src_meta = lstat(&action.src)?;
+            ensure_source_snapshot_matches(
+                &action.src,
+                &src_meta,
+                &action.src_snapshot,
+                &replaced_inodes,
+            )?;
+            let tgt_meta = lstat(&action.tgt)?;
+            ensure_target_within_media_root_with(media, canonical_media, &action.tgt, &tgt_meta)?;
+            ensure_target_snapshot_matches(&action.tgt, &tgt_meta, &action.tgt_snapshot)?;
+            if let Some(reason) =
+                read_access_refusal(&action.src, &src_meta, &action.tgt, &tgt_meta)
+            {
                 let entry = &mut report_entries[index];
                 entry.status = "skipped".to_string();
                 entry.method = None;
