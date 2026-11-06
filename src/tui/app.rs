@@ -48,6 +48,24 @@ pub struct ConfigEditor {
     pub error: Option<String>,
 }
 
+/// What a test hardlink from the library into downloads showed, as
+/// `dejaview config validate` tries one: whether link runs will make
+/// hardlinks or fall back to symlinks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LinkCheck {
+    /// Not tried this session. It runs when the folders are saved, since it
+    /// touches one library file's change time.
+    Untested,
+    Testing,
+    Hardlinks,
+    /// The test failed, so link runs will make symlinks; `cause` says why.
+    Symlinks {
+        cause: String,
+    },
+    /// The library holds no file to try with yet.
+    NoLibraryFile,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum JobKind {
     Scan,
@@ -122,6 +140,8 @@ pub struct App {
     job_started_at: Option<Instant>,
     last_run_duration: Option<Duration>,
     running_job: Option<RunningJob>,
+    link_check: LinkCheck,
+    link_check_rx: Option<Receiver<(LinkCheck, Option<String>)>>,
     should_quit: bool,
 }
 
@@ -162,6 +182,8 @@ impl App {
             job_started_at: None,
             last_run_duration: None,
             running_job: None,
+            link_check: LinkCheck::Untested,
+            link_check_rx: None,
             should_quit: false,
         }
     }
@@ -177,7 +199,10 @@ impl App {
     pub fn step(&mut self) -> Result<()> {
         let event = events::next_event(self.tick_rate())?;
         match event {
-            Event::Tick => self.poll_running_job(),
+            Event::Tick => {
+                self.poll_running_job();
+                self.poll_link_check();
+            }
             Event::Key(key) => {
                 if key.kind == KeyEventKind::Press {
                     self.handle_key(key.code, key.modifiers)?;
@@ -295,20 +320,6 @@ impl App {
         }
     }
 
-    pub fn downloads_label(&self) -> String {
-        self.downloads
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<not set>".to_string())
-    }
-
-    pub fn media_label(&self) -> String {
-        self.media
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<not set>".to_string())
-    }
-
     /// The downloads folder, which the table shows each download below.
     pub fn downloads_root(&self) -> Option<&std::path::Path> {
         self.downloads.as_deref()
@@ -365,75 +376,10 @@ impl App {
         self.logs.iter().cloned().collect()
     }
 
-    pub fn activity_phase(&self) -> &'static str {
-        if let Some(phase) = self.current_phase.as_deref() {
-            return display_phase(phase);
-        }
-        if let Some(job) = &self.running_job {
-            return match job.kind {
-                JobKind::Scan => "SCANNING LIBRARY",
-                JobKind::LinkAll => "LINKING DUPLICATES",
-                JobKind::LinkSelected(_) => "LINKING SELECTED DUPLICATE",
-            };
-        }
-        match &self.report {
-            Some(report) if report.mode == "link" => "LAST RUN COMPLETE",
-            Some(_) => "READY TO REVIEW",
-            None => "READY TO SCAN",
-        }
-    }
-
-    pub fn throughput_label(&self) -> String {
-        if self.running_job.is_some() {
-            if let (Some(done), Some(total)) = (self.hash_progress_done, self.hash_progress_total) {
-                return match self.current_phase.as_deref() {
-                    Some("hashing_full") => {
-                        let mut label = format!("{done} / {total} duplicate files verified");
-                        if let Some(bytes) = self.full_pass_progress() {
-                            label.push_str("  |  ");
-                            label.push_str(&bytes);
-                        }
-                        label
-                    }
-                    _ => format!("{done} / {total} files hashed"),
-                };
-            }
-            if matches!(self.current_phase.as_deref(), Some("applying"))
-                && let (Some(applied), Some(planned)) =
-                    (self.live_applied_actions, self.live_planned_actions)
-            {
-                return format!("{applied} / {planned} actions applied");
-            }
-            let mut parts = Vec::new();
-            if let Some(files) = self.live_files_seen {
-                parts.push(format!("{files} files found"));
-            }
-            if let Some(groups) = self.live_groups_found {
-                parts.push(format!("{groups} groups"));
-            }
-            if let Some(planned) = self.live_planned_actions {
-                parts.push(format!("{planned} planned"));
-            }
-            if let Some(applied) = self.live_applied_actions {
-                parts.push(format!("{applied} applied"));
-            }
-            if parts.is_empty() {
-                return "subprocess active".to_string();
-            }
-            return parts.join("  |  ");
-        }
-        format!(
-            "{} files  |  {} planned  |  {} applied",
-            self.files_considered(),
-            self.planned_actions(),
-            self.applied_actions()
-        )
-    }
-
     /// How far the full pass has read, how fast and how long it has left:
     /// `12.3 GiB of 40.0 GiB  |  150.0 MiB/s  |  ETA 03:05`. Speed and time
     /// left wait for a second of reading.
-    fn full_pass_progress(&self) -> Option<String> {
+    pub fn full_pass_progress(&self) -> Option<String> {
         let (done, total) = self.hash_bytes?;
         let format_bytes = super::view::format_bytes;
         let mut label = format!("{} of {}", format_bytes(done), format_bytes(total));
@@ -475,10 +421,6 @@ impl App {
         self.current_path.as_deref()
     }
 
-    pub fn current_path_label(&self) -> &'static str {
-        "current"
-    }
-
     pub fn active_worker_paths(&self) -> Vec<(usize, &str)> {
         self.active_workers
             .iter()
@@ -499,6 +441,73 @@ impl App {
 
     pub fn expand_paths(&self) -> bool {
         self.expand_paths
+    }
+
+    /// Whether both folders are set.
+    pub fn has_paths(&self) -> bool {
+        self.downloads.is_some() && self.media.is_some()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running_job.is_some()
+    }
+
+    /// A scan is running, as opposed to a link run.
+    pub fn scan_running(&self) -> bool {
+        self.running_job
+            .as_ref()
+            .is_some_and(|job| job.kind == JobKind::Scan)
+    }
+
+    /// The running job's phase as the event stream names it, such as
+    /// `hashing_sample`.
+    pub fn phase(&self) -> Option<&str> {
+        self.current_phase.as_deref()
+    }
+
+    /// How far the running job is, as done of total: bytes in the full
+    /// pass, files while hashing, links while applying.
+    pub fn run_progress(&self) -> Option<(u64, u64)> {
+        self.running_job.as_ref()?;
+        match self.current_phase.as_deref() {
+            Some("hashing_full") if self.hash_bytes.is_some() => self.hash_bytes,
+            Some("hashing_sample") | Some("hashing_full") => {
+                let done = self.hash_progress_done?;
+                let total = self.hash_progress_total?;
+                Some((done as u64, total as u64))
+            }
+            Some("applying") => {
+                let applied = self.live_applied_actions?;
+                let planned = self.live_planned_actions?;
+                Some((applied as u64, planned as u64))
+            }
+            _ => None,
+        }
+    }
+
+    /// Files hashed, or matches verified, of those the phase will read.
+    pub fn hash_progress(&self) -> Option<(usize, usize)> {
+        Some((self.hash_progress_done?, self.hash_progress_total?))
+    }
+
+    /// Whether a report is loaded, and from a link run.
+    pub fn showing_link_report(&self) -> bool {
+        self.report
+            .as_ref()
+            .is_some_and(|report| report.mode == "link")
+    }
+
+    pub fn has_report(&self) -> bool {
+        self.report.is_some()
+    }
+
+    pub fn link_check(&self) -> &LinkCheck {
+        &self.link_check
+    }
+
+    /// How long the last finished run took, if one finished this session.
+    pub fn last_run_label(&self) -> Option<String> {
+        self.last_run_duration.map(format_duration)
     }
 
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<()> {
@@ -879,7 +888,51 @@ impl App {
     }
 
     fn save_config_from_editor(&mut self) -> Result<()> {
-        self.save_config_from_editor_with(load_config, save_config)
+        self.save_config_from_editor_with(load_config, save_config)?;
+        if matches!(self.overlay, Overlay::None) {
+            self.start_link_check();
+        }
+        Ok(())
+    }
+
+    /// Try one hardlink between the saved folders, off the UI thread.
+    fn start_link_check(&mut self) {
+        let (Some(downloads), Some(media)) = (self.downloads.clone(), self.media.clone()) else {
+            return;
+        };
+        self.link_check = LinkCheck::Testing;
+        self.link_check_rx = Some(actions::spawn_link_check(downloads, media));
+    }
+
+    fn poll_link_check(&mut self) {
+        let Some(receiver) = &self.link_check_rx else {
+            return;
+        };
+        let (check, warning) = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => (LinkCheck::Untested, None),
+        };
+        self.link_check_rx = None;
+        let line = match &check {
+            LinkCheck::Hardlinks => {
+                Some("A test hardlink worked: link runs will free space.".to_string())
+            }
+            LinkCheck::Symlinks { cause } => Some(format!(
+                "A test hardlink failed: {cause}. Link runs will make symlinks, which break if a library file is renamed, upgraded or deleted."
+            )),
+            LinkCheck::NoLibraryFile => {
+                Some("No library file to test a hardlink with yet.".to_string())
+            }
+            LinkCheck::Untested | LinkCheck::Testing => None,
+        };
+        if let Some(line) = line {
+            self.push_log(line);
+        }
+        if let Some(warning) = warning {
+            self.push_log(warning);
+        }
+        self.link_check = check;
     }
 
     fn save_config_from_editor_with<L, S>(&mut self, load_fn: L, save_fn: S) -> Result<()>
@@ -1473,6 +1526,14 @@ impl App {
         self.toggle_path_mode();
     }
 
+    pub(crate) fn set_link_check_for_test(&mut self, check: LinkCheck) {
+        self.link_check = check;
+    }
+
+    pub(crate) fn push_log_for_test(&mut self, line: &str) {
+        self.push_log(line.to_string());
+    }
+
     pub(crate) fn handle_key_for_test(&mut self, code: KeyCode, mods: KeyModifiers) {
         self.handle_key(code, mods).expect("key handling");
     }
@@ -1723,9 +1784,9 @@ mod tests {
 
         assert_eq!(app.files_considered(), 42);
         assert_eq!(app.planned_actions(), 2);
-        assert_eq!(app.activity_phase(), "HASHING FILES");
+        assert_eq!(app.phase(), Some("hashing_sample"));
         assert_eq!(app.active_worker_paths(), vec![(2, "/downloads/movie.mkv")]);
-        assert_eq!(app.throughput_label(), "23 / 42 files hashed");
+        assert_eq!(app.hash_progress(), Some((23, 42)));
     }
 
     #[test]
@@ -2078,12 +2139,9 @@ mod tests {
         app.set_hash_progress_for_test(0, 2);
         app.set_full_pass_for_test(500 << 20, 2000 << 20, Duration::from_secs(10));
 
-        let label = app.throughput_label();
+        let label = app.full_pass_progress().expect("the full pass's progress");
 
-        assert!(
-            label.starts_with("0 / 2 duplicate files verified"),
-            "{label}"
-        );
+        assert_eq!(app.hash_progress(), Some((0, 2)));
         assert!(label.contains("500.0 MiB of 2.0 GiB"), "{label}");
         assert!(label.contains("50.0 MiB/s"), "{label}");
         assert!(label.contains("ETA 00:30"), "{label}");
@@ -2107,7 +2165,10 @@ mod tests {
                 total: 4 << 30,
             },
         );
-        assert!(app.throughput_label().contains("1.0 GiB of 4.0 GiB"));
+        assert!(
+            app.full_pass_progress()
+                .is_some_and(|label| label.contains("1.0 GiB of 4.0 GiB"))
+        );
     }
 
     #[test]
@@ -2257,15 +2318,6 @@ mod tests {
     }
 
     #[test]
-    fn current_path_label_is_current() {
-        let config = Config::default();
-        let mut app = App::new(&config, false);
-        app.current_phase = Some("hashing_sample".to_string());
-
-        assert_eq!(app.current_path_label(), "current");
-    }
-
-    #[test]
     fn phase_change_clears_stale_current_path() {
         let config = Config::default();
         let mut app = App::new(&config, false);
@@ -2280,7 +2332,7 @@ mod tests {
 
         assert!(!cleared);
         assert_eq!(app.current_path(), None);
-        assert_eq!(app.activity_phase(), "PLANNING ACTIONS");
+        assert_eq!(app.phase(), Some("planning"));
     }
 
     #[test]

@@ -1,76 +1,65 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
-/// Below this many rows, or [`SIDEBAR_COLUMNS`] columns, the header drops
-/// the wordmark and the metric cards for one line of counts, so the results
-/// keep their room.
+/// Below this many rows, or [`FULL_HEADER_COLUMNS`] columns, the header
+/// drops the logo and the big number for three lines of counts and
+/// activity, so the pairs keep their room.
 pub const FULL_HEADER_ROWS: u16 = 30;
-/// Below this many columns the Workspace sidebar is hidden: its paths and
-/// keys are in the footer and in Help, and the results need the width.
-pub const SIDEBAR_COLUMNS: u16 = 100;
-/// Below this many columns the Inspector is hidden too.
-pub const INSPECTOR_COLUMNS: u16 = 70;
-/// Below this many rows the Run Log keeps one line and the footer its border.
-const TINY_ROWS: u16 = 22;
+pub const FULL_HEADER_COLUMNS: u16 = 100;
+/// From this many columns the pairs show the library file beside the
+/// download; below it, the details panel names it.
+pub const LIBRARY_COLUMNS: u16 = 96;
+/// Below this many rows the details panel gives way and the footer loses the
+/// rule above its keys.
+const DETAILS_ROWS: u16 = 22;
+/// From this many rows the log shows its two newest lines.
+const TWO_LOG_LINES_ROWS: u16 = 34;
 
 pub struct DashboardLayout {
-    pub top: Rect,
-    /// The header is one block of counts and activity, without the wordmark.
+    pub header: Rect,
+    /// The header is three lines of counts and activity, without the logo.
     pub compact_header: bool,
-    pub center_left: Option<Rect>,
-    pub center_main: Rect,
-    pub center_right: Option<Rect>,
-    pub bottom_log: Rect,
+    /// The pairs, or what stands in for them.
+    pub body: Rect,
+    /// The selected pair, told in full.
+    pub details: Option<Rect>,
+    pub log: Rect,
     pub footer: Rect,
-    /// The footer has room for the line above its keys.
-    pub footer_border: bool,
+    /// The footer has room for the rule above its keys.
+    pub footer_rule: bool,
 }
 
 pub fn dashboard(area: Rect) -> DashboardLayout {
-    let compact_header = area.height < FULL_HEADER_ROWS || area.width < SIDEBAR_COLUMNS;
-    let tiny = area.height < TINY_ROWS;
-    let (top, log, footer) = match (compact_header, tiny) {
-        (false, _) => (9, 6, 2),
-        (true, false) => (6, 4, 2),
-        (true, true) => (6, 3, 1),
+    let compact_header = area.height < FULL_HEADER_ROWS || area.width < FULL_HEADER_COLUMNS;
+    let roomy = area.height >= DETAILS_ROWS;
+    let header = if compact_header { 4 } else { 8 };
+    let details = match area.height {
+        h if h >= TWO_LOG_LINES_ROWS => 6,
+        h if h >= DETAILS_ROWS => 5,
+        _ => 0,
     };
-    let vertical = Layout::default()
+    let log = if area.height >= TWO_LOG_LINES_ROWS {
+        2
+    } else {
+        1
+    };
+    let footer = if roomy { 2 } else { 1 };
+    let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(top),
-            Constraint::Min(5),
+            Constraint::Length(header),
+            Constraint::Min(4),
+            Constraint::Length(details),
             Constraint::Length(log),
             Constraint::Length(footer),
         ])
         .split(area);
-
-    let (center_left, center_main, center_right) = if area.width >= SIDEBAR_COLUMNS {
-        let center = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(20),
-                Constraint::Percentage(57),
-                Constraint::Percentage(23),
-            ])
-            .split(vertical[1]);
-        (Some(center[0]), center[1], Some(center[2]))
-    } else if area.width >= INSPECTOR_COLUMNS {
-        let center = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-            .split(vertical[1]);
-        (None, center[0], Some(center[1]))
-    } else {
-        (None, vertical[1], None)
-    };
-
     DashboardLayout {
-        top: vertical[0],
+        header: rows[0],
         compact_header,
-        center_left,
-        center_main,
-        center_right,
-        bottom_log: vertical[2],
-        footer: vertical[3],
-        footer_border: !tiny,
+        body: rows[1],
+        details: roomy.then_some(rows[2]),
+        log: rows[3],
+        footer: rows[4],
+        footer_rule: roomy,
     }
 }

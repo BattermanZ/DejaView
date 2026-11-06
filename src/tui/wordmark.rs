@@ -145,14 +145,16 @@ fn cell(top: Option<Color>, bottom: Option<Color>) -> (&'static str, Style) {
     }
 }
 
-/// The logo as [`HEIGHT`] lines of [`WIDTH`] cells, each run of cells that
-/// share a style in one span.
-pub(crate) fn lines() -> Vec<Line<'static>> {
-    colours()
+/// Rows of coloured pixels as lines of half blocks, two pixel rows to a
+/// line, each run of cells that share a style in one span. An odd last row
+/// is paired with an empty one.
+pub(crate) fn half_blocks(pixels: &[Vec<Option<Color>>]) -> Vec<Line<'static>> {
+    pixels
         .chunks(2)
         .map(|pair| {
             let mut spans: Vec<Span<'static>> = Vec::new();
-            for (&top, &bottom) in pair[0].iter().zip(&pair[1]) {
+            for (x, &top) in pair[0].iter().enumerate() {
+                let bottom = pair.get(1).and_then(|row| row.get(x).copied()).flatten();
                 let (symbol, style) = cell(top, bottom);
                 match spans.last_mut() {
                     Some(span) if span.style == style => span.content.to_mut().push_str(symbol),
@@ -162,6 +164,11 @@ pub(crate) fn lines() -> Vec<Line<'static>> {
             Line::from(spans)
         })
         .collect()
+}
+
+/// The logo as [`HEIGHT`] lines of [`WIDTH`] cells.
+pub(crate) fn lines() -> Vec<Line<'static>> {
+    half_blocks(&colours())
 }
 
 #[cfg(test)]

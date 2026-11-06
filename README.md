@@ -172,6 +172,18 @@ dejaview tui
 
 Add `--strict` to run the dashboard's scans and links in strict mode.
 
+Each row is a download beside the library file it is a copy of, with the link between them drawn in the middle:
+
+| Link | Means |
+|---|---|
+| `╌╌╌╌○╌╌╌╌` orange | Not linked yet |
+| `━━━━●━━━━` green | A hardlink: one file on disk under both names |
+| `────────▶` amber | A symlink: it points at the library file and breaks if that file is renamed, upgraded or deleted |
+| `━━━━●━━━━` grey | Already one file; nothing to do |
+| `────✗` red | Failed; the details under the rows say why |
+
+Above the rows, the space a link run would free, or the space it freed, is drawn big, with the counts of hardlinks and symlinks beside it. Saving the folders in the path editor (`e`) tries one hardlink between them, as `dejaview config validate` does, and says whether links will be hardlinks or symlinks.
+
 | Key | Action |
 |---|---|
 | `S` | Scan. Before the paths are set, this opens the path editor. |
@@ -281,7 +293,7 @@ cargo test --release --test perf_harness -- --ignored --nocapture
 
 Each profile has a time limit you can tighten with `DEJAVIEW_PERF_SMALL_COLD_MS`, `DEJAVIEW_PERF_SMALL_WARM_MS`, and the matching `MEDIUM` and `LARGE` variables (milliseconds).
 
-`dejaview tui-logo-preview` shows the wordmark variants the dashboard chooses between.
+`dejaview tui-logo-preview` shows the dashboard's logo on its own, to judge it in a real terminal and font.
 
 ## License
 

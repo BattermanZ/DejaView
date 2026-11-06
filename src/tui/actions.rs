@@ -9,8 +9,34 @@ use crate::config::load_config;
 use crate::engine;
 use crate::fsutil::safe_write_bytes;
 
+use super::app::LinkCheck;
 use super::model::{RunReport, TuiEvent};
 use crate::protocol::{PROTOCOL_VERSION, PlannedPair};
+
+/// Try one real hardlink from the library into downloads, as `config
+/// validate` does, on a thread of its own, and send what it showed with any
+/// warning to log. It changes nothing in the library but one file's change
+/// time.
+pub fn spawn_link_check(
+    downloads: std::path::PathBuf,
+    media: std::path::PathBuf,
+) -> Receiver<(LinkCheck, Option<String>)> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = match engine::probe_hardlink(&downloads, &media) {
+            engine::HardlinkProbe::NoFile => (LinkCheck::NoLibraryFile, None),
+            engine::HardlinkProbe::Works { leftover, .. } => (LinkCheck::Hardlinks, leftover),
+            engine::HardlinkProbe::Fails { cause, .. } => (
+                LinkCheck::Symlinks {
+                    cause: cause.to_string(),
+                },
+                None,
+            ),
+        };
+        let _ = sender.send(result);
+    });
+    receiver
+}
 
 /// A child that already ended its stream with a done, error or cancelled
 /// event has said how it ended; its exit code (2 for a run with failures, 1
