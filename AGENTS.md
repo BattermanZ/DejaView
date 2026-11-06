@@ -179,9 +179,10 @@ terminal; say so in the pull request when you could not.
 ## Tickets and decisions
 
 Work is tracked as GitHub issues on `BattermanZ/DejaView`. `docs/FINDINGS.md`
-is a review's backlog not yet filed as issues: a finding is built once it is
-an issue labelled `ready-for-agent`, and its four open decisions are the
-maintainer's to make first.
+is a review's backlog not yet filed as issues. Its four decisions are settled,
+and its first round is worked straight from that file, as its "Rules for
+working in this repo" say; after that, a finding is built once it is an issue
+labelled `ready-for-agent`.
 
 A decision that is hard to reverse (a default, a format, a refusal) is
 recorded as an ADR under `docs/adr/` once made, and the words DejaView uses

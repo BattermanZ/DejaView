@@ -4,8 +4,8 @@ Written for the next session that works on this repo. It holds every open findin
 
 ## Where things stand
 
-- Repo: `BattermanZ/DejaView`. Work branch: `claude/happy-fermat-r9d08c`, pushed. The last code commit is `a3959f9`; this file was added in the commit after it. No PR is open. `main` is still at `c82ccfe`.
-- All line numbers below refer to `a3959f9`. Re-check them before editing.
+- Repo: `BattermanZ/DejaView`. The review was written against `a3959f9`. The safety group of the suggested order (S1 to S6, C1, C2, C4, C5, C6, with P1's size floor) is done on `claude/happy-fermat-r9d08c`; each of those findings ends with a Done line saying what was built and where it differs from the fix proposed.
+- All line numbers below refer to `a3959f9`, and the safety fixes moved many of them. Re-check them before editing.
 - State at `a3959f9`: 134 unit tests and 14 CLI tests pass as root and as non-root; `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean; CI (`.github/workflows/ci.yml`) passed on GitHub.
 - The reviewers' scratch files lived in the old container and are gone. Each finding below says how to reproduce it.
 - This file was fact-checked against `a3959f9` by a separate reviewer: line references and behaviour were checked in the code, and S1, S2, C1, C3, C4, C5, C6, C8, C9, C10, P2, P8, U6, U8, M2, M8 and M9 were reproduced again with the binary. Not re-checked: the simulated NAS timings (P section), the TUI rendering claims (U1-U4; the code matches), and S3/S4 (reproduced only by the original reviewer).
@@ -37,51 +37,59 @@ Severity: High, Medium, Low. Evidence tags: **[verified]** reproduced in the mai
 
 ### Data safety (fix first)
 
-**S1. High. The same library seen through a second mount gets past the overlap guard and is rewritten.** **[verified]**
+**S1. Done. High. The same library seen through a second mount gets past the overlap guard and is rewritten.** **[verified]**
 - Where: `src/config.rs:129-151` (`ensure_roots_disjoint`), `src/engine/linking.rs:51-74` (`ensure_source_outside_media_root`), `linking.rs:151-192`.
 - The guard compares canonical paths, so it cannot see that two different paths are the same directory.
 - Bind mounts (common in Docker): host `/data` mounted as downloads and `/data/media` as media. `config validate` passes. A library file that has an identical second copy in the library gets replaced by a relative symlink that dangles on the host. Reproduce: two identical files `media/A Movies/m.mkv` and `media/B Movies/m.mkv` under a host dir `data`, `mount --bind data c/downloads`, `mount --bind data/media c/media`, run `link`: `c/downloads/media/B Movies/m.mkv` becomes `-> ../../../media/A Movies/m.mkv`.
 - mergerfs branch vs pool **[reproduced]**: downloads pointed at a branch path that contains the library, media at the pool view. Each library file appears as a "download" (branch device) and as "media" (FUSE device). The branch file was replaced by a symlink to its own pool path: the only copy was destroyed, and reading it hung the pool (FUSE self-loop).
 - Fix (small): (a) while walking downloads, refuse if any directory has the media root's (dev, ino), and the reverse for the media walk; this catches bind mounts. (b) refuse a pair whose source and target have equal size, mtime_ns and ctime_ns but a different st_dev (the same file seen through two mounts; real copies almost never share ctime to the nanosecond). Add CLI tests using bind mounts if the CI runner allows `mount` (it may not; then unit-test the checks with injected metadata).
+- Done: every walk compares each directory's device and inode with the other root and stops the run on a match, `config validate` walks both trees the same way, and planning skips a download with the same size, mtime and ctime as a library file on another device (`skipped_as_library_file` in the report). A bind-mount CLI test runs where the process may mount and skips on CI; a unit test stands in with a folder's own device and inode.
 
-**S2. High. Empty files are planned and linked; later writes land in the library.** **[verified]**
+**S2. Done. High. Empty files are planned and linked; later writes land in the library.** **[verified]**
 - Where: `src/engine/collect.rs:87` and `158-164` (no size floor), `linking.rs:334-361`.
 - Every empty download is linked to the first empty media file: an empty `.keep` was linked to the library's `.plexignore`. With `min_age` 0, a file a torrent client has created but not yet written qualifies; the client then writes into the shared inode and the library file changes. Tiny sidecars (a 9-byte .srt, .nfo files) are linked too, saving nothing and tying unrelated library files to downloads.
 - Fix (tiny): skip `size == 0` in collect, whatever the floor. Then add `min_size`, default 1 MiB (P1, ADR 0002).
+- Done with P1: empty files are always skipped, and `min_size` (default 1 MiB) is in the config, `config set-min-size` and `--min-size`.
 
-**S3. High. The silent symlink fallback is unsafe for *arr setups.** **[reproduced]**
+**S3. Done. High. The silent symlink fallback is unsafe for *arr setups.** **[reproduced]**
 - Where: `linking.rs:282-323`, `collect.rs:23-25` (the walk skips symlinks, so a symlinked download is never looked at again), `types.rs` `LinkMode { Best, SymlinkOnly }`.
 - The hardlink fails, and DejaView quietly makes a symlink, when: the cron user does not own the library file and `fs.protected_hardlinks=1` (default on Debian/Ubuntu; EPERM); Docker mounts downloads and media separately or media is `:ro` (EXDEV even on one device); mergerfs path-preserving policies put the two files on different disks (EXDEV).
 - Why it hurts: the symlink dangles when Sonarr/Radarr upgrades or deletes the library file, and the torrent breaks; a client re-downloading the missing file writes through the dangling link and creates a file in the library; a category move in the client breaks the relative link; container paths may not exist on the host.
 - The planned row says "TRY HARDLINK" and the report's `fallback_reason` loses the errno (see C3).
 - Fix: the symlink fallback stays the default (ADR 0001), so make it visible: make `config validate` try one real hardlink from media into downloads and explain EPERM (ownership, protected_hardlinks) separately from EXDEV (filesystem, mount or mergerfs branch); print "N linked as symlinks" in the summary; add a check that lists symlinks under downloads pointing into media that no longer resolve (scan warning or a `check` command).
+- Done: `fallback_reason` names the cause and the OS error, the summary counts symlinks, `config validate` tries one real hardlink and names EXDEV or EPERM, and every walk lists symlinks into the library that no longer resolve (`dangling_symlinks` in the report).
 
-**S4. Medium (High with separate users). A hardlinked download takes on the library file's owner, mode, ACLs, xattrs and SELinux label.** **[reproduced]**
+**S4. Done. Medium (High with separate users). A hardlinked download takes on the library file's owner, mode, ACLs, xattrs and SELinux label.** **[reproduced]**
 - Where: `linking.rs:465-470` and `194-256`; nothing compares ownership.
 - Example: download `qbt:qbt 0664`, library copy `arr:arr 0640`, DejaView run as root. After `link` the download is `arr:arr 0640`; the torrent user gets "Permission denied" and seeding stops. The report says applied/hardlink with no warning.
 - Fix (small to medium): before linking, compare uid, gid and mode; skip (or require a flag) when the target gives the source's owner less access than the source had, and report why. Document ACL/xattr/SELinux (`:Z` labels) effects.
+- Done: a pair whose link would take read access from the download's owner or group is `skipped` with the reason in `error`, and the run carries on, `--strict` included. Losing write access alone is allowed, since seeding reads. The owner is taken to belong to the download's group (no group lookup without `libc`). README covers ACLs, xattrs and SELinux labels.
 
-**S5. Medium. TUI `L` links files that were never shown for review.** **[reproduced]**
+**S5. Done. Medium. TUI `L` links files that were never shown for review.** **[reproduced]**
 - Where: `src/tui/app.rs:488` (L opens the dialog with no scan required), `src/tui/actions.rs:131` (`run_link` starts a plain `link`, which rescans), dialog text at `src/tui/view/mod.rs:799`.
 - Scan shows 8 rows; a new duplicate appears; L then y applies 9. L also works before any scan ("Estimated planned actions: 0") and links everything. The dialog reports "Rows with warnings or errors: 8" on a clean plan because every planned row carries the note "tries hardlink first; may fall back to symlink" in `fallback_reason`.
 - Fix (medium): pass the reviewed rows to the child (a plan file with OS-string paths, or repeated `--only-source`), disable L until a scan has finished, count only rows with `error`, and drop "Current mode" from the dialog.
+- Done: `l` and `L` pass the reviewed (source, target) rows to the child as a plan file (`link --plan`), `L` is off until a finished scan has planned rows, the dialog counts rows with an error and drops the mode label, and a link run that ends without a report gives the rows back. The plan carries Strings like the report rows; non-UTF-8 paths stay with C9.
 
-**S6. Low. Path-based link and rename after the safety checks (TOCTOU).** **[reasoned]**
+**S6. Done. Low. Path-based link and rename after the safety checks (TOCTOU).** **[reasoned]**
 - Where: `linking.rs:465-470`, `51-74`, `213-236`.
 - A directory component of the source swapped for a symlink between the checks and the rename sends the rename outside downloads; run as root this replaces an arbitrary file. A target swapped for a symlink makes `linkat` hardlink the symlink, reported as "hardlink". Needs another local writer.
 - Fix (medium): open the source's parent with `O_NOFOLLOW`, fstat-verify it, and use `linkat`/`renameat` relative to that dirfd; re-check the target with `AT_SYMLINK_NOFOLLOW`. Probably needs `libc` or `rustix`.
+- Done with std only (decision 3): on Linux the download's folder is opened once and the link and rename go through `/proc/self/fd/N`, with the folder's real path checked inside downloads; the temp link and the download are both checked against the plan right before the rename, and a mismatch fails the pair with no symlink fallback. Off Linux, or without /proc, it works by path as before.
 
 ### Correctness and reports
 
-**C1. Medium. Downloads that are hardlinks of each other (cross-seed) fail every first run, and the report overstates savings.** **[verified]**
+**C1. Done. Medium. Downloads that are hardlinks of each other (cross-seed) fail every first run, and the report overstates savings.** **[verified]**
 - Where: `src/engine/types.rs:39-41` (source check includes ctime), `linking.rs:103-112`, `347-357`.
 - `dl/t1/movie.mkv` and `dl/t2/movie.mkv` share one inode, not the library's. Replacing t1 changes the inode's link count and ctime, so t2 fails "source changed since planning". The report says applied 1, `total_saved_bytes` 12000000 (both planned paths, failed one included), while 0 bytes were freed (t2 still holds the data); exit code 0. `--strict` stops at the first failure, so a strict cron makes one group of progress per run.
 - Fix (small): process paths sharing an inode back to back; after DejaView's own replacement, accept a ctime/nlink change on siblings whose size, mtime, dev and ino still match.
+- Done: a source whose inode this run already replaced a path of passes the pre-link check when only its ctime moved. The per-path `total_saved_bytes` stays C3's to fix.
 
-**C2. Medium. No lock against concurrent runs.** **[reproduced]**
+**C2. Done. Medium. No lock against concurrent runs.** **[reproduced]**
 - Where: `src/engine/mod.rs:131-174`, `report.rs:117-128`, `cache.rs:108-121`.
 - Two `link` runs over 300 pairs: no data damage, but 129/171 and 171/129 spurious "source changed" failures, both exit 0, and the second overwrote the first's report. The cache is last-writer-wins (atomic, but hashes are lost). `cache cleanup-temp` during a run can delete an in-flight temp link and force a symlink fallback.
 - Fix (small): a non-blocking exclusive lock (`File::try_lock`, decision 3) on `<downloads>/.dejaview.lock` for scan, link and cleanup-temp; exit with a clear message and code 3 when held (ADR 0003). Fix the README cron line too (absolute binary path, `flock -n`, stdout to /dev/null, dated `--report`).
+- Done: scan, link and `cache cleanup-temp` take a non-blocking lock on `<downloads>/.dejaview_lock` (the `.dejaview_` prefix keeps it out of scans), retrying for about 200 ms because a forked child can hold a just-released lock until its exec, and exit 3 when it is held. A filesystem that cannot lock at all runs unlocked with a warning. `rust-version = "1.89"`. The README cron line uses the absolute path, drops stdout and stays silent on exit 3; ADR 0003 keeps one report, so no dated `--report` and, with the built-in lock, no `flock -n`.
 
 **C3. Medium. Reports and errors don't match what happened.** **[reproduced]**
 - Where: `src/engine/mod.rs:186` (total computed before apply), `report.rs:117` (one fixed path), `report.rs:130-160`, `linking.rs:252, 306, 476-479, 500-505`, `mod.rs:297-312`, `hashing.rs:316, 400`.
@@ -93,19 +101,22 @@ Severity: High, Medium, Low. Evidence tags: **[verified]** reproduced in the mai
 - Non-strict runs with failed links exit 0.
 - Fix (small to medium): format errors with `{:#}` everywhere an anyhow error becomes a string; clear method and reason on failure; compute freed bytes from applied actions per inode (add `nlink` to FileInfo); add optional report fields `version`, `started_at`, `finished_at`, `downloads`, `media`, `link_mode`, `outcome` (complete, cancelled, failed), `symlinked` count, `already_linked` pairs/bytes, and split `planned_bytes` / `freed_bytes`; skip writing the report when nothing was planned; emit JSON before returning a strict error; exit codes as ADR 0003 sets them.
 
-**C4. High (blocks Docker and hardened systemd). Logger setup is fatal and paths can't be overridden.** **[verified]**
+**C4. Done. High (blocks Docker and hardened systemd). Logger setup is fatal and paths can't be overridden.** **[verified]**
 - Where: `src/main.rs:169`, `src/logger.rs:35-40, 66, 70`, `src/config.rs:18-22`.
 - An unwritable or uncreatable state dir makes every command fail, even `config show`, with a message that names no path (`XDG_STATE_HOME=/proc/x dejaview config show` gives "Error: No such file or directory (os error 2)"). With no HOME and no passwd entry (`docker run --user 1000` on a scratch image) every command fails with "Could not find state or config directory".
 - Fix (small): make logger init best-effort with one stderr warning that names the path; add `DEJAVIEW_CONFIG` (or `--config`) and `DEJAVIEW_LOG` (a path, or `-` for stderr). CLI test with an unwritable state dir.
+- Done: logger setup warns once and carries on, `DEJAVIEW_CONFIG` and `DEJAVIEW_LOG` (path or `-`) exist, and a CLI test runs `config show` with an uncreatable state folder.
 
-**C5. Low to Medium. mergerfs details.** **[reproduced]** on mergerfs 2.33.5
+**C5. Done. Low to Medium. mergerfs details.** **[reproduced]** on mergerfs 2.33.5
 - Without `use_ino` (older mergerfs), hardlinked pool paths report different inodes: every `link` run re-plans and "applies" the same pair (the rename is a no-op), reports savings, and a remount changes inode numbers and forces a full rehash. With `use_ino` it was correct. The README's `inodecalc=hybrid-hash` advice is incomplete: mention `use_ino` for older versions.
 - **[reasoned]** mergerfs `link-exdev`/`rename-exdev` options (present in 2.33.5, default `passthrough`) can turn a link into a symlink and still report success, so the report says "hardlink". Fix: after the rename, lstat the source and require a regular file with the target's dev/ino, else record the real method; treat "temp still exists after rename" as already linked.
+- Done: README mentions `use_ino`. What `link(2)` left is checked before the rename, by size and mtime rather than inode, since mergerfs without `use_ino` gives one file two inode numbers; a symlink to the library file is recorded as `symlink`. A temp name that survives the rename gives the status `already-linked`.
 
-**C6. Low to Medium. A download already hardlinked to a non-canonical library copy gets relinked.** **[reproduced]**
+**C6. Done. Low to Medium. A download already hardlinked to a non-canonical library copy gets relinked.** **[reproduced]**
 - Where: `linking.rs:345-350` (only the canonical `media[0]` inode is compared).
 - The download shares an inode with `B Movies/m.mkv`; the library also has an identical `A Movies/m.mkv`. The download is relinked to A, reported as 3 MB saved, disk use unchanged, and the *arr hardlink is broken.
 - Fix (tiny): skip a download whose (dev, ino) matches any media file in its hash group, or choose that file as its target.
+- Done: a download sharing an inode with any library file in its hash group is skipped.
 
 **C7. Low. A permanent walk error disables cache pruning and makes `--strict` fail every run.** **[reproduced]**
 - Where: `mod.rs:159-172`, `collect.rs:53-58`.
@@ -130,10 +141,11 @@ Severity: High, Medium, Low. Evidence tags: **[verified]** reproduced in the mai
 
 Measured by the reviewer on a 93,730-file library shaped like a Jellyfin/Kodi library (24k episodes with .nfo and thumbnails, 3k movies, posters), with real mergerfs and with an LD_PRELOAD shim adding 0.5 ms per stat/open/read/close and one shared 110 MB/s link ("sim"). Warm scan: local ext4 0.73 s, real mergerfs 7.75 s, sim NAS 91.2 s (walk 65.2 s, quick hash 25.7 s). P1 to P3 together are projected (not measured end to end) to bring the sim warm scan to about 4-5 s.
 
-**P1. High. No minimum file size.** **[reproduced]**
+**P1. Done. High. No minimum file size.** **[reproduced]**
 - Where: `collect.rs:83-96` (the only filter is `min_age`).
 - A 1 MiB floor cuts the files quick-hashed on a cold run of that library from 34,775 to 40 (groups 8,628 to 20); a 64 KiB floor leaves 2,981.
 - Fix (small): `min_size` config and flag; skip before building FileInfo and before the TUI File event; report a `skipped_by_min_size` count like `skipped_by_min_age`.
+- Done with S2 (see there); the report counts `skipped_by_min_size`.
 
 **P2. High. Small files in shared-size groups are re-read on every run.** **[verified]**
 - Where: `src/engine/hashing.rs:282-334` (phase 1 quick-hashes every physical file in a group that has any uncached member), `:326-332`, `sync_cache` at `:188-211` (only full-hashed files get entries).
@@ -258,14 +270,14 @@ All reproduced by rendering the TUI in a pty with pyte at 60x20, 80x24, 100x30, 
 ### Docs to correct
 
 - README "Cheap repeat runs" and "rescanning ... costs very little": true for hardlinked videos, not for small sidecars (P2).
-- README mergerfs section: add `use_ino` for older mergerfs (C5) and the symlink-fallback risks (S3).
-- README says `fallback_reason` names the cause; it doesn't until C3 is fixed.
-- README cron example: absolute binary path, `flock -n`, stdout to /dev/null, dated report (C2).
+- Done: README mergerfs section has `use_ino` for older mergerfs (C5) and the symlink-fallback risks (S3).
+- Done: `fallback_reason` names the cause and the OS error (S3).
+- Done: README cron example has the absolute binary path, drops stdout and treats exit 3 as nothing to report (C2, ADR 0003).
 - README says the config/log follow XDG; on macOS they don't (M8).
 
 ## Suggested order
 
-1. Safety: S1, S2 (empty files), S3, S4, S5, C1, C6, C2 (lock), C4 (logging), C5, then S6.
-2. NAS speed: P1, P2, P8, P3, P4, P7, then P5 and P6, then P9, P10, P11.
+1. Safety, done on `claude/happy-fermat-r9d08c`: S1, S2 (empty files, with P1's floor), S3, S4, S5, C1, C6, C2 (lock), C4 (logging), C5, then S6.
+2. NAS speed: P1 (done with S2), P2, P8, P3, P4, P7, then P5 and P6, then P9, P10, P11.
 3. Reports and UI: C3, C10, U1, U5, U2, U3, U4, U6, U7, U8, U9, C7, C8, C9.
 4. Maintenance and release: M1, M5, M6, M3, M2, M4, M7, M9, M8, docs.
