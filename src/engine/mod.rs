@@ -1,7 +1,5 @@
 use anyhow::{Result, anyhow};
 use colored::*;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 mod cache;
 mod collect;
@@ -16,7 +14,7 @@ pub use types::ScanRunOptions;
 use crate::protocol::TuiEvent;
 use cache::{load_cache, save_cache};
 use collect::{CollectOptions, collect_run_files, group_files_by_size};
-use hashing::hash_groups_and_update_cache;
+use hashing::{HashOptions, hash_groups_and_update_cache};
 use linking::{apply_actions, plan_actions_and_table};
 use report::{
     RunReportInput, build_report_entries, build_run_report, maybe_confirm_apply,
@@ -114,25 +112,22 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
 
     let cache_path = cache_path(config)?;
     logger::info("run", format!("using cache path {}", cache_path.display()));
-    let cache = Arc::new(Mutex::new(load_cache(&cache_path)));
-    let inode_hash: Arc<Mutex<HashMap<(u64, u64), String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut cache = load_cache(&cache_path);
 
     let mut groups = group_files_by_size(files);
     hash_groups_and_update_cache(
         &mut groups,
-        &cache,
-        &inode_hash,
-        options.strict,
-        options.show_progress,
-        options.tui_events,
-        options.link_mode,
-        options.only_sources,
+        &mut cache,
+        &HashOptions {
+            strict: options.strict,
+            show_progress: options.show_progress,
+            tui_events: options.tui_events,
+            link_mode: options.link_mode,
+            only_sources: options.only_sources,
+        },
         &mut warnings,
     )?;
-
-    if let Ok(c) = Arc::try_unwrap(cache) {
-        save_cache(&cache_path, &c.into_inner().unwrap())?;
-    }
+    save_cache(&cache_path, &cache)?;
 
     let (table, actions, _total_saved_space) = plan_actions_and_table(&groups);
     let actions = if options.only_sources.is_empty() {

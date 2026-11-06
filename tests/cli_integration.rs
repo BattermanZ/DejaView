@@ -550,3 +550,97 @@ fn nested_media_root_is_rejected_and_library_is_untouched() {
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+fn write_seeded(path: &Path, size: usize, seed: u8) {
+    fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+    let bytes: Vec<u8> = (0..size)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect();
+    fs::write(path, bytes).expect("write seeded file");
+}
+
+/// Paths a scan actually opened for hashing, read from the TUI event stream.
+fn paths_read_by_scan(root: &Path) -> Vec<String> {
+    let out = run_cmd(root, &["scan", "--tui-events", "--no-progress"]);
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut paths = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let event: serde_json::Value = serde_json::from_str(line).expect("parse event");
+        if event["type"] == "worker_activity"
+            && let Some(path) = event["path"].as_str()
+        {
+            let phase = event["phase"].as_str().expect("phase");
+            let rel = Path::new(path)
+                .strip_prefix(root)
+                .expect("path under root")
+                .display();
+            paths.push(format!("{phase} {rel}"));
+        }
+    }
+    paths.sort();
+    paths
+}
+
+#[test]
+fn scans_skip_hardlinked_files_and_reuse_cache_for_every_path() {
+    let root = unique_temp_dir("hash_reads");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    // A real duplicate: separate copies in downloads and media.
+    write_seeded(&media.join("movie.mkv"), 300_000, 1);
+    write_seeded(&downloads.join("movie.mkv"), 300_000, 1);
+    // Already hardlinked, as an *arr import leaves it: one physical file.
+    write_seeded(&media.join("show.mkv"), 200_000, 2);
+    fs::hard_link(media.join("show.mkv"), downloads.join("show.mkv")).expect("hardlink show");
+    // A hardlinked pair plus a separate copy of the same content.
+    write_seeded(&media.join("ep.mkv"), 100_000, 3);
+    fs::hard_link(media.join("ep.mkv"), downloads.join("ep.mkv")).expect("hardlink ep");
+    write_seeded(&downloads.join("ep-copy.mkv"), 100_000, 3);
+
+    run_ok(
+        &root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        &root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+    set_min_age_zero(&root);
+
+    let cold = paths_read_by_scan(&root);
+    assert!(
+        !cold.iter().any(|p| p.contains("show.mkv")),
+        "a group that is one physical file must not be read: {cold:?}"
+    );
+    let full_reads = cold
+        .iter()
+        .filter(|p| p.starts_with("hashing_full"))
+        .count();
+    assert_eq!(
+        full_reads, 4,
+        "one full read per physical file in a duplicate group: {cold:?}"
+    );
+
+    let warm = paths_read_by_scan(&root);
+    assert!(
+        warm.is_empty(),
+        "an unchanged tree must be served from cache: {warm:?}"
+    );
+
+    run_ok(&root, &["link", "--no-progress"]);
+    let after_link = paths_read_by_scan(&root);
+    assert!(
+        after_link.is_empty(),
+        "linked pairs are one physical file and must not be reread: {after_link:?}"
+    );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
