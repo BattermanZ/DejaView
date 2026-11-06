@@ -89,16 +89,6 @@ pub(super) fn ensure_source_outside_media_root(
     Ok(())
 }
 
-pub(super) fn snapshot_from_file_info(file: &FileInfo) -> FileSnapshot {
-    FileSnapshot {
-        size: file.size,
-        mtime_ns: file.mtime_ns,
-        ctime_ns: file.ctime_ns,
-        dev: file.dev,
-        inode: file.inode,
-    }
-}
-
 /// The file at `path` itself, not what a symlink there points to.
 fn lstat(path: &Path) -> Result<fs::Metadata> {
     fs::symlink_metadata(path).with_context(|| {
@@ -120,7 +110,7 @@ fn ensure_source_snapshot_matches(
     expected: &FileSnapshot,
     replaced_inodes: &HashSet<(u64, u64)>,
 ) -> Result<()> {
-    let current = FileSnapshot::of(meta);
+    let current = FileSnapshot::from_metadata(meta);
     if expected.matches_source(&current) {
         return Ok(());
     }
@@ -147,7 +137,7 @@ fn ensure_target_snapshot_matches(
     meta: &fs::Metadata,
     expected: &FileSnapshot,
 ) -> Result<()> {
-    if !expected.matches_target(&FileSnapshot::of(meta)) {
+    if !expected.matches_target(&FileSnapshot::from_metadata(meta)) {
         return Err(anyhow!(
             "target changed since planning; rerun scan before linking: {}",
             path.display()
@@ -390,14 +380,6 @@ fn temp_name(kind: &str) -> String {
     )
 }
 
-fn mtime_ns(meta: &fs::Metadata) -> u128 {
-    meta.modified()
-        .unwrap_or(SystemTime::UNIX_EPOCH)
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-}
-
 /// What the hardlink step left at the temp name.
 #[derive(Debug, PartialEq, Eq)]
 enum TempLink {
@@ -415,10 +397,10 @@ enum TempLink {
 fn check_temp_link(tmp: &Path, req: &LinkRequest<'_>) -> Result<TempLink> {
     let meta = fs::symlink_metadata(tmp)
         .with_context(|| format!("metadata of temp link for {}", req.src.display()))?;
-    let expected = req.tgt_snapshot;
     if meta.file_type().is_file()
-        && meta.len() == expected.size
-        && mtime_ns(&meta) == expected.mtime_ns
+        && req
+            .tgt_snapshot
+            .matches_contents(&FileSnapshot::from_metadata(&meta))
     {
         return Ok(TempLink::Hardlink);
     }
@@ -446,12 +428,10 @@ fn ensure_pinned_source_unchanged(dir: &PinnedDir, req: &LinkRequest<'_>) -> Res
             req.src.display()
         )
     })?;
-    let expected = req.src_snapshot;
     let unchanged = meta.file_type().is_file()
-        && meta.dev() == expected.dev
-        && meta.ino() == expected.inode
-        && meta.len() == expected.size
-        && mtime_ns(&meta) == expected.mtime_ns;
+        && req
+            .src_snapshot
+            .matches_target(&FileSnapshot::from_metadata(&meta));
     if !unchanged {
         return Err(anyhow!(
             "the download {} changed while it was being linked; nothing was replaced, rerun scan",
@@ -692,15 +672,6 @@ pub(super) fn replace_file_with_best_link(req: &LinkRequest<'_>) -> Result<Linke
     )
 }
 
-/// Whether `download` already is the library file `library`: one inode, or one
-/// file seen through two mounts. A bind mount or a mergerfs branch shows a
-/// library file on a second device, often under another inode number, but with
-/// the same size and timestamps; two real copies almost never share a ctime to
-/// the nanosecond.
-fn is_same_physical_file(download: &FileInfo, library: &FileInfo) -> bool {
-    snapshot_from_file_info(download).is_same_physical_file(&snapshot_from_file_info(library))
-}
-
 /// Plan one link per download in a group of identical files, all to the library
 /// file whose path sorts first. A download that already is one of the group's
 /// library files is left alone: relinking it frees nothing, breaks the
@@ -722,16 +693,16 @@ pub(super) fn plan_group_actions(group: &[&FileInfo]) -> Vec<LinkAction> {
     for src in downloads {
         if media
             .iter()
-            .any(|library| is_same_physical_file(src, library))
+            .any(|library| src.snapshot.is_same_physical_file(&library.snapshot))
         {
             continue;
         }
         actions.push(LinkAction {
             src: src.path.clone(),
             tgt: canonical.path.clone(),
-            size: src.size,
-            src_snapshot: snapshot_from_file_info(src),
-            tgt_snapshot: snapshot_from_file_info(canonical),
+            size: src.snapshot.size,
+            src_snapshot: src.snapshot,
+            tgt_snapshot: canonical.snapshot,
         });
     }
 
@@ -750,7 +721,8 @@ fn library_files_seen_through_second_mount(group: &[&FileInfo]) -> Vec<(PathBuf,
             media
                 .iter()
                 .find(|library| {
-                    library.dev != download.dev && is_same_physical_file(download, library)
+                    library.snapshot.dev != download.snapshot.dev
+                        && download.snapshot.is_same_physical_file(&library.snapshot)
                 })
                 .map(|library| (download.path.clone(), library.path.clone()))
         })

@@ -15,7 +15,7 @@ use super::linking::{
     Applied, ApplyOptions, ApplyOutcome, CanonicalRoots, LinkRequest, Linked, apply_actions,
     ensure_target_within_media_root, plan_group_actions, replace_file_with_best_link_with,
 };
-use super::types::{Cache, CacheEntry, FileInfo, LinkMode, RunMetrics};
+use super::types::{Cache, CacheEntry, FileInfo, FileSnapshot, LinkMode, RunMetrics};
 use crate::protocol::{EntryStatus, LinkMethod, LinkReportEntry};
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -50,11 +50,13 @@ fn write_file(path: &Path, content: &[u8]) {
 fn sample_file_info(path: &str, dev: u64, inode: u64, in_downloads: bool) -> FileInfo {
     FileInfo {
         path: PathBuf::from(path),
-        size: 10,
-        mtime_ns: 0,
-        ctime_ns: inode as i128,
-        dev,
-        inode,
+        snapshot: FileSnapshot {
+            size: 10,
+            mtime_ns: 0,
+            ctime_ns: inode as i128,
+            dev,
+            inode,
+        },
         hash: Some("h".into()),
         sample: None,
         in_downloads,
@@ -383,11 +385,13 @@ fn save_cache_writes_json() {
     cache.insert(
         "foo".into(),
         CacheEntry {
-            size: 42,
-            mtime_ns: 123,
-            ctime_ns: 456,
-            dev: 7,
-            inode: 8,
+            snapshot: FileSnapshot {
+                size: 42,
+                mtime_ns: 123,
+                ctime_ns: 456,
+                dev: 7,
+                inode: 8,
+            },
             hash: Some("abc".into()),
             sample: None,
         },
@@ -449,7 +453,7 @@ fn plan_group_actions_skips_library_file_seen_through_a_second_mount() {
     // timestamps; its only copy must not be replaced.
     let pool_view = sample_file_info("/pool/media/m.mkv", 1, 10, false);
     let mut branch_view = sample_file_info("/disk1/media/m.mkv", 2, 500, true);
-    branch_view.ctime_ns = pool_view.ctime_ns;
+    branch_view.snapshot.ctime_ns = pool_view.snapshot.ctime_ns;
     assert!(plan_group_actions(&[&pool_view, &branch_view]).is_empty());
 
     // The same holds when the library has a second copy that sorts first: the
@@ -457,7 +461,7 @@ fn plan_group_actions_skips_library_file_seen_through_a_second_mount() {
     let copy_a = sample_file_info("/pool/media/A/m.mkv", 1, 10, false);
     let copy_b = sample_file_info("/pool/media/B/m.mkv", 1, 11, false);
     let mut branch_b = sample_file_info("/disk1/media/B/m.mkv", 2, 501, true);
-    branch_b.ctime_ns = copy_b.ctime_ns;
+    branch_b.snapshot.ctime_ns = copy_b.snapshot.ctime_ns;
     assert!(plan_group_actions(&[&copy_a, &copy_b, &branch_b]).is_empty());
 
     // A real copy on another device has its own ctime and is still planned.
@@ -673,30 +677,8 @@ fn apply_actions_rejects_source_metadata_change_after_planning() {
         src: src.clone(),
         tgt: tgt.clone(),
         size: src_meta.len(),
-        src_snapshot: super::types::FileSnapshot {
-            size: src_meta.len(),
-            mtime_ns: src_meta
-                .modified()
-                .expect("src modified")
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("src mtime")
-                .as_nanos(),
-            ctime_ns: (src_meta.ctime() as i128 * 1_000_000_000) + src_meta.ctime_nsec() as i128,
-            dev: src_meta.dev(),
-            inode: src_meta.ino(),
-        },
-        tgt_snapshot: super::types::FileSnapshot {
-            size: tgt_meta.len(),
-            mtime_ns: tgt_meta
-                .modified()
-                .expect("tgt modified")
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("tgt mtime")
-                .as_nanos(),
-            ctime_ns: (tgt_meta.ctime() as i128 * 1_000_000_000) + tgt_meta.ctime_nsec() as i128,
-            dev: tgt_meta.dev(),
-            inode: tgt_meta.ino(),
-        },
+        src_snapshot: FileSnapshot::from_metadata(&src_meta),
+        tgt_snapshot: FileSnapshot::from_metadata(&tgt_meta),
     };
     std::thread::sleep(Duration::from_millis(2));
     write_file(&src, b"changed-content");
@@ -753,30 +735,8 @@ fn apply_actions_rejects_target_metadata_change_after_planning() {
         src: src.clone(),
         tgt: tgt.clone(),
         size: src_meta.len(),
-        src_snapshot: super::types::FileSnapshot {
-            size: src_meta.len(),
-            mtime_ns: src_meta
-                .modified()
-                .expect("src modified")
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("src mtime")
-                .as_nanos(),
-            ctime_ns: (src_meta.ctime() as i128 * 1_000_000_000) + src_meta.ctime_nsec() as i128,
-            dev: src_meta.dev(),
-            inode: src_meta.ino(),
-        },
-        tgt_snapshot: super::types::FileSnapshot {
-            size: tgt_meta.len(),
-            mtime_ns: tgt_meta
-                .modified()
-                .expect("tgt modified")
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("tgt mtime")
-                .as_nanos(),
-            ctime_ns: (tgt_meta.ctime() as i128 * 1_000_000_000) + tgt_meta.ctime_nsec() as i128,
-            dev: tgt_meta.dev(),
-            inode: tgt_meta.ino(),
-        },
+        src_snapshot: FileSnapshot::from_metadata(&src_meta),
+        tgt_snapshot: FileSnapshot::from_metadata(&tgt_meta),
     };
     std::thread::sleep(Duration::from_millis(2));
     write_file(&tgt, b"changed-content");
@@ -833,55 +793,20 @@ fn apply_actions_allow_multiple_sources_for_same_target_in_one_run() {
     let src_a_meta = fs::metadata(&src_a).expect("src_a metadata");
     let src_b_meta = fs::metadata(&src_b).expect("src_b metadata");
     let tgt_meta = fs::metadata(&tgt).expect("tgt metadata");
-    let tgt_snapshot = super::types::FileSnapshot {
-        size: tgt_meta.len(),
-        mtime_ns: tgt_meta
-            .modified()
-            .expect("tgt modified")
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("tgt mtime")
-            .as_nanos(),
-        ctime_ns: (tgt_meta.ctime() as i128 * 1_000_000_000) + tgt_meta.ctime_nsec() as i128,
-        dev: tgt_meta.dev(),
-        inode: tgt_meta.ino(),
-    };
+    let tgt_snapshot = FileSnapshot::from_metadata(&tgt_meta);
     let actions = vec![
         super::types::LinkAction {
             src: src_a.clone(),
             tgt: tgt.clone(),
             size: src_a_meta.len(),
-            src_snapshot: super::types::FileSnapshot {
-                size: src_a_meta.len(),
-                mtime_ns: src_a_meta
-                    .modified()
-                    .expect("src_a modified")
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .expect("src_a mtime")
-                    .as_nanos(),
-                ctime_ns: (src_a_meta.ctime() as i128 * 1_000_000_000)
-                    + src_a_meta.ctime_nsec() as i128,
-                dev: src_a_meta.dev(),
-                inode: src_a_meta.ino(),
-            },
-            tgt_snapshot: tgt_snapshot.clone(),
+            src_snapshot: FileSnapshot::from_metadata(&src_a_meta),
+            tgt_snapshot,
         },
         super::types::LinkAction {
             src: src_b.clone(),
             tgt: tgt.clone(),
             size: src_b_meta.len(),
-            src_snapshot: super::types::FileSnapshot {
-                size: src_b_meta.len(),
-                mtime_ns: src_b_meta
-                    .modified()
-                    .expect("src_b modified")
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .expect("src_b mtime")
-                    .as_nanos(),
-                ctime_ns: (src_b_meta.ctime() as i128 * 1_000_000_000)
-                    + src_b_meta.ctime_nsec() as i128,
-                dev: src_b_meta.dev(),
-                inode: src_b_meta.ino(),
-            },
+            src_snapshot: FileSnapshot::from_metadata(&src_b_meta),
             tgt_snapshot,
         },
     ];
@@ -1218,11 +1143,13 @@ fn save_cache_failure_cleans_up_temp_file() {
     cache.insert(
         "k".into(),
         CacheEntry {
-            size: 1,
-            mtime_ns: 1,
-            ctime_ns: 2,
-            dev: 3,
-            inode: 4,
+            snapshot: FileSnapshot {
+                size: 1,
+                mtime_ns: 1,
+                ctime_ns: 2,
+                dev: 3,
+                inode: 4,
+            },
             hash: Some("h".into()),
             sample: None,
         },
@@ -1247,20 +1174,8 @@ fn save_cache_failure_cleans_up_temp_file() {
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
-fn snapshot_of(path: &Path) -> super::types::FileSnapshot {
-    let meta = fs::metadata(path).expect("metadata");
-    super::types::FileSnapshot {
-        size: meta.len(),
-        mtime_ns: meta
-            .modified()
-            .expect("modified")
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("mtime")
-            .as_nanos(),
-        ctime_ns: (meta.ctime() as i128 * 1_000_000_000) + meta.ctime_nsec() as i128,
-        dev: meta.dev(),
-        inode: meta.ino(),
-    }
+fn snapshot_of(path: &Path) -> FileSnapshot {
+    FileSnapshot::from_metadata(&fs::symlink_metadata(path).expect("metadata"))
 }
 
 #[test]
@@ -1449,11 +1364,13 @@ fn run_scan_prunes_cache_entries_for_removed_files() {
 #[test]
 fn prune_cache_keeps_entries_under_what_the_walk_could_not_read() {
     let entry = CacheEntry {
-        size: 1,
-        mtime_ns: 0,
-        ctime_ns: 0,
-        dev: 1,
-        inode: 1,
+        snapshot: FileSnapshot {
+            size: 1,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            dev: 1,
+            inode: 1,
+        },
         hash: Some("h".into()),
         sample: None,
     };
@@ -1547,11 +1464,13 @@ fn prune_cache_keeps_only_seen_paths() {
         cache.insert(
             path.to_string(),
             CacheEntry {
-                size: 1,
-                mtime_ns: 0,
-                ctime_ns: 0,
-                dev: 1,
-                inode: 1,
+                snapshot: FileSnapshot {
+                    size: 1,
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                    dev: 1,
+                    inode: 1,
+                },
                 hash: Some("h".into()),
                 sample: None,
             },
@@ -2413,11 +2332,13 @@ fn cache_keys_name_the_root_so_two_mounts_of_one_share_agree() {
     // A cache kept by the old version: absolute keys, one outside both roots.
     let mut cache = Cache::new();
     let entry = CacheEntry {
-        size: 1,
-        mtime_ns: 0,
-        ctime_ns: 0,
-        dev: 1,
-        inode: 1,
+        snapshot: FileSnapshot {
+            size: 1,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            dev: 1,
+            inode: 1,
+        },
         hash: Some("h".into()),
         sample: None,
     };
@@ -2612,8 +2533,11 @@ fn the_cache_does_not_vouch_for_a_download_that_is_a_library_file_through_a_moun
     cache.insert(
         "media/B/a.mkv".into(),
         CacheEntry {
-            dev: download.dev + 1,
-            inode: download.inode + 1,
+            snapshot: FileSnapshot {
+                dev: download.snapshot.dev + 1,
+                inode: download.snapshot.inode + 1,
+                ..download.snapshot
+            },
             ..download
         },
     );
@@ -2810,8 +2734,8 @@ fn a_plan_comes_out_in_download_path_order() {
         let mut download = sample_file_info(&format!("/downloads/{n:02}.mkv"), 2, 2000 + n, true);
         library.hash = Some(format!("h{n}"));
         download.hash = Some(format!("h{n}"));
-        library.size = 10 + n;
-        download.size = 10 + n;
+        library.snapshot.size = 10 + n;
+        download.snapshot.size = 10 + n;
         groups.push(vec![library, download]);
     }
     groups.reverse();
@@ -2870,5 +2794,40 @@ fn cache_keys_keep_bytes_that_are_not_utf8() {
     assert_eq!(
         keys.key(Path::new("/dl/Show/é.mkv"), true),
         "downloads/Show/é.mkv"
+    );
+}
+
+#[test]
+fn a_cache_entry_is_one_flat_object_on_disk() {
+    let full = CacheEntry {
+        snapshot: FileSnapshot {
+            size: 42,
+            mtime_ns: 1_700_000_000_123_456_789,
+            ctime_ns: 1_700_000_000_987_654_321,
+            dev: 2049,
+            inode: 131_073,
+        },
+        hash: Some("ab".into()),
+        sample: Some("cd".into()),
+    };
+    let json = serde_json::to_string(&full).expect("serialise");
+    assert_eq!(
+        json,
+        r#"{"size":42,"mtime_ns":1700000000123456789,"ctime_ns":1700000000987654321,"dev":2049,"inode":131073,"hash":"ab","sample":"cd"}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<CacheEntry>(&json).expect("parse"),
+        full
+    );
+    // A quick hash alone leaves the full hash out, as before.
+    let quick = CacheEntry { hash: None, ..full };
+    let json = serde_json::to_string(&quick).expect("serialise");
+    assert_eq!(
+        json,
+        r#"{"size":42,"mtime_ns":1700000000123456789,"ctime_ns":1700000000987654321,"dev":2049,"inode":131073,"sample":"cd"}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<CacheEntry>(&json).expect("parse"),
+        quick
     );
 }

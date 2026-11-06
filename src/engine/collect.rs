@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 use walkdir::WalkDir;
 
 use super::cancel::{CancelToken, FirstError};
-use super::types::{FileInfo, RunMetrics};
+use super::types::{FileInfo, FileSnapshot, RunMetrics};
 use super::types::{emit_tui_event, progress_due};
 use crate::logger;
 use crate::protocol::{Phase, TuiEvent, WarningSummary};
@@ -466,10 +466,6 @@ impl<'a> Walk<'a> {
             found.skipped_by_min_age += 1;
             return;
         }
-        let mtime_ns = mtime
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
         if self.options.tui_events {
             let seen = shared.files_seen.fetch_add(1, Ordering::Relaxed) + 1;
             if progress_due() {
@@ -489,11 +485,7 @@ impl<'a> Walk<'a> {
         }
         found.files.push(FileInfo {
             path,
-            size: meta.len(),
-            mtime_ns,
-            ctime_ns: (meta.ctime() as i128 * 1_000_000_000) + meta.ctime_nsec() as i128,
-            dev: meta.dev(),
-            inode: meta.ino(),
+            snapshot: FileSnapshot::from_metadata(&meta),
             hash: None,
             sample: None,
             in_downloads: self.in_downloads,
@@ -593,7 +585,7 @@ pub(super) fn collect_run_files(
 pub(super) fn group_files_by_size(files: Vec<FileInfo>) -> Vec<Vec<FileInfo>> {
     let mut size_map: HashMap<u64, Vec<FileInfo>> = HashMap::new();
     for f in files {
-        size_map.entry(f.size).or_default().push(f);
+        size_map.entry(f.snapshot.size).or_default().push(f);
     }
     size_map.into_values().filter(|v| v.len() > 1).collect()
 }

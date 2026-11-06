@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 
 use super::cache::CacheKeys;
 use super::cancel::{CancelToken, Cancelled, FirstError};
-use super::linking::{plan_hashed_group_actions, snapshot_from_file_info};
+use super::linking::plan_hashed_group_actions;
 use super::report::build_report_entries;
-use super::types::{Cache, CacheEntry, FileInfo, LinkMode};
+use super::types::{Cache, CacheEntry, FileInfo, FileSnapshot, LinkMode};
 use super::types::{emit_tui_event, progress_due};
 use crate::logger;
 use crate::protocol::{Phase, TuiEvent, WarningSummary};
@@ -269,10 +269,10 @@ impl GroupWork {
 }
 
 fn split_by_inode(group: &[FileInfo]) -> Vec<Vec<usize>> {
-    let mut index: HashMap<(u64, u64, u128, i128), usize> = HashMap::new();
+    let mut index: HashMap<FileSnapshot, usize> = HashMap::new();
     let mut inodes: Vec<Vec<usize>> = Vec::new();
     for (idx, file) in group.iter().enumerate() {
-        match index.entry((file.dev, file.inode, file.mtime_ns, file.ctime_ns)) {
+        match index.entry(file.snapshot) {
             Entry::Occupied(slot) => inodes[*slot.get()].push(idx),
             Entry::Vacant(slot) => {
                 slot.insert(inodes.len());
@@ -284,7 +284,7 @@ fn split_by_inode(group: &[FileInfo]) -> Vec<Vec<usize>> {
 }
 
 fn cache_entry_matches(entry: &CacheEntry, file: &FileInfo) -> bool {
-    entry.snapshot() == snapshot_from_file_info(file)
+    file.snapshot.matches_source(&entry.snapshot)
 }
 
 /// The full and quick hashes the cache holds for a physical file, from any of
@@ -324,7 +324,7 @@ fn plan_group_work(group: &[FileInfo], cache: &Cache, keys: &CacheKeys) -> Optio
     if !inodes.iter().any(download_only) {
         return None;
     }
-    let small = group[0].size <= SAMPLE_BYTES;
+    let small = group[0].snapshot.size <= SAMPLE_BYTES;
     let files = inodes
         .into_iter()
         .map(|members| {
@@ -361,11 +361,7 @@ fn upsert_entry(
         .get(&key)
         .filter(|entry| cache_entry_matches(entry, file));
     let entry = CacheEntry {
-        size: file.size,
-        mtime_ns: file.mtime_ns,
-        ctime_ns: file.ctime_ns,
-        dev: file.dev,
-        inode: file.inode,
+        snapshot: file.snapshot,
         hash: hash
             .cloned()
             .or_else(|| valid.and_then(|entry| entry.hash.clone())),
@@ -572,7 +568,7 @@ pub(super) fn hash_groups_and_update_cache(
                         Some(file.path.display().to_string()),
                         tui_events,
                     );
-                    let digest_result = sample_digest(&file.path, file.size);
+                    let digest_result = sample_digest(&file.path, file.snapshot.size);
                     let done = sample_done.fetch_add(1, Ordering::Relaxed) + 1;
                     emit_hash_progress(done as usize, total_sample_files, tui_events);
                     if let Some(progress_bar) = &bar {
@@ -627,7 +623,9 @@ pub(super) fn hash_groups_and_update_cache(
     let total_full_bytes: u64 = full_candidates
         .iter()
         .zip(groups.iter())
-        .map(|(candidates, group)| candidates.len() as u64 * group.first().map_or(0, |f| f.size))
+        .map(|(candidates, group)| {
+            candidates.len() as u64 * group.first().map_or(0, |f| f.snapshot.size)
+        })
         .sum();
     if tui_events && total_full_files > 0 {
         let _ = emit_tui_event(&TuiEvent::Phase {
@@ -711,7 +709,7 @@ pub(super) fn hash_groups_and_update_cache(
                             tui_events,
                         );
                         let digest_result =
-                            full_digest(path, file.size, options.cancel, &on_chunk);
+                            full_digest(path, file.snapshot.size, options.cancel, &on_chunk);
                         // Only a file read to its end is verified: one that
                         // failed or that a cancel stopped is not.
                         if digest_result.is_ok() {
@@ -789,11 +787,13 @@ mod tests {
     fn file(path: &str, dev: u64, inode: u64, mtime_ns: u128) -> FileInfo {
         FileInfo {
             path: PathBuf::from(path),
-            size: 10,
-            mtime_ns,
-            ctime_ns: 0,
-            dev,
-            inode,
+            snapshot: FileSnapshot {
+                size: 10,
+                mtime_ns,
+                ctime_ns: 0,
+                dev,
+                inode,
+            },
             hash: None,
             sample: None,
             in_downloads: path.starts_with("/dl"),
@@ -802,19 +802,14 @@ mod tests {
 
     /// A file bigger than the sample, so its quick hash is not its full hash.
     fn large(path: &str, inode: u64) -> FileInfo {
-        FileInfo {
-            size: SAMPLE_BYTES + 1,
-            ..file(path, 1, inode, 0)
-        }
+        let mut file = file(path, 1, inode, 0);
+        file.snapshot.size = SAMPLE_BYTES + 1;
+        file
     }
 
     fn entry_for(file: &FileInfo, hash: Option<&str>, sample: Option<&str>) -> CacheEntry {
         CacheEntry {
-            size: file.size,
-            mtime_ns: file.mtime_ns,
-            ctime_ns: file.ctime_ns,
-            dev: file.dev,
-            inode: file.inode,
+            snapshot: file.snapshot,
             hash: hash.map(str::to_string),
             sample: sample.map(str::to_string),
         }
@@ -1026,7 +1021,7 @@ mod tests {
         // mergerfs inodecalc=passthrough can report one inode for different files on
         // different branches; a real hardlink always shares its timestamps too.
         let mut other = file("/media/b", 1, 7, 5);
-        other.ctime_ns = 5;
+        other.snapshot.ctime_ns = 5;
         let group = vec![file("/dl/a", 1, 7, 0), other];
         let work = plan_group_work(&group, &Cache::new(), &keys()).expect("two physical files");
         assert_eq!(work.files.len(), 2);
