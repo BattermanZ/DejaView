@@ -23,6 +23,8 @@ pub enum Overlay {
     JsonPreview(String),
     ConfigEditor(ConfigEditor),
     ConfirmLink(ConfirmLinkMode),
+    /// Clear the cache and scan again: every file is read again.
+    ConfirmRescan,
     BlockingNotice(String),
 }
 
@@ -514,6 +516,19 @@ impl App {
                 }
                 _ => {}
             },
+            Overlay::ConfirmRescan => match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.overlay = Overlay::None;
+                    if let Err(err) = self.start_rescan_job() {
+                        self.push_log(format!("Rescan failed: {err:#}"));
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
+                    self.overlay = Overlay::None;
+                    self.push_log("Rescan cancelled; the cache is kept.".to_string());
+                }
+                _ => {}
+            },
             Overlay::BlockingNotice(_) => match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.overlay = Overlay::None,
                 KeyCode::Char('c') => {
@@ -544,9 +559,13 @@ impl App {
             KeyCode::Char('c') => self.request_cancel(),
             KeyCode::Char('e') => self.open_config_editor(),
             KeyCode::Char('S') | KeyCode::Char('s') => self.start_scan_job(),
+            // Clearing the cache costs a read of every file, hours on a
+            // network drive, and x sits next to c: ask first.
             KeyCode::Char('X') | KeyCode::Char('x') => {
-                if let Err(err) = self.start_rescan_job() {
-                    self.push_log(format!("Rescan failed: {err}"));
+                if self.running_job.is_some() {
+                    self.push_log("A run is already in progress.".to_string());
+                } else if self.paths_are_set_or_ask() {
+                    self.overlay = Overlay::ConfirmRescan;
                 }
             }
             KeyCode::Char('L') => {
@@ -1930,6 +1949,28 @@ mod tests {
             media: Some(PathBuf::from("/nonexistent/media")),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn x_asks_before_clearing_the_cache() {
+        let mut app = App::new(&config_with_paths(), false);
+
+        app.handle_main_key(KeyCode::Char('x')).expect("key");
+        assert!(matches!(app.overlay, Overlay::ConfirmRescan));
+        assert!(app.running_job.is_none(), "nothing cleared or started yet");
+
+        app.handle_key(KeyCode::Char('n'), KeyModifiers::NONE)
+            .expect("key");
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.running_job.is_none());
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line.contains("the cache is kept"))
+        );
+
+        app.handle_main_key(KeyCode::Char('X')).expect("key");
+        assert!(matches!(app.overlay, Overlay::ConfirmRescan));
     }
 
     #[test]

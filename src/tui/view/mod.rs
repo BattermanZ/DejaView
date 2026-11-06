@@ -616,6 +616,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Overlay::JsonPreview(json) => render_json_overlay(frame, app, json),
         Overlay::ConfigEditor(editor) => render_config_overlay(frame, editor),
         Overlay::ConfirmLink(mode) => render_confirm_link_overlay(frame, app, *mode),
+        Overlay::ConfirmRescan => render_confirm_rescan_overlay(frame),
         Overlay::BlockingNotice(message) => render_blocking_notice_overlay(frame, message),
     }
 }
@@ -875,7 +876,7 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(table, content[1], &mut state);
 }
 
-const HELP_TEXT: &str = "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\np toggle compact/full paths\nj/k or arrows move rows\nPgUp/PgDn move a page\ng/G or Home/End first and last row\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nX clear cache and rescan\nl confirm and link selected row\nL confirm and run link-all job\nc cancel the running scan or link\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels";
+const HELP_TEXT: &str = "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\np toggle compact/full paths\nj/k or arrows move rows\nPgUp/PgDn move a page\ng/G or Home/End first and last row\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nX or x clear cache and rescan (asks first)\nl confirm and link selected row\nL confirm and run link-all job\nc cancel the running scan or link\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels";
 
 fn render_help_overlay(frame: &mut Frame, app: &App) {
     let (area, lines) = dialog_for(frame.area(), 60, HELP_TEXT, 0);
@@ -1072,6 +1073,32 @@ fn render_confirm_link_overlay(frame: &mut Frame, app: &App, mode: ConfirmLinkMo
             Block::default()
                 .borders(Borders::ALL)
                 .title(Line::from(vec![Span::styled(title, Theme::title(true))]))
+                .title_bottom(prompt)
+                .style(Theme::popup())
+                .border_style(Theme::accent()),
+        )
+        .style(Theme::popup());
+    frame.render_widget(body, area);
+}
+
+fn render_confirm_rescan_overlay(frame: &mut Frame) {
+    let text = "Clear the cache and scan again?\n\nEvery file in both folders is read again, as on a first run; on a network drive that can take hours. S scans reading only what changed.";
+    let (area, lines) = dialog_for(frame.area(), 64, text, 0);
+    frame.render_widget(Clear, area);
+    let prompt = Line::from(vec![
+        Span::styled(" y clear and scan ", Theme::title(true)),
+        Span::raw(" "),
+        Span::styled(" n cancel ", Theme::title(false)),
+    ])
+    .right_aligned();
+    let body = Paragraph::new(lines.join("\n"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Line::from(vec![Span::styled(
+                    " RESCAN FROM SCRATCH ",
+                    Theme::title(true),
+                )]))
                 .title_bottom(prompt)
                 .style(Theme::popup())
                 .border_style(Theme::accent()),
@@ -1857,5 +1884,23 @@ mod navigation_tests {
         assert!(text.contains("Esc cancels"), "{text}");
         press(&mut app, KeyCode::Esc);
         assert!(matches!(app.overlay(), Overlay::None));
+    }
+}
+
+#[cfg(test)]
+mod rescan_tests {
+    use super::row_tests::{app_with_episodes, screen};
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn the_rescan_question_fits_a_small_terminal() {
+        let mut app = app_with_episodes(1);
+        app.handle_key_for_test(KeyCode::Char('x'), KeyModifiers::NONE);
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("RESCAN FROM SCRATCH"), "{text}");
+        assert!(
+            text.contains("y clear and scan") && text.contains("n cancel"),
+            "{text}"
+        );
     }
 }
