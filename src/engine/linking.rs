@@ -220,149 +220,303 @@ fn ensure_link_keeps_read_access(src: &Path, tgt: &Path) -> Result<()> {
     Ok(())
 }
 
-fn finalize_tmp_swap_with<G>(tmp_link: &Path, src: &Path, rename_fn: G) -> Result<()>
-where
-    G: Fn(&Path, &Path) -> std::io::Result<()>,
-{
-    rename_fn(tmp_link, src)
-        .with_context(|| format!("mv {:?} {:?}", tmp_link.display(), src.display()))?;
-    if tmp_link.exists() {
-        logger::warn(
-            "link",
-            format!(
-                "temp link remained after rename, cleaning up {}",
-                tmp_link.display()
-            ),
-        );
-        fs::remove_file(tmp_link)
-            .with_context(|| format!("remove leftover temp link {}", tmp_link.display()))?;
-        if tmp_link.exists() {
-            return Err(anyhow!(
-                "leftover temp link remained after rename: {}",
-                tmp_link.display()
-            ));
-        }
+/// The downloads and media roots, resolved once per run.
+pub(super) struct CanonicalRoots {
+    pub(super) downloads: PathBuf,
+    pub(super) media: PathBuf,
+}
+
+impl CanonicalRoots {
+    pub(super) fn new(downloads: &Path, media: &Path) -> Result<Self> {
+        Ok(CanonicalRoots {
+            downloads: fs::canonicalize(downloads)
+                .with_context(|| format!("resolve the downloads folder {}", downloads.display()))?,
+            media: fs::canonicalize(media)
+                .with_context(|| format!("resolve the media folder {}", media.display()))?,
+        })
+    }
+}
+
+/// One replacement: the download, the library file it becomes a link to, and
+/// what the plan saw of that library file.
+pub(super) struct LinkRequest<'a> {
+    pub(super) src: &'a Path,
+    pub(super) tgt: &'a Path,
+    pub(super) tgt_snapshot: &'a FileSnapshot,
+    pub(super) roots: &'a CanonicalRoots,
+    pub(super) link_mode: LinkMode,
+}
+
+/// What a replacement did.
+#[derive(Debug)]
+pub(super) struct Linked {
+    /// "hardlink" or "symlink": what the download is now.
+    pub(super) method: &'static str,
+    pub(super) fallback_reason: Option<String>,
+    /// The download already was the library file, so nothing changed.
+    pub(super) already_linked: bool,
+}
+
+/// The download's folder, opened once. On Linux every later step goes through
+/// `/proc/self/fd/N`, which reaches the opened folder itself without resolving
+/// its path again, so a folder in the path swapped for a symlink after the
+/// checks cannot move the replacement anywhere else. Off Linux, or without
+/// /proc, the steps fall back to the path.
+struct PinnedDir {
+    path: PathBuf,
+    _handle: Option<fs::File>,
+}
+
+impl PinnedDir {
+    fn join(&self, name: impl AsRef<Path>) -> PathBuf {
+        self.path.join(name)
+    }
+}
+
+fn ensure_dir_inside_downloads(real_dir: &Path, src: &Path, roots: &CanonicalRoots) -> Result<()> {
+    if real_dir.starts_with(&roots.media) || !real_dir.starts_with(&roots.downloads) {
+        return Err(anyhow!(
+            "refusing to replace {}: its folder is {}, which is not inside the downloads folder {}",
+            src.display(),
+            real_dir.display(),
+            roots.downloads.display()
+        ));
     }
     Ok(())
 }
 
-pub(super) fn replace_file_with_relative_symlink(src: &Path, tgt: &Path) -> Result<()> {
-    replace_file_with_relative_symlink_with(src, tgt, |from, to| fs::rename(from, to))
-}
-
-fn replace_file_with_relative_symlink_with<G>(src: &Path, tgt: &Path, rename_fn: G) -> Result<()>
-where
-    G: Fn(&Path, &Path) -> std::io::Result<()>,
-{
+fn pin_download_dir(src: &Path, roots: &CanonicalRoots) -> Result<PinnedDir> {
     let parent = src
         .parent()
         .ok_or_else(|| anyhow!("source path has no parent: {}", src.display()))?;
-    let rel = diff_paths(tgt, parent).context("failed to compute relative path")?;
-    let tmp_link = parent.join(format!(
-        ".dejaview_link.tmp.{}.{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-
-    let link_result = (|| -> Result<()> {
-        logger::info(
-            "link",
-            format!(
-                "creating temp symlink {} -> {}",
-                tmp_link.display(),
-                tgt.display()
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let handle =
+            fs::File::open(parent).with_context(|| format!("open folder {}", parent.display()))?;
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()));
+        match fs::read_link(&fd_path) {
+            Ok(real_dir) => {
+                ensure_dir_inside_downloads(&real_dir, src, roots)?;
+                return Ok(PinnedDir {
+                    path: fd_path,
+                    _handle: Some(handle),
+                });
+            }
+            Err(err) => logger::warn(
+                "link",
+                format!(
+                    "cannot pin {} through /proc ({err}); linking by path",
+                    parent.display()
+                ),
             ),
-        );
-        symlink(&rel, &tmp_link)
-            .with_context(|| format!("ln -s {:?} {:?}", rel, tmp_link.display()))?;
-        finalize_tmp_swap_with(&tmp_link, src, rename_fn)?;
-        Ok(())
-    })();
-
-    if link_result.is_err() {
-        let _ = fs::remove_file(&tmp_link);
+        }
     }
-
-    link_result
-}
-
-fn replace_file_with_hardlink_with<F>(src: &Path, tgt: &Path, hard_link_fn: F) -> Result<()>
-where
-    F: Fn(&Path, &Path) -> std::io::Result<()>,
-{
-    replace_file_with_hardlink_and_rename_with(src, tgt, hard_link_fn, |from, to| {
-        fs::rename(from, to)
+    let real_dir =
+        fs::canonicalize(parent).with_context(|| format!("resolve folder {}", parent.display()))?;
+    ensure_dir_inside_downloads(&real_dir, src, roots)?;
+    Ok(PinnedDir {
+        path: parent.to_path_buf(),
+        _handle: None,
     })
 }
 
-pub(super) fn replace_file_with_hardlink_and_rename_with<F, G>(
-    src: &Path,
-    tgt: &Path,
-    hard_link_fn: F,
-    rename_fn: G,
-) -> Result<()>
-where
-    F: Fn(&Path, &Path) -> std::io::Result<()>,
-    G: Fn(&Path, &Path) -> std::io::Result<()>,
-{
-    let parent = src
-        .parent()
-        .ok_or_else(|| anyhow!("source path has no parent: {}", src.display()))?;
-    let tmp_link = parent.join(format!(
-        ".dejaview_hardlink.tmp.{}.{}",
+fn temp_name(kind: &str) -> String {
+    format!(
+        ".dejaview_{kind}.tmp.{}.{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos()
-    ));
+    )
+}
 
-    let link_result = (|| -> Result<()> {
-        logger::info(
-            "link",
-            format!(
-                "creating temp hardlink {} -> {}",
-                tmp_link.display(),
-                tgt.display()
-            ),
-        );
-        hard_link_fn(tgt, &tmp_link)
-            .with_context(|| format!("ln {:?} {:?}", tgt.display(), tmp_link.display()))?;
-        finalize_tmp_swap_with(&tmp_link, src, rename_fn)?;
+fn mtime_ns(meta: &fs::Metadata) -> u128 {
+    meta.modified()
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+/// What the hardlink step left at the temp name.
+#[derive(Debug, PartialEq, Eq)]
+enum TempLink {
+    /// A regular file with the library file's size and mtime: a hardlink.
+    Hardlink,
+    /// A symlink to the library file, which mergerfs's `link-exdev` option
+    /// makes, reporting success, when the two files sit on different disks.
+    FilesystemSymlink,
+}
+
+/// Check what is at the temp name before it replaces the download. `link(2)`
+/// does not follow a symlink, so a library path swapped for a symlink after the
+/// checks leaves a symlink to wherever it pointed; anything that is not the
+/// planned library file is refused here, with nothing replaced.
+fn check_temp_link(tmp: &Path, req: &LinkRequest<'_>) -> Result<TempLink> {
+    let meta = fs::symlink_metadata(tmp)
+        .with_context(|| format!("metadata of temp link for {}", req.src.display()))?;
+    let expected = req.tgt_snapshot;
+    if meta.file_type().is_file()
+        && meta.len() == expected.size
+        && mtime_ns(&meta) == expected.mtime_ns
+    {
+        return Ok(TempLink::Hardlink);
+    }
+    if meta.file_type().is_symlink()
+        && let (Ok(resolved), Ok(target)) = (fs::canonicalize(tmp), fs::canonicalize(req.tgt))
+        && resolved == target
+        && target.starts_with(&req.roots.media)
+    {
+        return Ok(TempLink::FilesystemSymlink);
+    }
+    Err(anyhow!(
+        "the library file {} changed while it was being linked; nothing was replaced, rerun scan",
+        req.tgt.display()
+    ))
+}
+
+/// Rename the temp link over the download. Returns true when the temp name is
+/// still there afterwards: rename(2) does nothing when both names are already
+/// one file, which means the download already was the library file.
+fn swap_into_place<G>(tmp: &Path, dest: &Path, src: &Path, rename_fn: &G) -> Result<bool>
+where
+    G: Fn(&Path, &Path) -> std::io::Result<()>,
+{
+    rename_fn(tmp, dest).with_context(|| format!("rename the temp link over {}", src.display()))?;
+    if fs::symlink_metadata(tmp).is_err() {
+        return Ok(false);
+    }
+    logger::warn(
+        "link",
+        format!(
+            "temp link remained after rename: {} already was the library file",
+            src.display()
+        ),
+    );
+    fs::remove_file(tmp)
+        .with_context(|| format!("remove leftover temp link beside {}", src.display()))?;
+    if fs::symlink_metadata(tmp).is_ok() {
+        return Err(anyhow!(
+            "leftover temp link remained after rename beside {}",
+            src.display()
+        ));
+    }
+    Ok(true)
+}
+
+fn file_name_of(src: &Path) -> Result<&std::ffi::OsStr> {
+    src.file_name()
+        .ok_or_else(|| anyhow!("source path has no file name: {}", src.display()))
+}
+
+/// Remove a temp name after a failed step, and say what happened to it.
+fn clean_up_temp(tmp: &Path, kind: &str, src: &Path) -> String {
+    match fs::remove_file(tmp) {
+        Ok(()) => format!("temp {kind} beside {} cleaned up", src.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            format!("temp {kind} beside {} not created", src.display())
+        }
+        Err(err) => format!(
+            "failed to remove temp {kind} beside {}: {err}",
+            src.display()
+        ),
+    }
+}
+
+fn replace_with_symlink<G>(dir: &PinnedDir, req: &LinkRequest<'_>, rename_fn: &G) -> Result<()>
+where
+    G: Fn(&Path, &Path) -> std::io::Result<()>,
+{
+    let parent = req
+        .src
+        .parent()
+        .ok_or_else(|| anyhow!("source path has no parent: {}", req.src.display()))?;
+    let rel = diff_paths(req.tgt, parent).context("failed to compute relative path")?;
+    let tmp = dir.join(temp_name("link"));
+    logger::info(
+        "link",
+        format!(
+            "creating temp symlink beside {} -> {}",
+            req.src.display(),
+            rel.display()
+        ),
+    );
+    let result = (|| -> Result<()> {
+        symlink(&rel, &tmp)
+            .with_context(|| format!("ln -s {} beside {}", rel.display(), req.src.display()))?;
+        swap_into_place(&tmp, &dir.join(file_name_of(req.src)?), req.src, rename_fn)?;
         Ok(())
     })();
-
-    if let Err(err) = link_result {
-        let cleanup_note = match fs::remove_file(&tmp_link) {
-            Ok(()) => format!("temp hardlink path cleaned up: {}", tmp_link.display()),
-            Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => {
-                format!("temp hardlink path not created: {}", tmp_link.display())
-            }
-            Err(remove_err) => format!(
-                "failed to remove temp hardlink path {}: {}",
-                tmp_link.display(),
-                remove_err
-            ),
-        };
-        return Err(anyhow!("{err}; {cleanup_note}"));
+    if let Err(err) = result {
+        let note = clean_up_temp(&tmp, "symlink", req.src);
+        return Err(anyhow!("{err:#}; {note}"));
     }
-
     Ok(())
 }
 
-pub(super) fn replace_file_with_best_link_with<F>(
-    src: &Path,
-    tgt: &Path,
-    hard_link_fn: F,
-    link_mode: LinkMode,
-) -> Result<(String, Option<String>)>
+/// Hardlink the library file to a temp name beside the download, check it, and
+/// rename it over the download.
+fn replace_with_hardlink<F, G>(
+    dir: &PinnedDir,
+    req: &LinkRequest<'_>,
+    hard_link_fn: &F,
+    rename_fn: &G,
+) -> Result<Linked>
 where
     F: Fn(&Path, &Path) -> std::io::Result<()>,
+    G: Fn(&Path, &Path) -> std::io::Result<()>,
 {
-    if link_mode == LinkMode::SymlinkOnly {
+    let tmp = dir.join(temp_name("hardlink"));
+    logger::info(
+        "link",
+        format!(
+            "creating temp hardlink beside {} -> {}",
+            req.src.display(),
+            req.tgt.display()
+        ),
+    );
+    let result = (|| -> Result<Linked> {
+        hard_link_fn(req.tgt, &tmp)
+            .with_context(|| format!("ln {} beside {}", req.tgt.display(), req.src.display()))?;
+        let made = check_temp_link(&tmp, req)?;
+        let already_linked =
+            swap_into_place(&tmp, &dir.join(file_name_of(req.src)?), req.src, rename_fn)?;
+        Ok(match made {
+            TempLink::Hardlink => Linked {
+                method: "hardlink",
+                fallback_reason: None,
+                already_linked,
+            },
+            TempLink::FilesystemSymlink => Linked {
+                method: "symlink",
+                fallback_reason: Some(
+                    "the filesystem made a symlink when asked for a hardlink (mergerfs link-exdev, the two files are on different disks)"
+                        .to_string(),
+                ),
+                already_linked,
+            },
+        })
+    })();
+    result.map_err(|err| {
+        let note = clean_up_temp(&tmp, "hardlink", req.src);
+        anyhow!("{err:#}; {note}")
+    })
+}
+
+pub(super) fn replace_file_with_best_link_with<F, G>(
+    req: &LinkRequest<'_>,
+    hard_link_fn: F,
+    rename_fn: G,
+) -> Result<Linked>
+where
+    F: Fn(&Path, &Path) -> std::io::Result<()>,
+    G: Fn(&Path, &Path) -> std::io::Result<()>,
+{
+    let dir = pin_download_dir(req.src, req.roots)?;
+    let (src, tgt) = (req.src, req.tgt);
+    if req.link_mode == LinkMode::SymlinkOnly {
         logger::info(
             "link",
             format!(
@@ -371,25 +525,23 @@ where
                 tgt.display()
             ),
         );
-        replace_file_with_relative_symlink(src, tgt)?;
-        return Ok((
-            "symlink".to_string(),
-            Some("symlink-only mode enabled".to_string()),
-        ));
+        replace_with_symlink(&dir, req, &rename_fn)?;
+        return Ok(Linked {
+            method: "symlink",
+            fallback_reason: Some("symlink-only mode enabled".to_string()),
+            already_linked: false,
+        });
     }
-    let parent = src
-        .parent()
-        .ok_or_else(|| anyhow!("source path has no parent: {}", src.display()))?;
-    let src_dev = fs::metadata(parent)
-        .with_context(|| format!("metadata {}", parent.display()))?
+    let src_dev = fs::metadata(&dir.path)
+        .with_context(|| format!("metadata of the folder of {}", src.display()))?
         .dev();
     let tgt_dev = fs::metadata(tgt)
         .with_context(|| format!("metadata {}", tgt.display()))?
         .dev();
 
     let fallback_reason = if src_dev == tgt_dev {
-        match replace_file_with_hardlink_with(src, tgt, hard_link_fn) {
-            Ok(()) => return Ok(("hardlink".to_string(), None)),
+        match replace_with_hardlink(&dir, req, &hard_link_fn, &rename_fn) {
+            Ok(linked) => return Ok(linked),
             Err(err) => {
                 logger::warn(
                     "link",
@@ -417,16 +569,20 @@ where
         Some("cross-device; hardlink not possible".to_string())
     };
 
-    replace_file_with_relative_symlink(src, tgt)?;
-    Ok(("symlink".to_string(), fallback_reason))
+    replace_with_symlink(&dir, req, &rename_fn)?;
+    Ok(Linked {
+        method: "symlink",
+        fallback_reason,
+        already_linked: false,
+    })
 }
 
-pub(super) fn replace_file_with_best_link(
-    src: &Path,
-    tgt: &Path,
-    link_mode: LinkMode,
-) -> Result<(String, Option<String>)> {
-    replace_file_with_best_link_with(src, tgt, |from, to| fs::hard_link(from, to), link_mode)
+pub(super) fn replace_file_with_best_link(req: &LinkRequest<'_>) -> Result<Linked> {
+    replace_file_with_best_link_with(
+        req,
+        |from, to| fs::hard_link(from, to),
+        |from, to| fs::rename(from, to),
+    )
 }
 
 /// Whether `download` already is the library file `library`: one inode, or one
@@ -557,6 +713,8 @@ pub(super) fn plan_actions_and_table(groups: &[Vec<FileInfo>]) -> Plan {
 }
 
 pub(super) struct ApplyOptions<'a> {
+    /// The downloads root: a download's folder must resolve inside it.
+    pub(super) downloads: &'a Path,
     pub(super) strict: bool,
     pub(super) json_output: bool,
     pub(super) tui_events: bool,
@@ -567,6 +725,8 @@ pub(super) struct ApplyOptions<'a> {
 #[derive(Default)]
 pub(super) struct ApplyOutcome {
     pub(super) applied: usize,
+    /// Pairs found at link time to be one file already; nothing changed.
+    pub(super) already_linked: usize,
     pub(super) strict_error: Option<anyhow::Error>,
     /// Stopped between actions on request; actions not reached stay planned.
     pub(super) cancelled: bool,
@@ -580,6 +740,7 @@ pub(super) fn apply_actions(
     report_entries: &mut [LinkReportEntry],
 ) -> ApplyOutcome {
     let ApplyOptions {
+        downloads,
         strict,
         json_output,
         tui_events,
@@ -587,6 +748,7 @@ pub(super) fn apply_actions(
         cancel,
     } = *options;
     let mut applied_actions = 0usize;
+    let mut already_linked = 0usize;
     let mut strict_link_error: Option<anyhow::Error> = None;
     let mut cancelled = false;
     // Source inodes this run replaced a path of; see ensure_source_snapshot_matches.
@@ -599,6 +761,7 @@ pub(super) fn apply_actions(
     if !json_output && !tui_events {
         println!("{} Applying…", "▶".cyan());
     }
+    let roots = CanonicalRoots::new(downloads, media);
 
     for (index, action) in actions.iter().enumerate() {
         if cancel.is_cancelled() {
@@ -611,7 +774,7 @@ pub(super) fn apply_actions(
                 path: action.src.display().to_string(),
             });
         }
-        let apply_result = (|| -> Result<()> {
+        let apply_result = (|| -> Result<bool> {
             logger::info(
                 "link",
                 format!(
@@ -625,54 +788,82 @@ pub(super) fn apply_actions(
             ensure_target_within_media_root(media, &action.tgt)?;
             ensure_target_snapshot_matches(&action.tgt, &action.tgt_snapshot)?;
             ensure_link_keeps_read_access(&action.src, &action.tgt)?;
-            let (method, fallback_reason) =
-                replace_file_with_best_link(&action.src, &action.tgt, link_mode)?;
-            report_entries[index].method = Some(method);
-            report_entries[index].fallback_reason = fallback_reason;
-            report_entries[index].status = "applied".to_string();
-            Ok(())
+            let roots = roots.as_ref().map_err(|err| anyhow!("{err:#}"))?;
+            let linked = replace_file_with_best_link(&LinkRequest {
+                src: &action.src,
+                tgt: &action.tgt,
+                tgt_snapshot: &action.tgt_snapshot,
+                roots,
+                link_mode,
+            })?;
+            report_entries[index].method = Some(linked.method.to_string());
+            if linked.already_linked {
+                report_entries[index].status = "already-linked".to_string();
+                report_entries[index].fallback_reason = Some(
+                    "already this library file; nothing changed. The filesystem gives one file different inode numbers: on mergerfs, mount with inodecalc=hybrid-hash, or use_ino on older versions".to_string(),
+                );
+            } else {
+                report_entries[index].status = "applied".to_string();
+                report_entries[index].fallback_reason = linked.fallback_reason;
+            }
+            Ok(linked.already_linked)
         })();
-        if let Err(err) = apply_result {
-            warnings.link_errors += 1;
-            report_entries[index].status = "failed".to_string();
-            report_entries[index].error = Some(err.to_string());
-            logger::error(
-                "link",
-                format!(
-                    "failed {} -> {}: {}",
-                    action.src.display(),
-                    action.tgt.display(),
-                    err
-                ),
-            );
-            if tui_events {
-                let _ = emit_tui_event(&TuiEvent::Log {
-                    message: format!(
-                        "Failed to apply {} -> {}: {}",
+        let was_already_linked = match apply_result {
+            Ok(was_already_linked) => was_already_linked,
+            Err(err) => {
+                warnings.link_errors += 1;
+                report_entries[index].status = "failed".to_string();
+                report_entries[index].error = Some(err.to_string());
+                logger::error(
+                    "link",
+                    format!(
+                        "failed {} -> {}: {}",
                         action.src.display(),
                         action.tgt.display(),
                         err
                     ),
-                });
-            }
-            if strict {
-                strict_link_error = Some(anyhow!(
-                    "strict mode link failure for {} -> {}: {}",
-                    action.src.display(),
-                    action.tgt.display(),
-                    err
-                ));
-                break;
-            } else {
-                eprintln!(
-                    "{} Failed to apply {} -> {}: {}",
-                    "⚠".yellow(),
-                    action.src.display(),
-                    action.tgt.display(),
-                    err
                 );
-                continue;
+                if tui_events {
+                    let _ = emit_tui_event(&TuiEvent::Log {
+                        message: format!(
+                            "Failed to apply {} -> {}: {}",
+                            action.src.display(),
+                            action.tgt.display(),
+                            err
+                        ),
+                    });
+                }
+                if strict {
+                    strict_link_error = Some(anyhow!(
+                        "strict mode link failure for {} -> {}: {}",
+                        action.src.display(),
+                        action.tgt.display(),
+                        err
+                    ));
+                    break;
+                } else {
+                    eprintln!(
+                        "{} Failed to apply {} -> {}: {}",
+                        "⚠".yellow(),
+                        action.src.display(),
+                        action.tgt.display(),
+                        err
+                    );
+                    continue;
+                }
             }
+        };
+        if was_already_linked {
+            already_linked += 1;
+            logger::warn(
+                "link",
+                format!(
+                    "{} already was {}; nothing changed",
+                    action.src.display(),
+                    action.tgt.display()
+                ),
+            );
+            continue;
         }
         applied_actions += 1;
         replaced_inodes.insert((action.src_snapshot.dev, action.src_snapshot.inode));
@@ -699,6 +890,7 @@ pub(super) fn apply_actions(
 
     ApplyOutcome {
         applied: applied_actions,
+        already_linked,
         strict_error: strict_link_error,
         cancelled,
     }

@@ -254,6 +254,9 @@ fn empty_results_lines() -> Vec<Line<'static>> {
 }
 
 fn outcome_label(row: &LinkReportEntry) -> String {
+    if row.status.eq_ignore_ascii_case("already-linked") {
+        return "ALREADY LINKED".to_string();
+    }
     match row.method.as_deref() {
         Some("try-hardlink") => "TRY HARDLINK".to_string(),
         Some("hardlink") => "HARDLINK".to_string(),

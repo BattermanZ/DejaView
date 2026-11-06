@@ -238,6 +238,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
 
     let ApplyOutcome {
         applied: applied_actions,
+        already_linked,
         strict_error: strict_link_error,
         cancelled: apply_cancelled,
     } = if options.dry_run {
@@ -262,6 +263,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
             &actions,
             media,
             &ApplyOptions {
+                downloads,
                 strict: options.strict,
                 json_output: options.json_output,
                 tui_events: options.tui_events,
@@ -286,6 +288,12 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         }
     }
 
+    if already_linked > 0 && !machine_output {
+        println!(
+            "{} {already_linked} pair(s) already were one file; nothing changed. The filesystem gives one file different inode numbers: on mergerfs, mount with inodecalc=hybrid-hash, or use_ino on older versions.",
+            "ℹ".cyan()
+        );
+    }
     if !machine_output {
         print_run_summary(
             files_seen,
