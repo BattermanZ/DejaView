@@ -634,13 +634,16 @@ fn scans_skip_hardlinked_files_and_reuse_cache_for_every_path() {
         !cold.iter().any(|p| p.contains("show.mkv")),
         "a group that is one physical file must not be read: {cold:?}"
     );
-    let full_reads = cold
-        .iter()
-        .filter(|p| p.starts_with("hashing_full"))
-        .count();
+    // Every file here is under the 1 MiB sample, so its quick hash reads it
+    // whole and is its full hash: one read per physical file, none in full.
     assert_eq!(
-        full_reads, 4,
-        "one full read per physical file in a duplicate group: {cold:?}"
+        cold.len(),
+        4,
+        "one read per physical file in a duplicate group: {cold:?}"
+    );
+    assert!(
+        cold.iter().all(|p| p.starts_with("hashing_sample")),
+        "a file no bigger than the sample is never read twice: {cold:?}"
     );
 
     let warm = paths_read_by_scan(&root);

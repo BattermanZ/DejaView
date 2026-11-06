@@ -22,7 +22,12 @@ pub(super) struct FileInfo {
     pub(super) ctime_ns: i128,
     pub(super) dev: u64,
     pub(super) inode: u64,
+    /// Full BLAKE3, hex, once known.
     pub(super) hash: Option<String>,
+    /// Quick hash of the first and last MiB, hex, for a file bigger than
+    /// [`super::hashing::SAMPLE_BYTES`]; a smaller file's quick hash is its
+    /// full hash and lives in `hash`.
+    pub(super) sample: Option<String>,
     pub(super) in_downloads: bool,
 }
 
@@ -48,14 +53,24 @@ impl FileSnapshot {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// What the cache knows of one path, valid while the file's size, times,
+/// device and inode are the ones recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct CacheEntry {
     pub(super) size: u64,
     pub(super) mtime_ns: u128,
     pub(super) ctime_ns: i128,
     pub(super) dev: u64,
     pub(super) inode: u64,
-    pub(super) hash: String,
+    /// Full BLAKE3, hex. Absent when only the quick hash is known. A version
+    /// that required it reads such a cache as unreadable and starts empty,
+    /// which costs a rehash but can never pair two different files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) hash: Option<String>,
+    /// Quick hash, hex, for a file bigger than the sample: kept so a file
+    /// whose quick hash matched no other is not read again next run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) sample: Option<String>,
 }
 
 pub(super) type Cache = HashMap<String, CacheEntry>;

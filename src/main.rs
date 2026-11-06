@@ -144,6 +144,17 @@ enum ConfigCommands {
     },
     /// Set worker thread count for hashing
     SetThreads { count: usize },
+    /// Set the file and folder names every walk leaves out, as globs (* for any run of characters, ? for one). With no PATTERN, nothing is left out
+    #[command(
+        after_help = "The default list leaves out the folders a NAS or an OS keeps for itself: @eaDir, #recycle, #snapshot, @Recycle, .@__thumb, .recycle, .snapshots, .Trash-*, $RECYCLE.BIN and lost+found."
+    )]
+    SetExclude {
+        /// Names to leave out, such as '#recycle' or '*.part'
+        patterns: Vec<String>,
+        /// Go back to the default list
+        #[arg(long, conflicts_with = "patterns")]
+        default: bool,
+    },
     /// Set link mode
     SetLinkMode { mode: LinkModeArg },
     /// Validate configured paths and permissions
@@ -324,6 +335,25 @@ fn run_cli() -> Result<()> {
                 save_config(&config)?;
                 println!("{} threads set to {}.", "✔".green(), count);
             }
+            ConfigCommands::SetExclude { patterns, default } => {
+                if default {
+                    config.exclude = None;
+                } else {
+                    config::check_exclude_patterns(&patterns)?;
+                    config.exclude = Some(patterns);
+                }
+                save_config(&config)?;
+                let effective = config.effective_exclude();
+                if effective.is_empty() {
+                    println!("{} Walks now leave nothing out.", "✔".green());
+                } else {
+                    println!(
+                        "{} Walks now leave out: {}",
+                        "✔".green(),
+                        effective.join("  ")
+                    );
+                }
+            }
             ConfigCommands::SetLinkMode { mode } => {
                 config.link_mode = Some(mode.into());
                 save_config(&config)?;
@@ -471,7 +501,9 @@ fn validate_config(config: &config::Config) -> Result<()> {
     {
         if let Err(err) = config::ensure_roots_disjoint(&downloads, &media) {
             failures.push(err.to_string());
-        } else if let Err(err) = engine::ensure_roots_not_mounted_inside(&downloads, &media) {
+        } else if let Err(err) =
+            engine::ensure_roots_not_mounted_inside(&downloads, &media, config.effective_exclude())
+        {
             failures.push(format!("{err:#}"));
         }
     }
@@ -667,6 +699,39 @@ mod tests {
         match cli.command {
             Commands::Link { confirm, .. } => assert!(confirm),
             _ => panic!("expected link command"),
+        }
+    }
+
+    #[test]
+    fn parses_config_set_exclude_command() {
+        let cli = Cli::try_parse_from(["dejaview", "config", "set-exclude", "#recycle", "*.part"])
+            .expect("parse config set-exclude");
+        match cli.command {
+            Commands::Config(ConfigArgs {
+                command: ConfigCommands::SetExclude { patterns, default },
+            }) => {
+                assert_eq!(patterns, vec!["#recycle", "*.part"]);
+                assert!(!default);
+            }
+            _ => panic!("expected config set-exclude command"),
+        }
+        assert!(
+            Cli::try_parse_from(["dejaview", "config", "set-exclude", "--default", "x"]).is_err()
+        );
+    }
+
+    #[test]
+    fn set_exclude_help_names_every_default_pattern() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("config")
+            .and_then(|config| config.find_subcommand_mut("set-exclude"))
+            .and_then(|command| command.get_after_help())
+            .map(ToString::to_string)
+            .expect("set-exclude has an after_help");
+        for pattern in config::DEFAULT_EXCLUDE {
+            assert!(help.contains(pattern), "{pattern} missing from {help}");
         }
     }
 

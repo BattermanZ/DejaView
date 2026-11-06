@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::cancel::{CancelToken, Cancelled};
 use super::linking::plan_hashed_group_actions;
@@ -17,7 +18,36 @@ use super::types::emit_tui_event;
 use super::types::{Cache, CacheEntry, FileInfo, LinkMode, RunWarnings};
 use crate::protocol::TuiEvent;
 
+/// Every path a hash opened, so a test can count reads under its own folder.
+#[cfg(test)]
+pub(super) mod read_log {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static OPENED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(in crate::engine) fn record(path: &Path) {
+        OPENED.lock().expect("read log").push(path.to_path_buf());
+    }
+
+    /// How many times a hash opened a file under `root`.
+    pub(in crate::engine) fn reads_under(root: &Path) -> usize {
+        OPENED
+            .lock()
+            .expect("read log")
+            .iter()
+            .filter(|path| path.starts_with(root))
+            .count()
+    }
+}
+
+/// Bytes hashed from each end of a file for its quick hash. A file no bigger
+/// than this is read whole, so its quick hash is its full BLAKE3.
+pub(super) const SAMPLE_BYTES: u64 = 1 << 20;
+
 fn sample_digest(path: &Path, size: u64) -> Result<[u8; 32]> {
+    #[cfg(test)]
+    read_log::record(path);
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     sample_digest_from(&mut file, size)
 }
@@ -83,6 +113,8 @@ fn emit_hash_progress(done: usize, total: usize, tui_events: bool) {
 /// Full BLAKE3 of a file, checking for cancellation between 1 MiB chunks so a
 /// cancel does not wait for a large file to finish.
 pub(super) fn full_digest(path: &Path, cancel: &CancelToken) -> Result<String> {
+    #[cfg(test)]
+    read_log::record(path);
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut hasher = Hasher::new();
     let mut buf = vec![0u8; 1 << 20];
@@ -107,21 +139,78 @@ pub(super) struct HashOptions<'a> {
     pub(super) cancel: &'a CancelToken,
 }
 
-/// Hashing work for one size group. Paths that share dev, inode, mtime and ctime
-/// are one physical file: only its first path is read, and the hash is copied to
-/// the rest. The timestamps guard against filesystems that can report one inode
+/// One physical file in a size group: every path of it, and what is known of
+/// its content. Paths that share dev, inode, mtime and ctime are one physical
+/// file: only its first path is read, and what is learned is copied to the
+/// rest. The timestamps guard against filesystems that can report one inode
 /// for different files (mergerfs with inodecalc=passthrough); hardlinks always
 /// share them.
+#[derive(Debug)]
+struct Physical {
+    /// Indices into the group.
+    members: Vec<usize>,
+    /// Full BLAKE3, hex, from the cache or read this run.
+    full: Option<String>,
+    /// Quick hash, hex. For a file no bigger than the sample it equals `full`.
+    sample: Option<String>,
+}
+
+/// Hashing work for one size group.
+#[derive(Debug)]
 struct GroupWork {
-    /// Indices into the group, one entry per physical file.
-    inodes: Vec<Vec<usize>>,
-    /// Full hash per physical file, when any of its paths has a valid cache entry.
-    cached: Vec<Option<String>>,
+    files: Vec<Physical>,
+    /// The group's files are no bigger than the sample, so a quick hash reads
+    /// the whole file and is its full hash.
+    small: bool,
 }
 
 impl GroupWork {
-    fn needs_sampling(&self) -> bool {
-        self.cached.iter().any(Option::is_none)
+    /// Whether a physical file still lacks its full hash. When none does, the
+    /// group is planned from the cache alone.
+    fn needs_reading(&self) -> bool {
+        self.files.iter().any(|file| file.full.is_none())
+    }
+
+    /// Record a quick hash read this run.
+    fn set_sample(&mut self, idx: usize, sample: String) {
+        let file = &mut self.files[idx];
+        if self.small {
+            file.full = Some(sample.clone());
+        }
+        file.sample = Some(sample);
+    }
+
+    /// Physical files to read in full: those without a full hash whose quick
+    /// hash matches another file's in the group.
+    fn full_candidates(&self) -> Vec<usize> {
+        let mut by_sample: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (idx, file) in self.files.iter().enumerate() {
+            if let Some(sample) = &file.sample {
+                by_sample.entry(sample).or_default().push(idx);
+            }
+        }
+        let mut candidates: Vec<usize> = by_sample
+            .into_values()
+            .filter(|indices| indices.len() > 1)
+            .flatten()
+            .filter(|&idx| self.files[idx].full.is_none())
+            .collect();
+        candidates.sort_unstable();
+        candidates
+    }
+
+    /// Copy what is known of each physical file to every path of it.
+    fn assign(&self, group: &mut [FileInfo]) {
+        for file in &self.files {
+            for &idx in &file.members {
+                group[idx].hash = file.full.clone();
+                group[idx].sample = if self.small {
+                    None
+                } else {
+                    file.sample.clone()
+                };
+            }
+        }
     }
 }
 
@@ -152,62 +241,96 @@ fn cache_entry_matches(entry: &CacheEntry, file: &FileInfo) -> bool {
         && entry.inode == file.inode
 }
 
-fn cached_hash(cache: &Cache, group: &[FileInfo], members: &[usize]) -> Option<String> {
-    members.iter().find_map(|&idx| {
+/// The full and quick hashes the cache holds for a physical file, from any of
+/// its paths whose entry is still valid.
+fn cached_hashes(
+    cache: &Cache,
+    group: &[FileInfo],
+    members: &[usize],
+) -> (Option<String>, Option<String>) {
+    let (mut full, mut sample) = (None, None);
+    for &idx in members {
         let file = &group[idx];
-        cache
+        if let Some(entry) = cache
             .get(&cache_key(file))
             .filter(|entry| cache_entry_matches(entry, file))
-            .map(|entry| entry.hash.clone())
-    })
+        {
+            full = full.or_else(|| entry.hash.clone());
+            sample = sample.or_else(|| entry.sample.clone());
+        }
+    }
+    (full, sample)
 }
 
-/// None when every path in the group is the same physical file: such a group
-/// cannot produce an action, so nothing in it is read.
+/// None when the group cannot produce an action, so nothing in it is read: it
+/// lacks a download or a library file, every path is one physical file, or
+/// every download already is a library file.
 fn plan_group_work(group: &[FileInfo], cache: &Cache) -> Option<GroupWork> {
+    if !group.iter().any(|file| !file.in_downloads) {
+        return None;
+    }
     let inodes = split_by_inode(group);
     if inodes.len() < 2 {
         return None;
     }
-    let cached = inodes
-        .iter()
-        .map(|members| cached_hash(cache, group, members))
-        .collect();
-    Some(GroupWork { inodes, cached })
-}
-
-fn assign_hash(group: &mut [FileInfo], members: &[usize], hash: &str) {
-    for &idx in members {
-        group[idx].hash = Some(hash.to_string());
+    let download_only = |members: &Vec<usize>| members.iter().all(|&idx| group[idx].in_downloads);
+    if !inodes.iter().any(download_only) {
+        return None;
     }
+    let small = group[0].size <= SAMPLE_BYTES;
+    let files = inodes
+        .into_iter()
+        .map(|members| {
+            let (mut full, mut sample) = cached_hashes(cache, group, &members);
+            if small {
+                full = full.or(sample);
+                sample = full.clone();
+            }
+            Physical {
+                members,
+                full,
+                sample,
+            }
+        })
+        .collect();
+    Some(GroupWork { files, small })
 }
 
-/// Write a cache entry for every hashed path whose entry is missing or stale, so
-/// every path of a hardlinked file is served from cache next run, not only the
-/// path that was read.
-fn sync_cache(cache: &mut Cache, groups: &[Vec<FileInfo>]) {
+/// Write a cache entry for every path whose full or quick hash is known and
+/// whose entry is missing, stale or knows less, so every path of a hardlinked
+/// file is served from cache next run, not only the path that was read.
+/// Returns how many entries were written.
+fn sync_cache(cache: &mut Cache, groups: &[Vec<FileInfo>]) -> usize {
+    let mut written = 0;
     for file in groups.iter().flatten() {
-        let Some(hash) = &file.hash else {
+        if file.hash.is_none() && file.sample.is_none() {
             continue;
-        };
+        }
         let key = cache_key(file);
-        let current = cache
+        let valid = cache
             .get(&key)
-            .is_some_and(|entry| cache_entry_matches(entry, file) && &entry.hash == hash);
-        if !current {
-            cache.insert(
-                key,
-                CacheEntry {
-                    size: file.size,
-                    mtime_ns: file.mtime_ns,
-                    ctime_ns: file.ctime_ns,
-                    dev: file.dev,
-                    inode: file.inode,
-                    hash: hash.clone(),
-                },
-            );
+            .filter(|entry| cache_entry_matches(entry, file));
+        let entry = CacheEntry {
+            size: file.size,
+            mtime_ns: file.mtime_ns,
+            ctime_ns: file.ctime_ns,
+            dev: file.dev,
+            inode: file.inode,
+            hash: file
+                .hash
+                .clone()
+                .or_else(|| valid.and_then(|entry| entry.hash.clone())),
+            sample: file
+                .sample
+                .clone()
+                .or_else(|| valid.and_then(|entry| entry.sample.clone())),
+        };
+        if valid != Some(&entry) {
+            cache.insert(key, entry);
+            written += 1;
         }
     }
+    written
 }
 
 fn emit_planned_entries(group: &[FileInfo], options: &HashOptions<'_>) {
@@ -224,6 +347,48 @@ fn emit_planned_entries(group: &[FileInfo], options: &HashOptions<'_>) {
     }
 }
 
+/// The first error that stops a hashing phase (a strict failure or a cancel),
+/// shared by its workers so the others stop before their next file.
+#[derive(Default)]
+struct Stop {
+    stopped: AtomicBool,
+    error: Mutex<Option<anyhow::Error>>,
+}
+
+impl Stop {
+    fn is_set(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    fn set(&self, err: anyhow::Error) {
+        self.stopped.store(true, Ordering::Relaxed);
+        if let Ok(mut slot) = self.error.lock()
+            && slot.is_none()
+        {
+            *slot = Some(err);
+        }
+    }
+
+    /// Whether a worker may start its next file.
+    fn may_continue(&self, cancel: &CancelToken) -> bool {
+        if self.is_set() {
+            return false;
+        }
+        if let Err(cancelled) = cancel.check() {
+            self.set(cancelled.into());
+            return false;
+        }
+        true
+    }
+
+    fn into_result(self) -> Result<()> {
+        match self.error.into_inner() {
+            Ok(Some(err)) => Err(err),
+            _ => Ok(()),
+        }
+    }
+}
+
 pub(super) fn hash_groups_and_update_cache(
     groups: &mut [Vec<FileInfo>],
     cache: &mut Cache,
@@ -232,29 +397,35 @@ pub(super) fn hash_groups_and_update_cache(
 ) -> Result<()> {
     let strict = options.strict;
     let tui_events = options.tui_events;
-    let works: Vec<Option<GroupWork>> = groups
+    let mut works: Vec<Option<GroupWork>> = groups
         .iter()
         .map(|group| plan_group_work(group, cache))
         .collect();
 
-    // Groups whose every physical file is cached need no reads at all.
+    // Groups whose every physical file has a cached full hash need no reads.
     for (group, work) in groups.iter_mut().zip(&works) {
-        let Some(work) = work.as_ref().filter(|work| !work.needs_sampling()) else {
-            continue;
-        };
-        for (members, hash) in work.inodes.iter().zip(&work.cached) {
-            if let Some(hash) = hash {
-                assign_hash(group, members, hash);
-            }
+        if let Some(work) = work.as_ref().filter(|work| !work.needs_reading()) {
+            work.assign(group);
+            emit_planned_entries(group, options);
         }
-        emit_planned_entries(group, options);
     }
 
+    // Whether each group is read this run, fixed before reading: reading the
+    // quick hashes of small files completes their full hashes.
+    let reading: Vec<bool> = works
+        .iter()
+        .map(|work| work.as_ref().is_some_and(GroupWork::needs_reading))
+        .collect();
     let total_sample_files = works
         .iter()
         .flatten()
-        .filter(|work| work.needs_sampling())
-        .map(|work| work.inodes.len())
+        .filter(|work| work.needs_reading())
+        .map(|work| {
+            work.files
+                .iter()
+                .filter(|file| file.sample.is_none())
+                .count()
+        })
         .sum::<usize>();
     let total_sample_u64 = total_sample_files as u64;
     let bar = if options.show_progress {
@@ -273,74 +444,77 @@ pub(super) fn hash_groups_and_update_cache(
     let full_hash_errors = AtomicU64::new(0);
     let sample_done = AtomicU64::new(0);
     let full_done = AtomicU64::new(0);
+    let stop = Stop::default();
 
-    // Phase 1: sample one path per physical file and keep the physical files whose
-    // sample collides with another's.
-    let full_candidates = groups
+    // Phase 1: the quick hash of each physical file that has none yet. Work is
+    // split per file, not per group, so one large group of same-size files
+    // does not run on one worker.
+    let sampled: Vec<Vec<(usize, String)>> = groups
         .par_iter()
         .zip(works.par_iter())
-        .map(|(group, work)| -> Result<Vec<usize>> {
-            let Some(work) = work.as_ref().filter(|work| work.needs_sampling()) else {
-                return Ok(Vec::new());
+        .zip(reading.par_iter())
+        .map(|((group, work), &reading)| {
+            let Some(work) = work.as_ref().filter(|_| reading) else {
+                return Vec::new();
             };
-            let worker = worker_id();
-            let mut sample_hashes: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
-            for (inode_idx, members) in work.inodes.iter().enumerate() {
-                options.cancel.check()?;
-                let file = &group[members[0]];
-                emit_worker_activity(
-                    "hashing_sample",
-                    worker,
-                    Some(file.path.display().to_string()),
-                    tui_events,
-                );
-
-                let digest_result = sample_digest(&file.path, file.size);
-                let done = sample_done.fetch_add(1, Ordering::Relaxed) + 1;
-                emit_hash_progress(done as usize, total_sample_files, tui_events);
-                if let Some(progress_bar) = &bar {
-                    progress_bar.inc(1);
-                }
-                emit_worker_activity("hashing_sample", worker, None, tui_events);
-
-                match digest_result {
-                    Ok(digest) => {
-                        sample_hashes.entry(digest).or_default().push(inode_idx);
+            work.files
+                .par_iter()
+                .enumerate()
+                .filter(|(_, file)| file.sample.is_none())
+                .filter_map(|(idx, physical)| {
+                    if !stop.may_continue(options.cancel) {
+                        return None;
                     }
-                    Err(err) => {
-                        sample_hash_errors.fetch_add(1, Ordering::Relaxed);
-                        if strict {
-                            return Err(anyhow!(
-                                "sample hash error for {}: {}",
-                                file.path.display(),
-                                err
-                            ));
+                    let worker = worker_id();
+                    let file = &group[physical.members[0]];
+                    emit_worker_activity(
+                        "hashing_sample",
+                        worker,
+                        Some(file.path.display().to_string()),
+                        tui_events,
+                    );
+                    let digest_result = sample_digest(&file.path, file.size);
+                    let done = sample_done.fetch_add(1, Ordering::Relaxed) + 1;
+                    emit_hash_progress(done as usize, total_sample_files, tui_events);
+                    if let Some(progress_bar) = &bar {
+                        progress_bar.inc(1);
+                    }
+                    emit_worker_activity("hashing_sample", worker, None, tui_events);
+                    match digest_result {
+                        Ok(digest) => Some((idx, blake3::Hash::from(digest).to_hex().to_string())),
+                        Err(err) => {
+                            sample_hash_errors.fetch_add(1, Ordering::Relaxed);
+                            if strict {
+                                stop.set(anyhow!(
+                                    "sample hash error for {}: {err:#}",
+                                    file.path.display()
+                                ));
+                            }
+                            None
                         }
                     }
-                }
+                })
+                .collect()
+        })
+        .collect();
+    for (work, sampled) in works.iter_mut().zip(sampled) {
+        if let Some(work) = work.as_mut() {
+            for (idx, sample) in sampled {
+                work.set_sample(idx, sample);
             }
+        }
+    }
 
-            let mut candidates: Vec<usize> = sample_hashes
-                .into_values()
-                .filter(|inode_indices| inode_indices.len() > 1)
-                .flatten()
-                .collect();
-            candidates.sort_unstable();
-            Ok(candidates)
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let total_full_files = works
+    let full_candidates: Vec<Vec<usize>> = works
         .iter()
-        .zip(&full_candidates)
-        .filter_map(|(work, candidates)| work.as_ref().map(|work| (work, candidates)))
-        .map(|(work, candidates)| {
-            candidates
-                .iter()
-                .filter(|&&inode_idx| work.cached[inode_idx].is_none())
-                .count()
+        .map(|work| {
+            work.as_ref()
+                .filter(|_| !stop.is_set())
+                .map(GroupWork::full_candidates)
+                .unwrap_or_default()
         })
-        .sum::<usize>();
+        .collect();
+    let total_full_files = full_candidates.iter().map(Vec::len).sum::<usize>();
     if tui_events && total_full_files > 0 {
         let _ = emit_tui_event(&TuiEvent::Phase {
             phase: "hashing_full".to_string(),
@@ -357,57 +531,65 @@ pub(super) fn hash_groups_and_update_cache(
         }
     }
 
-    // Phase 2: full hash for each colliding physical file not already cached, then
-    // copy the hash to every path of that file.
-    let full_result = groups
+    // Phase 2: the full hash of each physical file whose quick hash collides
+    // with another's, again split per file. A group's rows go to the TUI as
+    // soon as its own files are done.
+    groups
         .par_iter_mut()
-        .zip(works.par_iter())
+        .zip(works.par_iter_mut())
         .zip(full_candidates.into_par_iter())
-        .try_for_each(|((group, work), candidates)| -> Result<()> {
-            let Some(work) = work.as_ref().filter(|work| work.needs_sampling()) else {
-                return Ok(());
+        .zip(reading.into_par_iter())
+        .for_each(|(((group, work), candidates), reading)| {
+            let Some(work) = work.as_mut().filter(|_| reading) else {
+                return;
             };
-            let worker = worker_id();
-            for inode_idx in candidates {
-                let members = &work.inodes[inode_idx];
-                let hash = if let Some(hash) = &work.cached[inode_idx] {
-                    hash.clone()
-                } else {
-                    let path = group[members[0]].path.clone();
+            let hashed: Vec<(usize, String)> = candidates
+                .par_iter()
+                .filter_map(|&idx| {
+                    if !stop.may_continue(options.cancel) {
+                        return None;
+                    }
+                    let worker = worker_id();
+                    let path = &group[work.files[idx].members[0]].path;
                     emit_worker_activity(
                         "hashing_full",
                         worker,
                         Some(path.display().to_string()),
                         tui_events,
                     );
-                    let digest_result = full_digest(&path, options.cancel);
+                    let digest_result = full_digest(path, options.cancel);
                     let done = full_done.fetch_add(1, Ordering::Relaxed) + 1;
                     emit_hash_progress(done as usize, total_full_files, tui_events);
                     if let Some(progress_bar) = &bar {
                         progress_bar.inc(1);
                     }
                     emit_worker_activity("hashing_full", worker, None, tui_events);
-
                     match digest_result {
-                        Ok(hash) => hash,
-                        Err(err) if err.is::<Cancelled>() => return Err(err),
+                        Ok(hash) => Some((idx, hash)),
+                        Err(err) if err.is::<Cancelled>() => {
+                            stop.set(err);
+                            None
+                        }
                         Err(err) => {
                             full_hash_errors.fetch_add(1, Ordering::Relaxed);
                             if strict {
-                                return Err(anyhow!(
-                                    "full hash error for {}: {}",
-                                    path.display(),
-                                    err
+                                stop.set(anyhow!(
+                                    "full hash error for {}: {err:#}",
+                                    path.display()
                                 ));
                             }
-                            continue;
+                            None
                         }
                     }
-                };
-                assign_hash(group, members, &hash);
+                })
+                .collect();
+            for (idx, hash) in hashed {
+                work.files[idx].full = Some(hash);
             }
-            emit_planned_entries(group, options);
-            Ok(())
+            work.assign(group);
+            if !stop.is_set() {
+                emit_planned_entries(group, options);
+            }
         });
 
     // Hashes finished before a cancel or a strict failure are still valid.
@@ -419,7 +601,7 @@ pub(super) fn hash_groups_and_update_cache(
         bar.finish_with_message("Hashing complete ✔".green().bold().to_string());
     }
 
-    full_result
+    stop.into_result()
 }
 
 #[cfg(test)]
@@ -436,19 +618,41 @@ mod tests {
             dev,
             inode,
             hash: None,
+            sample: None,
             in_downloads: path.starts_with("/dl"),
         }
     }
 
-    fn entry_for(file: &FileInfo, hash: &str) -> CacheEntry {
+    /// A file bigger than the sample, so its quick hash is not its full hash.
+    fn large(path: &str, inode: u64) -> FileInfo {
+        FileInfo {
+            size: SAMPLE_BYTES + 1,
+            ..file(path, 1, inode, 0)
+        }
+    }
+
+    fn entry_for(file: &FileInfo, hash: Option<&str>, sample: Option<&str>) -> CacheEntry {
         CacheEntry {
             size: file.size,
             mtime_ns: file.mtime_ns,
             ctime_ns: file.ctime_ns,
             dev: file.dev,
             inode: file.inode,
-            hash: hash.to_string(),
+            hash: hash.map(str::to_string),
+            sample: sample.map(str::to_string),
         }
+    }
+
+    fn members(work: &GroupWork) -> Vec<Vec<usize>> {
+        work.files.iter().map(|file| file.members.clone()).collect()
+    }
+
+    /// Physical files phase 1 would read.
+    fn to_sample(work: &GroupWork) -> usize {
+        work.files
+            .iter()
+            .filter(|file| file.sample.is_none())
+            .count()
     }
 
     /// Returns at most `max` bytes per read, as a FUSE mount such as mergerfs
@@ -520,6 +724,30 @@ mod tests {
     }
 
     #[test]
+    fn group_without_a_library_file_is_not_read() {
+        let group = vec![file("/dl/a", 1, 7, 0), file("/dl/b", 1, 8, 0)];
+        assert!(plan_group_work(&group, &Cache::new()).is_none());
+    }
+
+    #[test]
+    fn group_without_a_download_is_not_read() {
+        let group = vec![file("/media/a", 1, 7, 0), file("/media/b", 1, 8, 0)];
+        assert!(plan_group_work(&group, &Cache::new()).is_none());
+    }
+
+    #[test]
+    fn group_whose_downloads_all_are_library_files_is_not_read() {
+        // The download is a hardlink of one library file; the other library
+        // file can only be compared with the first, which plans nothing.
+        let group = vec![
+            file("/dl/a", 1, 7, 0),
+            file("/media/a", 1, 7, 0),
+            file("/media/b", 1, 8, 0),
+        ];
+        assert!(plan_group_work(&group, &Cache::new()).is_none());
+    }
+
+    #[test]
     fn hardlinked_paths_are_read_once() {
         let group = vec![
             file("/dl/a", 1, 7, 0),
@@ -527,15 +755,16 @@ mod tests {
             file("/dl/copy", 1, 9, 0),
         ];
         let work = plan_group_work(&group, &Cache::new()).expect("two physical files");
-        assert_eq!(work.inodes, vec![vec![0, 1], vec![2]]);
-        assert!(work.needs_sampling());
+        assert_eq!(members(&work), vec![vec![0, 1], vec![2]]);
+        assert!(work.needs_reading());
+        assert_eq!(to_sample(&work), 2);
     }
 
     #[test]
     fn same_inode_on_another_device_is_a_different_file() {
         let group = vec![file("/dl/a", 1, 7, 0), file("/media/a", 2, 7, 0)];
         let work = plan_group_work(&group, &Cache::new()).expect("two physical files");
-        assert_eq!(work.inodes.len(), 2);
+        assert_eq!(work.files.len(), 2);
     }
 
     #[test]
@@ -546,7 +775,7 @@ mod tests {
         other.ctime_ns = 5;
         let group = vec![file("/dl/a", 1, 7, 0), other];
         let work = plan_group_work(&group, &Cache::new()).expect("two physical files");
-        assert_eq!(work.inodes.len(), 2);
+        assert_eq!(work.files.len(), 2);
     }
 
     #[test]
@@ -557,11 +786,12 @@ mod tests {
             file("/dl/copy", 1, 9, 0),
         ];
         let mut cache = Cache::new();
-        cache.insert("/media/a".into(), entry_for(&group[1], "h"));
-        cache.insert("/dl/copy".into(), entry_for(&group[2], "h"));
+        cache.insert("/media/a".into(), entry_for(&group[1], Some("h"), None));
+        cache.insert("/dl/copy".into(), entry_for(&group[2], Some("h"), None));
         let work = plan_group_work(&group, &cache).expect("two physical files");
-        assert_eq!(work.cached, vec![Some("h".into()), Some("h".into())]);
-        assert!(!work.needs_sampling());
+        let full: Vec<_> = work.files.iter().map(|file| file.full.clone()).collect();
+        assert_eq!(full, vec![Some("h".into()), Some("h".into())]);
+        assert!(!work.needs_reading());
     }
 
     #[test]
@@ -569,9 +799,63 @@ mod tests {
         let group = vec![file("/dl/a", 1, 7, 5), file("/media/a", 1, 8, 0)];
         let mut cache = Cache::new();
         let stale = file("/dl/a", 1, 7, 4);
-        cache.insert("/dl/a".into(), entry_for(&stale, "old"));
+        cache.insert("/dl/a".into(), entry_for(&stale, Some("old"), None));
         let work = plan_group_work(&group, &cache).expect("two physical files");
-        assert_eq!(work.cached[0], None);
+        assert_eq!(work.files[0].full, None);
+        assert_eq!(to_sample(&work), 2);
+    }
+
+    #[test]
+    fn a_small_file_s_quick_hash_is_its_full_hash() {
+        let group = vec![file("/dl/a", 1, 7, 0), file("/media/a", 1, 8, 0)];
+        let mut work = plan_group_work(&group, &Cache::new()).expect("two physical files");
+        work.set_sample(0, "h".into());
+        work.set_sample(1, "h".into());
+        assert!(!work.needs_reading());
+        assert!(work.full_candidates().is_empty());
+    }
+
+    #[test]
+    fn a_small_file_s_cached_full_hash_needs_no_quick_hash() {
+        let group = vec![file("/dl/a", 1, 7, 0), file("/media/a", 1, 8, 0)];
+        let mut cache = Cache::new();
+        cache.insert("/media/a".into(), entry_for(&group[1], Some("h"), None));
+        let work = plan_group_work(&group, &cache).expect("two physical files");
+        assert_eq!(to_sample(&work), 1);
+        assert_eq!(work.files[1].sample.as_deref(), Some("h"));
+    }
+
+    #[test]
+    fn cached_quick_hashes_that_match_nothing_need_no_reads() {
+        // A new download whose quick hash matched no library file last run:
+        // neither file is read again while both stay unchanged.
+        let group = vec![large("/dl/a", 7), large("/media/a", 8)];
+        let mut cache = Cache::new();
+        cache.insert("/dl/a".into(), entry_for(&group[0], None, Some("s1")));
+        cache.insert("/media/a".into(), entry_for(&group[1], None, Some("s2")));
+        let work = plan_group_work(&group, &cache).expect("two physical files");
+        assert!(work.needs_reading());
+        assert_eq!(to_sample(&work), 0);
+        assert!(work.full_candidates().is_empty());
+    }
+
+    #[test]
+    fn only_files_whose_quick_hashes_collide_are_read_in_full() {
+        let group = vec![
+            large("/dl/a", 7),
+            large("/media/a", 8),
+            large("/media/b", 9),
+        ];
+        let mut cache = Cache::new();
+        cache.insert(
+            "/media/a".into(),
+            entry_for(&group[1], Some("f"), Some("s")),
+        );
+        let mut work = plan_group_work(&group, &cache).expect("three physical files");
+        assert_eq!(to_sample(&work), 2);
+        work.set_sample(0, "s".into());
+        work.set_sample(2, "other".into());
+        assert_eq!(work.full_candidates(), vec![0]);
     }
 
     #[test]
@@ -581,16 +865,29 @@ mod tests {
             file("/media/a", 1, 7, 0),
             file("/dl/unhashed", 1, 9, 0),
         ];
-        assign_hash(&mut group, &[0, 1], "h");
+        group[0].hash = Some("h".into());
+        group[1].hash = Some("h".into());
         let mut cache = Cache::new();
         let stale = file("/media/a", 1, 7, 99);
-        cache.insert("/media/a".into(), entry_for(&stale, "old"));
+        cache.insert("/media/a".into(), entry_for(&stale, Some("old"), None));
 
-        sync_cache(&mut cache, &[group.clone()]);
+        assert_eq!(sync_cache(&mut cache, std::slice::from_ref(&group)), 2);
 
         assert_eq!(cache.len(), 2);
         assert!(cache_entry_matches(&cache["/dl/a"], &group[0]));
         assert!(cache_entry_matches(&cache["/media/a"], &group[1]));
-        assert_eq!(cache["/media/a"].hash, "h");
+        assert_eq!(cache["/media/a"].hash.as_deref(), Some("h"));
+        assert_eq!(sync_cache(&mut cache, &[group]), 0);
+    }
+
+    #[test]
+    fn sync_cache_keeps_what_an_entry_knows_when_this_run_learned_less() {
+        let mut group = vec![large("/dl/a", 7)];
+        group[0].hash = Some("f".into());
+        let mut cache = Cache::new();
+        cache.insert("/dl/a".into(), entry_for(&group[0], Some("f"), Some("s")));
+
+        assert_eq!(sync_cache(&mut cache, &[group]), 0);
+        assert_eq!(cache["/dl/a"].sample.as_deref(), Some("s"));
     }
 }

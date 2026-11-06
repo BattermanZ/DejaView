@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::cache::{clear_cache_file, load_cache, save_cache};
 use super::collect::{
-    CollectOptions, RootId, collect_files, collect_run_files, group_files_by_size,
+    CollectOptions, Exclude, RootId, collect_files, collect_run_files, group_files_by_size,
 };
 use super::linking::{
     ApplyOptions, ApplyOutcome, CanonicalRoots, LinkRequest, Linked, apply_actions,
@@ -34,6 +34,8 @@ fn make_config(downloads: &Path, media: &Path, min_age: u64) -> Config {
         // Test files are a few bytes; only the empty-file rule applies.
         min_size: Some(1),
         threads: None,
+        full_threads: None,
+        exclude: None,
         link_mode: Some(LinkMode::Best),
     }
 }
@@ -54,6 +56,7 @@ fn sample_file_info(path: &str, dev: u64, inode: u64, in_downloads: bool) -> Fil
         dev,
         inode,
         hash: Some("h".into()),
+        sample: None,
         in_downloads,
     }
 }
@@ -375,14 +378,18 @@ fn save_cache_writes_json() {
             ctime_ns: 456,
             dev: 7,
             inode: 8,
-            hash: "abc".into(),
+            hash: Some("abc".into()),
+            sample: None,
         },
     );
 
     save_cache(&cache_path, &cache).expect("save cache");
     let loaded = load_cache(&cache_path);
     assert_eq!(loaded.len(), 1);
-    assert_eq!(loaded.get("foo").expect("foo key").hash, "abc");
+    assert_eq!(
+        loaded.get("foo").expect("foo key").hash.as_deref(),
+        Some("abc")
+    );
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
@@ -492,6 +499,7 @@ fn collect_files_strict_fails_on_walk_error() {
         Duration::from_secs(0),
         &CollectOptions {
             min_size: 1,
+            exclude: &Exclude::default(),
             strict: true,
             show_progress: false,
             tui_events: false,
@@ -526,6 +534,7 @@ fn partially_linked_groups_still_plan_remaining_download_duplicates() {
         Duration::from_secs(0),
         CollectOptions {
             min_size: 1,
+            exclude: &Exclude::default(),
             strict: false,
             show_progress: false,
             tui_events: false,
@@ -1196,7 +1205,8 @@ fn save_cache_failure_cleans_up_temp_file() {
             ctime_ns: 2,
             dev: 3,
             inode: 4,
-            hash: "h".into(),
+            hash: Some("h".into()),
+            sample: None,
         },
     );
     let result = save_cache(&cache_file, &cache);
@@ -1307,6 +1317,7 @@ fn collect_refuses_a_directory_that_is_the_other_root() {
         Duration::from_secs(0),
         &CollectOptions {
             min_size: 1,
+            exclude: &Exclude::default(),
             strict: false,
             show_progress: false,
             tui_events: false,
@@ -1325,9 +1336,17 @@ fn collect_refuses_a_directory_that_is_the_other_root() {
 
     // The same root reached at the top, as when both are one folder.
     let same = RootId::of("media", &downloads).expect("same id");
-    assert!(super::collect::ensure_root_not_reached(&test_root(&downloads), &same).is_err());
     assert!(
-        super::collect::ensure_root_not_reached(&test_root(&downloads), &unrelated_root()).is_ok()
+        super::collect::ensure_root_not_reached(&test_root(&downloads), &same, &Exclude::default())
+            .is_err()
+    );
+    assert!(
+        super::collect::ensure_root_not_reached(
+            &test_root(&downloads),
+            &unrelated_root(),
+            &Exclude::default()
+        )
+        .is_ok()
     );
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
@@ -1354,6 +1373,7 @@ fn collect_files_skips_dejaview_own_files() {
         Duration::from_secs(0),
         &CollectOptions {
             min_size: 1,
+            exclude: &Exclude::default(),
             strict: false,
             show_progress: false,
             tui_events: false,
@@ -1418,7 +1438,8 @@ fn prune_cache_keeps_only_seen_paths() {
                 ctime_ns: 0,
                 dev: 1,
                 inode: 1,
-                hash: "h".into(),
+                hash: Some("h".into()),
+                sample: None,
             },
         );
     }
@@ -2036,5 +2057,70 @@ fn a_pair_left_alone_for_access_does_not_stop_a_strict_run() {
         .expect("locked entry");
     assert_eq!(locked_entry["status"], "skipped");
     assert_eq!(report["warnings"]["link_errors"], 0);
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_warm_scan_reads_no_file_it_already_knows() {
+    let root = unique_temp_dir("warm_reads");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    // Same size, different content: the quick hashes differ, so neither file
+    // is read in full and neither has a full hash to cache.
+    let big = (super::hashing::SAMPLE_BYTES + 4096) as usize;
+    write_file(&downloads.join("new.mkv"), &vec![1u8; big]);
+    write_file(&media.join("other.mkv"), &vec![2u8; big]);
+    // Small files whose quick hash is their full hash.
+    write_file(&downloads.join("a.nfo"), b"aaaa");
+    write_file(&media.join("b.nfo"), b"bbbb");
+    let config = make_config(&downloads, &media, 0);
+
+    run_scan(&config, true, false, None);
+    assert_eq!(super::hashing::read_log::reads_under(&root), 4);
+    run_scan(&config, true, false, None);
+    assert_eq!(super::hashing::read_log::reads_under(&root), 4);
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn excluded_folders_are_never_walked() {
+    let root = unique_temp_dir("exclude");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    // A recycle-bin copy sorts first by bytes, so without the exclude list it
+    // would become the link target.
+    write_file(&media.join("#recycle/movie.mkv"), b"same-content");
+    write_file(&media.join("Movies/movie.mkv"), b"same-content");
+    write_file(&downloads.join("movie.mkv"), b"same-content");
+    write_file(&downloads.join("@eaDir/thumb.mkv"), b"same-content");
+    let config = make_config(&downloads, &media, 0);
+    let exclude = Exclude::new(config.effective_exclude());
+    let mut warnings = RunWarnings::default();
+    let mut metrics = RunMetrics::default();
+
+    let files = collect_run_files(
+        &downloads,
+        &media,
+        Duration::ZERO,
+        CollectOptions {
+            min_size: 1,
+            exclude: &exclude,
+            strict: true,
+            show_progress: false,
+            tui_events: false,
+            cancel: &CancelToken::default(),
+        },
+        &mut warnings,
+        &mut metrics,
+    )
+    .expect("collect");
+    let mut paths: Vec<_> = files.iter().map(|file| file.path.clone()).collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![downloads.join("movie.mkv"), media.join("Movies/movie.mkv")]
+    );
+
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

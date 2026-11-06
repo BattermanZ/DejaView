@@ -57,11 +57,13 @@ pub fn cleanup_temp_artifacts(config: &Config) -> Result<Vec<std::path::PathBuf>
 pub fn ensure_roots_not_mounted_inside(
     downloads: &std::path::Path,
     media: &std::path::Path,
+    exclude: Vec<String>,
 ) -> Result<()> {
     let downloads = collect::RootId::of("downloads", downloads)?;
     let media = collect::RootId::of("media", media)?;
-    collect::ensure_root_not_reached(&downloads, &media)?;
-    collect::ensure_root_not_reached(&media, &downloads)
+    let exclude = collect::Exclude::new(exclude);
+    collect::ensure_root_not_reached(&downloads, &media, &exclude)?;
+    collect::ensure_root_not_reached(&media, &downloads, &exclude)
 }
 
 /// What one real hardlink from the library into downloads did.
@@ -172,6 +174,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
 
     // Held until the run returns, cache save and report included.
     let _lock = lock::acquire(downloads)?;
+    let exclude = collect::Exclude::new(config.effective_exclude());
     let mut warnings = RunWarnings::default();
     let mut metrics = RunMetrics::default();
     if options.tui_events {
@@ -188,6 +191,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         min_age,
         CollectOptions {
             min_size: config.effective_min_size(),
+            exclude: &exclude,
             strict: options.strict,
             show_progress: options.show_progress,
             tui_events: options.tui_events,

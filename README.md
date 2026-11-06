@@ -29,7 +29,7 @@ There is also a terminal dashboard, `dejaview tui`, for scanning, reviewing and 
 
 - **Matching by content.** Files are grouped by size, then compared with BLAKE3 hashes: a quick hash of the first and last MiB, and a full hash only when quick hashes collide. Names and folders play no part.
 - **Hardlink first.** On the same filesystem the download becomes a hardlink and the space comes back. Across filesystems, or if the hardlink fails, DejaView falls back to a relative symlink and records why in the report.
-- **Cheap repeat runs.** A cache in the downloads folder remembers hashes. Hardlinked paths are hashed once, and an already-linked pair with no other file of the same size is not read at all, so rescanning a library that the *arr apps already hardlink costs very little.
+- **Cheap repeat runs.** A cache in the downloads folder remembers what each file hashed to, quick hashes included, so a repeat run reads only the files that are new or changed since the last one. Hardlinked paths are read once, and files of a size no download shares with a library file are not read at all.
 - **Dry run by default.** `scan` only shows the plan. `link` changes files, and `link --confirm` asks first.
 - **Reports.** `--json` prints a run summary for scripts, and every `link` run writes a JSON report of what it changed.
 - **Terminal dashboard.** Live progress per hashing thread, link one row or all of them, and cancel a running scan or link with `c`.
@@ -102,6 +102,7 @@ dejaview link --confirm
 | `dejaview config set-min-age SECONDS` | Skip files modified more recently than this. |
 | `dejaview config set-min-size BYTES` | Skip files smaller than this. At least 1: empty files are always skipped. |
 | `dejaview config set-threads N` | Set the number of hashing threads. |
+| `dejaview config set-exclude [PATTERN]...` | Set the file and folder names every walk leaves out, as globs (`*` for any run of characters, `?` for one). With no pattern nothing is left out; `--default` goes back to the default list. |
 | `dejaview config set-link-mode best\|symlink-only` | Choose hardlink with symlink fallback, or symlinks only. |
 | `dejaview cache info` | Show where the cache is and how many entries it holds. |
 | `dejaview cache clear` | Delete the cache. The next scan hashes everything again. |
@@ -179,6 +180,7 @@ If the log cannot be written, DejaView warns once, naming the path, and runs wit
 | `min_age` | `0` | Seconds. Files modified more recently are skipped, which keeps DejaView away from files a client is still writing. |
 | `min_size` | `1048576` (1 MiB) | Bytes. Smaller files are skipped: `.nfo` files, text subtitles and artwork save almost nothing and cost a read on every run. Empty files are always skipped, because a torrent client creates a file empty before writing into it. |
 | `threads` | number of CPUs | Hashing threads. Lower it if parallel reads thrash spinning disks. |
+| `exclude` | the folders a NAS or an OS keeps for itself | Names of files and folders every walk leaves out, with everything under them, each matched against one name. The default list is `@eaDir`, `#recycle`, `#snapshot`, `@Recycle`, `.@__thumb`, `.recycle`, `.snapshots`, `.Trash-*`, `$RECYCLE.BIN` and `lost+found`: walking them costs time, and a recycle-bin copy could otherwise become a link target. |
 | `link_mode` | `best` | `best` hardlinks and falls back to relative symlinks. `symlink-only` always uses relative symlinks. |
 
 ### Files DejaView writes
@@ -220,10 +222,10 @@ Files whose name starts with `.dejaview_` are never treated as duplicates.
 
 ## How it works
 
-1. Walk both folders without following symlinks. Skip files smaller than `min_size` (and every empty file), files younger than `min_age`, and DejaView's own files.
-2. Group files by size. Paths that are already the same file count once, and a group that is all one file is skipped.
-3. Quick hash (BLAKE3 of the first and last MiB) of each remaining file, unless every file in the group is already cached.
-4. Full BLAKE3 hash of the files whose quick hashes collide.
+1. Walk both folders without following symlinks, leaving out the names on the `exclude` list. Skip files smaller than `min_size` (and every empty file), files younger than `min_age`, and DejaView's own files.
+2. Group files by size. Paths that are already the same file count once. A group is skipped when it is all one file, holds no download or no library file, or every download in it already is a library file.
+3. Quick hash (BLAKE3 of the first and last MiB) of each remaining file the cache does not already know. A file of 1 MiB or less is read whole, so its quick hash is its full hash.
+4. Full BLAKE3 hash of the files whose quick hashes collide, unless cached.
 5. In each set of identical files, the first media file by path is the target. Every download copy that is not already a link to it gets an action.
 6. `link` only: check both files again, link to a temporary name, rename it over the download.
 

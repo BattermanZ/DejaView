@@ -85,7 +85,8 @@ pub struct App {
     media: Option<PathBuf>,
     min_age: Option<u64>,
     min_size: u64,
-    threads: Option<usize>,
+    threads: usize,
+    full_threads: usize,
     link_mode: LinkMode,
     expand_paths: bool,
     current_phase: Option<String>,
@@ -120,7 +121,8 @@ impl App {
             media: config.media.clone(),
             min_age: config.min_age,
             min_size: config.effective_min_size(),
-            threads: config.threads,
+            threads: config.effective_threads(),
+            full_threads: config.effective_full_threads(),
             link_mode: config.link_mode.unwrap_or(LinkMode::Best),
             expand_paths: false,
             current_phase: None,
@@ -311,9 +313,7 @@ impl App {
     }
 
     pub fn threads_label(&self) -> String {
-        self.threads
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "auto".to_string())
+        format!("{} quick / {} full", self.threads, self.full_threads)
     }
 
     pub fn link_mode_label(&self) -> &'static str {
@@ -2141,6 +2141,8 @@ mod tests {
                     min_age: Some(900),
                     min_size: None,
                     threads: Some(8),
+                    full_threads: None,
+                    exclude: None,
                     link_mode: Some(LinkMode::Best),
                 })
             },
@@ -2151,6 +2153,8 @@ mod tests {
                     min_age: config.min_age,
                     min_size: config.min_size,
                     threads: config.threads,
+                    full_threads: config.full_threads,
+                    exclude: config.exclude.clone(),
                     link_mode: config.link_mode,
                 });
                 Ok(())
