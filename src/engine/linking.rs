@@ -24,12 +24,12 @@ pub(super) fn ensure_target_within_media_root(media_root: &Path, target: &Path) 
         fs::symlink_metadata(target).with_context(|| format!("metadata {}", target.display()))?;
     let canonical_media = fs::canonicalize(media_root)
         .with_context(|| format!("canonicalize {}", media_root.display()))?;
-    ensure_target_within_media_root_with(media_root, &canonical_media, target, &target_meta)
+    refuse_target_outside_media_root(media_root, &canonical_media, target, &target_meta)
 }
 
 /// Refuse a target that is a symlink or lies outside the media root, given
 /// the target's `lstat` and the media root resolved once per run.
-fn ensure_target_within_media_root_with(
+fn refuse_target_outside_media_root(
     media_root: &Path,
     canonical_media: &Path,
     target: &Path,
@@ -881,7 +881,10 @@ pub(super) fn apply_actions(
                 ),
             );
             let canonical_media = canonical_media.as_ref().map_err(|err| {
-                anyhow!("cannot resolve the media folder {}: {err}", media.display())
+                anyhow!(
+                    "cannot resolve the media folder {}: {err}; check that it is mounted and readable, then run again",
+                    media.display()
+                )
             })?;
             ensure_source_outside_media_root(media, canonical_media, &action.src)?;
             // One lstat of each file serves every check below.
@@ -893,7 +896,7 @@ pub(super) fn apply_actions(
                 &replaced_inodes,
             )?;
             let tgt_meta = lstat(&action.tgt)?;
-            ensure_target_within_media_root_with(media, canonical_media, &action.tgt, &tgt_meta)?;
+            refuse_target_outside_media_root(media, canonical_media, &action.tgt, &tgt_meta)?;
             ensure_target_snapshot_matches(&action.tgt, &tgt_meta, &action.tgt_snapshot)?;
             if let Some(reason) =
                 read_access_refusal(&action.src, &src_meta, &action.tgt, &tgt_meta)

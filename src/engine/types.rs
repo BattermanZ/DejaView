@@ -107,6 +107,19 @@ pub(super) struct CacheEntry {
     pub(super) sample: Option<String>,
 }
 
+impl CacheEntry {
+    /// The file as it was when this entry was written.
+    pub(super) fn snapshot(&self) -> FileSnapshot {
+        FileSnapshot {
+            size: self.size,
+            mtime_ns: self.mtime_ns,
+            ctime_ns: self.ctime_ns,
+            dev: self.dev,
+            inode: self.inode,
+        }
+    }
+}
+
 pub(super) type Cache = HashMap<String, CacheEntry>;
 
 #[derive(Default, Clone)]
@@ -122,6 +135,8 @@ pub(super) struct RunWarnings {
 pub(super) struct RunMetrics {
     pub(super) skipped_by_min_age: u64,
     pub(super) skipped_by_min_size: u64,
+    /// Files and folders left out by name; a folder counts once.
+    pub(super) skipped_by_exclude: u64,
     /// Downloads left alone as a library file seen through a second mount.
     pub(super) skipped_as_library_file: u64,
     /// Symlinks in downloads that point into the library and no longer resolve.

@@ -7,11 +7,11 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 use walkdir::WalkDir;
 
-use super::cancel::CancelToken;
+use super::cancel::{CancelToken, FirstError};
 use super::types::{FileInfo, RunMetrics, RunWarnings};
 use super::types::{emit_tui_event, progress_due};
 use crate::logger;
@@ -262,6 +262,7 @@ struct Found {
     metadata_errors: u64,
     skipped_by_min_size: u64,
     skipped_by_min_age: u64,
+    skipped_by_exclude: u64,
     dangling_symlinks: Vec<PathBuf>,
 }
 
@@ -272,6 +273,7 @@ impl Found {
         self.metadata_errors += other.metadata_errors;
         self.skipped_by_min_size += other.skipped_by_min_size;
         self.skipped_by_min_age += other.skipped_by_min_age;
+        self.skipped_by_exclude += other.skipped_by_exclude;
         self.dangling_symlinks.extend(other.dangling_symlinks);
     }
 
@@ -282,6 +284,7 @@ impl Found {
         warnings.metadata_errors += self.metadata_errors;
         metrics.skipped_by_min_size += self.skipped_by_min_size;
         metrics.skipped_by_min_age += self.skipped_by_min_age;
+        metrics.skipped_by_exclude += self.skipped_by_exclude;
         self.dangling_symlinks.sort();
         metrics.dangling_symlinks.extend(self.dangling_symlinks);
         self.files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -294,38 +297,8 @@ impl Found {
 /// of files found so far, for the TUI.
 #[derive(Default)]
 struct WalkShared {
-    stopped: AtomicBool,
-    error: Mutex<Option<anyhow::Error>>,
+    stop: FirstError,
     files_seen: AtomicUsize,
-}
-
-impl WalkShared {
-    fn fail(&self, err: anyhow::Error) {
-        self.stopped.store(true, Ordering::Relaxed);
-        if let Ok(mut slot) = self.error.lock()
-            && slot.is_none()
-        {
-            *slot = Some(err);
-        }
-    }
-
-    fn should_stop(&self, cancel: &CancelToken) -> bool {
-        if self.stopped.load(Ordering::Relaxed) {
-            return true;
-        }
-        if let Err(cancelled) = cancel.check() {
-            self.fail(cancelled.into());
-            return true;
-        }
-        false
-    }
-
-    fn into_result(self) -> Result<()> {
-        match self.error.into_inner() {
-            Ok(Some(err)) => Err(err),
-            _ => Ok(()),
-        }
-    }
 }
 
 /// The walk of one root, run by many workers at once: each folder is read by
@@ -362,7 +335,7 @@ impl<'a> Walk<'a> {
     fn walk_error(&self, shared: &WalkShared, found: &mut Found, path: &Path, err: std::io::Error) {
         found.walk_errors += 1;
         if self.options.strict {
-            shared.fail(anyhow!(
+            shared.stop.set(anyhow!(
                 "walk error under {}: cannot read {}: {err}",
                 self.root.path.display(),
                 path.display()
@@ -371,14 +344,14 @@ impl<'a> Walk<'a> {
     }
 
     /// Read one folder: hand its folders to the pool and look at its files.
-    fn read_dir<'s>(
+    fn read_folder<'s>(
         &'s self,
         scope: &rayon::Scope<'s>,
         shared: &'s WalkShared,
         dir: &Path,
         found: &mut Found,
     ) {
-        if shared.should_stop(self.options.cancel) {
+        if shared.stop.should_stop(self.options.cancel) {
             return;
         }
         let entries = match fs::read_dir(dir) {
@@ -386,7 +359,7 @@ impl<'a> Walk<'a> {
             Err(err) => return self.walk_error(shared, found, dir, err),
         };
         for entry in entries {
-            if shared.should_stop(self.options.cancel) {
+            if shared.stop.should_stop(self.options.cancel) {
                 return;
             }
             let entry = match entry {
@@ -399,6 +372,7 @@ impl<'a> Walk<'a> {
             let path = entry.path();
             let name = entry.file_name();
             if !self.options.exclude.keeps(&path, &name) {
+                found.skipped_by_exclude += 1;
                 continue;
             }
             let file_type = match entry.file_type() {
@@ -410,7 +384,7 @@ impl<'a> Walk<'a> {
             };
             if file_type.is_dir() {
                 if let Err(err) = ensure_not_other_root(&path, self.root, self.other) {
-                    shared.fail(err);
+                    shared.stop.set(err);
                     return;
                 }
                 scope.spawn(move |scope| self.walk_folder(scope, shared, path));
@@ -426,7 +400,7 @@ impl<'a> Walk<'a> {
 
     fn walk_folder<'s>(&'s self, scope: &rayon::Scope<'s>, shared: &'s WalkShared, dir: PathBuf) {
         let mut found = Found::default();
-        self.read_dir(scope, shared, &dir, &mut found);
+        self.read_folder(scope, shared, &dir, &mut found);
         if let Ok(mut all) = self.found.lock() {
             all.merge(found);
         }
@@ -446,7 +420,9 @@ impl<'a> Walk<'a> {
             Err(err) => {
                 found.metadata_errors += 1;
                 if self.options.strict {
-                    shared.fail(anyhow!("metadata error for {}: {err}", path.display()));
+                    shared
+                        .stop
+                        .set(anyhow!("metadata error for {}: {err}", path.display()));
                 }
                 return;
             }
@@ -524,7 +500,7 @@ fn walk_roots(
             found.finish(warnings, metrics)
         })
         .collect();
-    shared.into_result()?;
+    shared.stop.into_result()?;
     Ok(files)
 }
 

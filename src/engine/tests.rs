@@ -2131,6 +2131,8 @@ fn excluded_folders_are_never_walked() {
         paths,
         vec![downloads.join("movie.mkv"), media.join("Movies/movie.mkv")]
     );
+    // Each excluded folder counts once, whatever it holds.
+    assert_eq!(metrics.skipped_by_exclude, 2);
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
@@ -2442,11 +2444,12 @@ fn the_cache_vouches_only_for_rows_the_walk_would_plan_the_same() {
     let why = vouch(&downloads.join("a.mkv"), &media.join("b.mkv")).expect_err("different files");
     assert!(why.contains("no longer hash alike"), "{why}");
 
-    // The download becomes a link to the library file: already one file.
+    // The download becomes a link to a library file: only a walk can tell
+    // which, so the cache does not vouch for it.
     fs::remove_file(downloads.join("a.mkv")).expect("remove download");
     fs::hard_link(media.join("a.mkv"), downloads.join("a.mkv")).expect("hardlink");
-    let why = vouch(&downloads.join("a.mkv"), &media.join("a.mkv")).expect_err("changed");
-    assert!(why.contains("changed since it was hashed"), "{why}");
+    let why = vouch(&downloads.join("a.mkv"), &media.join("a.mkv")).expect_err("hardlinked");
+    assert!(why.contains("other hardlinks"), "{why}");
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

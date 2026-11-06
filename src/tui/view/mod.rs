@@ -1072,6 +1072,7 @@ mod tests {
             total_saved_bytes: 30,
             skipped_by_min_age: 0,
             skipped_by_min_size: 0,
+            skipped_by_exclude: 0,
             skipped_as_library_file: 0,
             dangling_symlinks: Vec::new(),
             warnings: crate::protocol::WarningSummary {
@@ -1129,6 +1130,7 @@ mod tests {
             total_saved_bytes: 20,
             skipped_by_min_age: 0,
             skipped_by_min_size: 0,
+            skipped_by_exclude: 0,
             skipped_as_library_file: 0,
             dangling_symlinks: Vec::new(),
             warnings: crate::protocol::WarningSummary {
@@ -1170,6 +1172,7 @@ mod tests {
             total_saved_bytes: 10,
             skipped_by_min_age: 0,
             skipped_by_min_size: 0,
+            skipped_by_exclude: 0,
             skipped_as_library_file: 0,
             dangling_symlinks: Vec::new(),
             warnings: crate::protocol::WarningSummary {

@@ -27,7 +27,7 @@ use report::{
     maybe_return_strict_errors, print_run_summary, print_space_summary, resolve_report_path,
     try_write_run_report,
 };
-use types::{LinkAction, RunMetrics, RunWarnings};
+use types::{Cache, LinkAction, RunMetrics, RunWarnings};
 
 use crate::config::{Config, cache_path};
 use crate::logger;
@@ -412,6 +412,21 @@ struct Planned {
     actions: Vec<LinkAction>,
 }
 
+/// The cache with its keys in this version's form, and how many keys were
+/// renamed from an earlier version's.
+fn load_keyed_cache(cache_path: &std::path::Path, roots: &Roots) -> (Cache, CacheKeys, usize) {
+    let mut cache = load_cache(cache_path);
+    let keys = CacheKeys::new(&roots.downloads.path, &roots.media.path);
+    let migrated = keys.migrate(&mut cache);
+    if migrated > 0 {
+        logger::info(
+            "cache",
+            format!("renamed {migrated} entries to keys relative to their folder"),
+        );
+    }
+    (cache, keys, migrated)
+}
+
 /// Plan a dashboard link of reviewed rows from the cache, without a walk,
 /// when the cache vouches for every row; None sends the run to the walk.
 fn plan_reviewed_rows(
@@ -420,9 +435,7 @@ fn plan_reviewed_rows(
     cache_path: &std::path::Path,
     filters: &reviewed::Filters<'_>,
 ) -> Result<Option<Planned>> {
-    let mut cache = load_cache(cache_path);
-    let keys = CacheKeys::new(&roots.downloads.path, &roots.media.path);
-    keys.migrate(&mut cache);
+    let (cache, keys, _) = load_keyed_cache(cache_path, roots);
     let checked = reviewed::plan_from_cache(
         options.only_pairs,
         &roots.downloads,
@@ -536,15 +549,7 @@ fn plan_by_walking(
         });
     }
 
-    let mut cache = load_cache(cache_path);
-    let keys = CacheKeys::new(&roots.downloads.path, &roots.media.path);
-    let migrated = keys.migrate(&mut cache);
-    if migrated > 0 {
-        logger::info(
-            "cache",
-            format!("renamed {migrated} entries to keys relative to their folder"),
-        );
-    }
+    let (mut cache, keys, migrated) = load_keyed_cache(cache_path, roots);
 
     let seen_paths: HashSet<String> = files
         .iter()
@@ -635,7 +640,12 @@ fn build_pool(kind: &str, threads: usize) -> Result<rayon::ThreadPool> {
             move |index| format!("dejaview-{kind}-{index}")
         })
         .build()
-        .map_err(|err| anyhow!("cannot start {threads} {kind} worker thread(s): {err}"))
+        .map_err(|err| {
+            anyhow!(
+                "cannot start {threads} {kind} worker thread(s): {err}; lower the count with `dejaview config {}`",
+                if kind == "full" { "set-full-threads" } else { "set-threads" }
+            )
+        })
 }
 
 /// A download that is a library file seen through a second mount means the

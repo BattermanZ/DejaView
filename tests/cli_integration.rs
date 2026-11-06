@@ -1380,12 +1380,113 @@ fn a_walk_paces_its_progress_events() {
         file_events < 200,
         "2000 files found, {file_events} file events: one per 100 ms at most"
     );
-    let last_count = events
+    // The walk's own last count, before hashing starts; the planning count
+    // later carries the same number and must not stand in for it.
+    let walk_ends = events
+        .iter()
+        .position(|e| e["type"] == "phase" && e["phase"] == "hashing_sample")
+        .expect("the walk ends");
+    let last_count = events[..walk_ends]
         .iter()
         .rev()
         .find_map(|e| e["files_seen"].as_u64())
-        .expect("a count event");
+        .expect("a count event from the walk");
     assert_eq!(last_count, 2000, "the final count is never paced away");
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_reviewed_download_hardlinked_into_the_library_since_the_scan_is_left_alone() {
+    let root = unique_temp_dir("plan_hardlinked_since");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let download = downloads.join("movie.mkv");
+    write_seeded(&download, 5000, 1);
+    write_seeded(&media.join("A/movie.mkv"), 5000, 1);
+    // Another copy, so later scans read the group again.
+    write_seeded(&downloads.join("copy/movie.mkv"), 5000, 1);
+    configure_small_files(&root, &downloads, &media);
+    events_of(&root, &["scan"]);
+
+    // Sonarr imports the download by hardlinking it into the library, and a
+    // scan from cron refreshes the download's cache entry.
+    fs::create_dir_all(media.join("B")).expect("create B");
+    fs::hard_link(&download, media.join("B/movie.mkv")).expect("hardlink into library");
+    events_of(&root, &["scan"]);
+
+    let plan = root.join("plan.json");
+    fs::write(
+        &plan,
+        serde_json::to_vec(&serde_json::json!([
+            {"source": download, "target": media.join("A/movie.mkv")},
+        ]))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+    let link = events_of(&root, &["link", "--plan", plan.to_str().expect("plan str")]);
+    assert!(
+        walked(&link),
+        "a download with other hardlinks is checked by the walk: {link:?}"
+    );
+    let ino = |path: PathBuf| fs::metadata(path).expect("metadata").ino();
+    assert_eq!(
+        ino(download.clone()),
+        ino(media.join("B/movie.mkv")),
+        "the hardlink Sonarr made is kept"
+    );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_run_under_nohup_keeps_running_when_the_terminal_hangs_up() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let root = unique_temp_dir("nohup");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    fs::create_dir_all(&downloads).expect("create downloads");
+    fs::create_dir_all(&media).expect("create media");
+    for path in [media.join("big.mkv"), downloads.join("big.mkv")] {
+        let file = fs::File::create(&path).expect("create sparse file");
+        file.set_len(1 << 30).expect("size sparse file");
+    }
+    configure_small_files(&root, &downloads, &media);
+
+    // nohup ignores SIGHUP and then runs DejaView in its own place.
+    let mut child = Command::new("nohup")
+        .arg(env!("CARGO_BIN_EXE_dejaview"))
+        .args(["scan", "--tui-events", "--no-progress"])
+        .env("XDG_CONFIG_HOME", root.join("xdg"))
+        .env("HOME", root.join("home"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start scan under nohup");
+    let mut events = Vec::new();
+    for line in BufReader::new(child.stdout.take().expect("stdout")).lines() {
+        let event: serde_json::Value =
+            serde_json::from_str(&line.expect("read event")).expect("parse event");
+        if event["type"] == "phase" && event["phase"] == "hashing_full" {
+            let status = Command::new("kill")
+                .args(["-HUP", &child.id().to_string()])
+                .status()
+                .expect("send SIGHUP");
+            assert!(status.success());
+        }
+        events.push(event);
+    }
+    let out = child.wait_with_output().expect("wait for scan");
+
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(events.last().expect("events")["type"], "done");
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

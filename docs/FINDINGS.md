@@ -172,13 +172,13 @@ Measured by the reviewer on a 93,730-file library shaped like a Jellyfin/Kodi li
 - Where: `main.rs:321-327` (cancel token wired only for `--tui-events`), `mod.rs:146-174` (cache saved once, after hashing).
 - A first run over copied pairs can take hours on a NAS; any interruption restarts from zero.
 - Fix: catch SIGINT/SIGTERM and call `CancelToken::cancel` (with `ctrlc`, decision 3); also save the cache periodically during the full pass (every few minutes or N GB).
-- Done: `ctrlc` with `termination` turns SIGINT, SIGTERM and SIGHUP during a scan or link into a cancel, so the run stops before its next file or chunk, saves its hashes and exits 1 saying so; a second signal exits 130 at once. Each finished hash goes into the cache as it lands and the cache is saved every five minutes while hashing. A link run stopped this way still exits 0 after its report, as a dashboard cancel did; exit code 2 stays with C3.
+- Done: `ctrlc` with `termination` turns SIGINT, SIGTERM and SIGHUP during a scan or link into a cancel, so the run stops before its next file or chunk, saves its hashes and exits 1 saying so; a second signal exits 130 at once. A process that already ignores one of them, as under `nohup`, keeps all three as given. Each finished hash goes into the cache as it lands and the cache is saved every five minutes while hashing. A link run stopped this way still exits 0 after its report, as a dashboard cancel did; exit code 2 stays with C3.
 
 **P6. Done. Medium. TUI single-row link and link-all repeat the whole walk.** **[reproduced]**
 - Where: `src/tui/actions.rs:127-148`, `src/engine/mod.rs:99-145`.
 - Real mergerfs: `link --only-source <row>` took 6.67 s, of which 6.29 s walking; about 65 s per row in the sim.
 - Fix (medium): pass the planned pair and both snapshots to the child, check both against the cache (the scan full-hashed both) and the existing pre-link checks, fall back to today's path otherwise. Do the same for L with the planned list (ties in with S5).
-- Done: `link --plan`, which `l` and `L` run, plans from the cache when it vouches for every reviewed row: both files where the walk would find and take them, unchanged since their full hashes were cached, hashing alike and not already one file, with every folder up to each root checked against the other root's device and inode as the walk does. Then neither folder is walked. Any row it cannot vouch for sends the whole run to the walk, and the log says why. The snapshots come from the cache and a fresh `stat` rather than from the plan file, so the plan format is unchanged.
+- Done: `link --plan`, which `l` and `L` run, plans from the cache when it vouches for every reviewed row: both files where the walk would find and take them, unchanged since their full hashes were cached, hashing alike and not already one file, the download with no other hardlinks (a later scan may have refreshed the entry of a download Sonarr hardlinked into the library since), with every folder up to each root checked against the other root's device and inode as the walk does. Then neither folder is walked. Any row it cannot vouch for sends the whole run to the walk, and the log says why. The snapshots come from the cache and a fresh `stat` rather than from the plan file, so the plan format is unchanged.
 
 **P7. Done. Low-Medium. Cache rewritten and fsynced every run; absolute-path keys.** **[reproduced]**
 - Where: `mod.rs:174`, `cache.rs:14-34`, `fsutil.rs:15-46`.
@@ -191,7 +191,7 @@ Measured by the reviewer on a 93,730-file library shaped like a Jellyfin/Kodi li
 - Groups with no download member, or no media member, are quick-hashed every run (20 unrelated same-size library files: 20 reads per run, never cached).
 - NAS housekeeping folders (`@eaDir`, `#recycle`, `.Trash-*`) are walked and hashed; `#recycle` sorts first by bytes, so a recycle-bin copy can become the link target.
 - Fix: drop groups lacking either side before hashing (tiny); add `exclude` glob lists per root with sensible defaults, applied with `filter_entry` so excluded trees are never read (small).
-- Done: a size group is not read when it lacks a download or a library file, or when every download in it already is a library file. An `exclude` list of name globs (`*`, `?`), by default the folders a NAS or an OS keeps for itself, is applied as the walk meets each name, so an excluded tree is never read; `config set-exclude` sets it and `config validate` walks the same way. One list covers both roots rather than one per root, since the folders it is for appear in both.
+- Done: a size group is not read when it lacks a download or a library file, or when every download in it already is a library file. An `exclude` list of name globs (`*`, `?`), by default the folders a NAS or an OS keeps for itself, is applied as the walk meets each name, so an excluded tree is never read; the report counts what it left out in `skipped_by_exclude` and the log names each. `config set-exclude` sets it and `config validate` walks the same way. One list covers both roots rather than one per root, since the folders it is for appear in both.
 
 **P9. Done. Low-Medium. Read path.** **[reproduced]**
 - Where: `hashing.rs:26-55, 86-99`.
@@ -205,7 +205,7 @@ Measured by the reviewer on a 93,730-file library shaped like a Jellyfin/Kodi li
 - Done: each pair takes one lstat of the download and one of the library file for every check, the media root is resolved once per run, and each log line is written with one `write_all`. The temp name's lstat after the rename stays, since C5 relies on it to find a pair that already was one file.
 
 **P11. Done. Low.** TUI event stream: 201k NDJSON lines (33.5 MB) for 93.7k files, one flush per event; it keeps up but costs 0.1-0.3 s locally. Throttle File/Count events to about every 100 ms and buffer stdout. Memory: about 0.7 KB per file (91 MB peak at 94k files); store `seen_paths` as 64-bit hashes and the hash as `[u8; 32]` if it matters.
-- Done: `file` and `count` events from the walk and the hashing go at most once per 100 ms across all workers; the count that ends a phase always goes. stdout stays line-buffered with a flush per event, since what is left is a few lines a second. The memory points are not done.
+- Done: `file` and `count` events from the walk and the hashing go at most once per 100 ms across all workers; the count that ends a phase always goes. stdout stays line-buffered with a flush per event: what is left is a few lines a second plus two `worker_activity` events per hashed file, which under the 1 MiB floor are few. The memory points are not done.
 
 ### TUI and CLI usability
 
@@ -264,7 +264,7 @@ All reproduced by rendering the TUI in a pty with pyte at 60x20, 80x24, 100x30, 
 - Done in `just test`, which reruns the unit tests as `nobody` under root. A bare `cargo test` as root still reports the five as `ok`.
 - TUI tests `starting_run_clears_stale_report_rows` and `rescan_clears_cache_then_starts_scan` really spawn the test binary with `scan --tui-events --no-progress`. Inject the job spawner into App so tests never spawn a process.
 - Done with P7: a cache that cannot be read or parsed is logged as a warning before DejaView starts with an empty one.
-- Untested: cross-device symlink fallback end to end (CI can use `/dev/shm` when its device differs from temp_dir), corrupt cache (today silently replaced by an empty one at `cache.rs:18` with no log line; `cache info` shows 0 and a multi-TB library is rehashed without explanation; log a warning), concurrent runs, partial-failure and cancel reports, the TUI strict path (U5). `run_scan_respects_min_age_filter` has no positive control.
+- Untested: cross-device symlink fallback end to end (CI can use `/dev/shm` when its device differs from temp_dir), corrupt cache (now logged as a warning, but no test drives it), concurrent runs, partial-failure and cancel reports, the TUI strict path (U5). `run_scan_respects_min_age_filter` has no positive control.
 - Line coverage is 75.6%.
 
 **M5. Medium. One definition of "same physical file".** The (size, mtime_ns, ctime_ns, dev, inode) tuple lives in FileInfo, FileSnapshot and CacheEntry, with two metadata-to-nanoseconds conversions and two comparison functions (`collect.rs:79-91`, `linking.rs:76-101`, `hashing.rs:147-153`, `types.rs`). Add `FileSnapshot::from_metadata`, embed FileSnapshot in FileInfo and in CacheEntry with `#[serde(flatten)]` (cache JSON unchanged), keep `matches_source`/`matches_target` as the only comparisons.

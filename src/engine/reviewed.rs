@@ -7,6 +7,7 @@
 
 use anyhow::Result;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -125,6 +126,13 @@ fn vouch_for_file(
     if !meta.file_type().is_file() {
         return not("is not a regular file");
     }
+    // A cache entry shows the file is unchanged since some run hashed it, not
+    // since the scan that showed the row. Sonarr or Radarr may have
+    // hardlinked the download into the library in between, and a later scan
+    // refreshed its entry; only the walk sees every library file it might be.
+    if in_downloads && meta.nlink() > 1 {
+        return not("has other hardlinks, which only a walk can tell apart");
+    }
     if meta.len() < filters.min_size.max(1) {
         return not("is under the size floor");
     }
@@ -135,14 +143,7 @@ fn vouch_for_file(
     let Some(entry) = cache.get(&keys.key(path, in_downloads)) else {
         return not("has no cache entry");
     };
-    let unchanged = FileSnapshot {
-        size: entry.size,
-        mtime_ns: entry.mtime_ns,
-        ctime_ns: entry.ctime_ns,
-        dev: entry.dev,
-        inode: entry.inode,
-    } == snapshot;
-    if !unchanged {
+    if entry.snapshot() != snapshot {
         return not("changed since it was hashed");
     }
     match &entry.hash {

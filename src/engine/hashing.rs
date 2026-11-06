@@ -10,12 +10,12 @@ use std::collections::hash_map::Entry;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::cache::CacheKeys;
-use super::cancel::{CancelToken, Cancelled};
-use super::linking::plan_hashed_group_actions;
+use super::cancel::{CancelToken, Cancelled, FirstError};
+use super::linking::{plan_hashed_group_actions, snapshot_from_file_info};
 use super::report::build_report_entries;
 use super::types::{Cache, CacheEntry, FileInfo, LinkMode, RunWarnings};
 use super::types::{emit_tui_event, progress_due};
@@ -143,10 +143,12 @@ pub(super) fn full_digest(path: &Path, cancel: &CancelToken) -> Result<String> {
         loop {
             cancel.check()?;
             let n = read_up_to(&mut file, buf)?;
-            if n == 0 {
+            hasher.update(&buf[..n]);
+            // read_up_to stops short only at end of file: no read is spent
+            // asking again.
+            if n < buf.len() {
                 return Ok(());
             }
-            hasher.update(&buf[..n]);
         }
     })?;
     Ok(hasher.finalize().to_hex().to_string())
@@ -259,11 +261,7 @@ fn split_by_inode(group: &[FileInfo]) -> Vec<Vec<usize>> {
 }
 
 fn cache_entry_matches(entry: &CacheEntry, file: &FileInfo) -> bool {
-    entry.size == file.size
-        && entry.mtime_ns == file.mtime_ns
-        && entry.ctime_ns == file.ctime_ns
-        && entry.dev == file.dev
-        && entry.inode == file.inode
+    entry.snapshot() == snapshot_from_file_info(file)
 }
 
 /// The full and quick hashes the cache holds for a physical file, from any of
@@ -459,48 +457,6 @@ fn emit_planned_entries(group: &[FileInfo], options: &HashOptions<'_>) {
     }
 }
 
-/// The first error that stops a hashing phase (a strict failure or a cancel),
-/// shared by its workers so the others stop before their next file.
-#[derive(Default)]
-struct Stop {
-    stopped: AtomicBool,
-    error: Mutex<Option<anyhow::Error>>,
-}
-
-impl Stop {
-    fn is_set(&self) -> bool {
-        self.stopped.load(Ordering::Relaxed)
-    }
-
-    fn set(&self, err: anyhow::Error) {
-        self.stopped.store(true, Ordering::Relaxed);
-        if let Ok(mut slot) = self.error.lock()
-            && slot.is_none()
-        {
-            *slot = Some(err);
-        }
-    }
-
-    /// Whether a worker may start its next file.
-    fn may_continue(&self, cancel: &CancelToken) -> bool {
-        if self.is_set() {
-            return false;
-        }
-        if let Err(cancelled) = cancel.check() {
-            self.set(cancelled.into());
-            return false;
-        }
-        true
-    }
-
-    fn into_result(self) -> Result<()> {
-        match self.error.into_inner() {
-            Ok(Some(err)) => Err(err),
-            _ => Ok(()),
-        }
-    }
-}
-
 /// What hashing did: how many cache entries it wrote, and whether it
 /// finished. The entries are written either way.
 pub(super) struct Hashed {
@@ -563,7 +519,7 @@ pub(super) fn hash_groups_and_update_cache(
     let full_hash_errors = AtomicU64::new(0);
     let sample_done = AtomicU64::new(0);
     let full_done = AtomicU64::new(0);
-    let stop = Stop::default();
+    let stop = FirstError::default();
     let live = LiveCache::new(cache, options.keys, &options.checkpoint);
 
     // Phase 1: the quick hash of each physical file that has none yet. Work is
@@ -582,7 +538,7 @@ pub(super) fn hash_groups_and_update_cache(
                 .enumerate()
                 .filter(|(_, file)| file.sample.is_none())
                 .filter_map(|(idx, physical)| {
-                    if !stop.may_continue(options.cancel) {
+                    if stop.should_stop(options.cancel) {
                         return None;
                     }
                     let worker = worker_id();
@@ -676,7 +632,7 @@ pub(super) fn hash_groups_and_update_cache(
                 let hashed: Vec<(usize, String)> = candidates
                     .par_iter()
                     .filter_map(|&idx| {
-                        if !stop.may_continue(options.cancel) {
+                        if stop.should_stop(options.cancel) {
                             return None;
                         }
                         let worker = worker_id();

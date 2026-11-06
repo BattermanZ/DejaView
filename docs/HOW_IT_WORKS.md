@@ -72,18 +72,21 @@ flowchart TD
 flowchart TD
     A[Load config] --> B{downloads/media set, valid and not overlapping?}
     B -- no --> X[Stop with actionable error]
-    B -- yes --> C[Collect files from downloads + media]
-    C --> D[Skip symlinks, .dejaview_ files, files under min_size and files younger than min_age]
+    B -- yes --> RV{link --plan from the dashboard, and the cache vouches for every row?}
+    RV -- yes --> M2[Plan the reviewed rows from the cache, walking neither folder]
+    M2 --> N
+    RV -- no --> C[Walk downloads + media at once, many folders in parallel]
+    C --> D[Leave out names on the exclude list, symlinks, .dejaview_ files, files under min_size and files younger than min_age]
     D --> E[Group by size]
     E --> F[Within a group, paths of one physical file count once]
-    F --> G{More than one physical file?}
+    F --> G{A download that is not a library file, and a library file?}
     G -- no --> SKIP[Skip group: nothing to read]
-    G -- yes --> H{Every physical file cached?}
+    G -- yes --> H{Every physical file's full hash cached?}
     H -- yes --> K[Use cached hashes]
-    H -- no --> I[Sample hash pass]
-    I --> J[Full hash pass for colliding samples]
+    H -- no --> I[Quick hash of each file not cached; a file of 1 MiB or less is read whole, so this is its full hash]
+    I --> J[Full hash of files whose quick hashes collide]
     J --> K
-    K --> L[Save cache, drop entries for paths not seen]
+    K --> L[Drop entries for paths not seen; save the cache if anything changed]
     L --> M[Build duplicate actions]
     M --> N{Mode?}
     N -- scan --> O[Show/emit plan only]
@@ -93,7 +96,7 @@ flowchart TD
     O --> R
 ```
 
-A run started from the TUI can be cancelled at any point. During collecting and hashing it stops almost at once, even partway through a large file, and still saves the hashes it finished. During the apply step it stops before the next file.
+A run started from the TUI can be cancelled at any point, and a run from the command line stops the same way on Ctrl+C or SIGTERM. During collecting and hashing it stops almost at once, even partway through a large file, and still saves the hashes it finished; while hashing it also saves the cache every five minutes. During the apply step it stops before the next file.
 
 ## 4) Link Method Decision
 

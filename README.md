@@ -29,7 +29,7 @@ There is also a terminal dashboard, `dejaview tui`, for scanning, reviewing and 
 
 - **Matching by content.** Files are grouped by size, then compared with BLAKE3 hashes: a quick hash of the first and last MiB, and a full hash only when quick hashes collide. Names and folders play no part.
 - **Hardlink first.** On the same filesystem the download becomes a hardlink and the space comes back. Across filesystems, or if the hardlink fails, DejaView falls back to a relative symlink and records why in the report.
-- **Cheap repeat runs.** A cache in the downloads folder remembers what each file hashed to, quick hashes included, so a repeat run reads only the files that are new or changed since the last one. Hardlinked paths are read once, and files of a size no download shares with a library file are not read at all.
+- **Cheap repeat runs.** A cache in the downloads folder remembers what each file hashed to, quick hashes included, so a repeat run reads only what it has not hashed before: files that are new or changed since the last run, and library files the first time a download of their size turns up. Hardlinked paths are read once, and files of a size no download shares with a library file are not read at all.
 - **Dry run by default.** `scan` only shows the plan. `link` changes files, and `link --confirm` asks first.
 - **Reports.** `--json` prints a run summary for scripts, and every `link` run writes a JSON report of what it changed.
 - **Terminal dashboard.** Live progress per hashing thread, link one row or all of them, and cancel a running scan or link with `c`.
@@ -132,9 +132,9 @@ For a cron job, give the binary's absolute path (cron's `PATH` is short), drop s
 
 The line keeps what DejaView writes to stderr, which is warnings and errors, and prints it unless the run exited with 3; cron mails whatever is printed.
 
-Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder. A run that finds another one going does nothing and exits with code 3, so a cron run that overlaps a long first run, or a run from the dashboard, skips its turn. Exit code 0 means the run finished, and 1 that it could not start or stopped on an error (with `--strict`, on the first failure) or on request.
+Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder. A run that finds another one going does nothing and exits with code 3, so a cron run that overlaps a long first run, or a run from the dashboard, skips its turn. Exit code 0 means the run finished, and 1 that it could not start or stopped on an error (with `--strict`, on the first failure), or was stopped on request before it linked anything.
 
-Ctrl+C, SIGTERM (a cron timeout, `docker stop`) or SIGHUP stops a scan or link before its next file, or partway through a large one, keeps every hash already finished in the cache and changes nothing more; a second Ctrl+C stops at once. While hashing, the cache is also saved every five minutes, so even a run killed outright loses at most that much work. A link run stopped this way keeps the files it already linked and writes its report.
+Ctrl+C, SIGTERM (a cron timeout, `docker stop`) or SIGHUP stops a scan or link before its next file, or partway through a large one, keeps every hash already finished in the cache and changes nothing more; a second Ctrl+C stops at once. While hashing, the cache is also saved every five minutes, so even a run killed outright loses at most that much work. A link run stopped this way while linking keeps the files it already linked, writes its report and exits 0; the report shows which pairs stayed planned. A run started under `nohup`, or with any of those signals ignored, keeps every signal as it was given.
 
 ### Terminal dashboard
 
@@ -161,7 +161,7 @@ Add `--strict` to run the dashboard's scans and links in strict mode.
 
 Cancelling a scan stops it almost at once, even partway through a large file, and keeps every hash already finished in the cache, so the next scan picks up where it stopped. Cancelling a link stops before the next file: files already linked stay linked and the rest stay planned. Quitting is blocked while a run is active, so cancel first.
 
-`l` and `L` link only rows you have seen: each row's download, to the library file the row shows. A duplicate that appeared since the scan is left for the next one, and so is a row whose files changed in between. `L` stays off until a scan has finished with planned rows. When neither file of any row has changed since the scan hashed it, linking checks the rows against the cache with two `stat` calls each and walks neither folder. Otherwise it walks both folders again to re-check the rows, and only hashes files of the same size as them.
+`l` and `L` link only rows you have seen: each row's download, to the library file the row shows. A duplicate that appeared since the scan is left for the next one, and so is a row whose files changed in between. `L` stays off until a scan has finished with planned rows. When neither file of any row has changed since the scan hashed it, and no download in them has other hardlinks, linking checks the rows against the cache and a `stat` of each file and of its folders, and walks neither folder. Otherwise it walks both folders again to re-check the rows, and only hashes files of the same size as them.
 
 ## Configuration
 

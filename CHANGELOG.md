@@ -16,7 +16,7 @@
 ### Added
 
 - `dejaview config set-full-threads N` sets how many files are read in full at once.
-- `dejaview config set-exclude [PATTERN]...` sets the file and folder names every walk leaves out, as globs, with everything under them.
+- `dejaview config set-exclude [PATTERN]...` sets the file and folder names every walk leaves out, as globs, with everything under them. The report counts what the list left out in `skipped_by_exclude`, the summary says how many, and the log names each.
 - `DEJAVIEW_CONFIG` sets the config file's path and `DEJAVIEW_LOG` the log's, or `-` for stderr, for containers and services run as a user with no home folder. [#3]
 - `dejaview config validate` tries one real hardlink from the library into downloads and says whether link runs will make hardlinks, and if not, why: different filesystems or mounts, or ownership and `fs.protected_hardlinks`. [#3]
 - Scans and links list symlinks in downloads that point into the library and no longer resolve, on stderr and in the report's `dangling_symlinks`. [#3]
@@ -26,8 +26,9 @@
 ### Changed
 
 - A scan or link run from the dashboard reports which file it is on and how many it has found or hashed up to ten times a second, instead of once for every file, which on a large library sent the dashboard hundreds of thousands of updates.
-- Hashing and linking make fewer round trips to a network drive: a quick hash reads exactly the bytes it hashes, where it spent one more read finding the end of each file; a full hash reads 8 MiB at a time instead of 1 MiB; and each link looks up the library file once instead of four times.
-- In the dashboard, `l` and `L` link the reviewed rows without walking both folders again when neither file of any row has changed since the scan hashed it; a row that changed sends the run back to the walk, which checks every row as before. Before, every link from the dashboard walked both folders first, which takes minutes on a network drive.
+- Hashing makes fewer round trips to a network drive: a quick hash reads exactly the bytes it hashes, where it spent one more read finding the end of each file, and a full hash reads 8 MiB at a time instead of 1 MiB.
+- Linking makes fewer round trips to a network drive: each link looks up the library file once, where it looked it up four times, and the download once instead of twice.
+- In the dashboard, `l` and `L` link the reviewed rows without walking both folders again when neither file of any row has changed since the scan hashed it; a row that changed sends the run back to the walk, which checks every row as before, and so does a download that has other hardlinks. Such a run's report counts only the rows' files in `files_considered`. Before, every link from the dashboard walked both folders first, which takes minutes on a network drive.
 - The same share mounted at two paths, such as in a Docker cron job and on the host the dashboard runs on, now uses one set of cache entries. Before, each run pruned the other's entries as gone and the next one hashed them again.
 - A run that learns nothing new leaves the cache file as it is. Before, every run rewrote and flushed it, tens of megabytes on a large library.
 - Downloads and media are walked at once, many folders in parallel, so a run on a network drive no longer waits on one `stat` after another before hashing starts.
@@ -36,7 +37,7 @@
 
 ### Fixed
 
-- Ctrl+C, SIGTERM (a cron timeout, `docker stop`) or SIGHUP stops a scan or link before its next file and keeps the hashes it finished; a second Ctrl+C stops at once. Before, it ended the process on the spot and every hash of the run was lost, so a first run over a network drive that was interrupted started over from nothing. While hashing, the cache is also saved every five minutes.
+- Ctrl+C, SIGTERM (a cron timeout, `docker stop`) or SIGHUP stops a scan or link before its next file and keeps the hashes it finished; a second Ctrl+C stops at once. Before, it ended the process on the spot and every hash of the run was lost, so a first run over a network drive that was interrupted started over from nothing. While hashing, the cache is also saved every five minutes. A run started under `nohup` still ignores hang-ups.
 - A cache file that cannot be read or parsed is named in the log with the reason before DejaView starts over with an empty one. Before, it was replaced silently, and the next run hashed the whole library again with no explanation.
 - The dashboard's Run Log shows its newest lines, and the activity line says how the last run ended. Before, the log stayed on its first few lines, so "Scan finished", a failed link and the reason for it (such as another run holding the lock) showed nowhere. The link confirmations show `y link` and `n cancel` on their border, so a small terminal no longer cuts the prompt off. [#3]
 - Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder. Before, two link runs failed each other's pairs, the later one overwrote the other's report and cache, and `cache cleanup-temp` could delete a link another run was about to rename into place. [#3]

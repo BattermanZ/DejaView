@@ -422,13 +422,18 @@ fn command_name(command: &Commands) -> &'static str {
 /// `docker stop`) and SIGHUP cancel it: the run stops before its next file,
 /// or between chunks of a large one, saves the hashes it has finished and
 /// changes nothing more. A second signal ends the process at once, for a run
-/// stuck on a read from a mount that stopped answering. A run driven by the
-/// TUI is also cancelled by a `cancel` line on stdin; any other run ignores
-/// stdin.
+/// stuck on a read from a mount that stopped answering.
+///
+/// A process told to ignore one of those signals, as `nohup` ignores SIGHUP,
+/// keeps every signal as it was given: catching SIGHUP there would stop a run
+/// its user meant to outlive the terminal. A run driven by the TUI is also
+/// cancelled by a `cancel` line on stdin; any other run ignores stdin.
 fn run_cancel_token(tui_events: bool) -> engine::CancelToken {
     let token = engine::CancelToken::default();
     let on_signal = token.clone();
-    let handled = ctrlc::set_handler(move || {
+    // try_set_handler refuses, and restores all three, when any of them is
+    // not at its default.
+    let handled = ctrlc::try_set_handler(move || {
         if on_signal.is_cancelled() {
             // The conventional status of a process ended by SIGINT.
             std::process::exit(130);
@@ -441,13 +446,18 @@ fn run_cancel_token(tui_events: bool) -> engine::CancelToken {
             "⚠".yellow()
         );
     });
-    if let Err(err) = handled {
-        logger::warn(
+    match handled {
+        Ok(()) => {}
+        Err(ctrlc::Error::MultipleHandlers) => logger::info(
+            "run",
+            "SIGINT, SIGTERM or SIGHUP is already ignored or handled, as under nohup; leaving signals as they were given, so a run stopped by one loses the hashes it has not saved",
+        ),
+        Err(err) => logger::warn(
             "run",
             format!(
                 "cannot catch Ctrl+C or SIGTERM ({err}); stopping a run that way loses the hashes it has not saved"
             ),
-        );
+        ),
     }
     if tui_events {
         token.watch(std::io::stdin());
@@ -468,9 +478,12 @@ fn read_plan(path: &std::path::Path) -> Result<Vec<(PathBuf, PathBuf)>> {
             path.display()
         ));
     }
+    // A row given twice is linked once: the second would fail as changed.
+    let mut seen = std::collections::HashSet::new();
     Ok(pairs
         .into_iter()
         .map(|pair| (PathBuf::from(pair.source), PathBuf::from(pair.target)))
+        .filter(|pair| seen.insert(pair.clone()))
         .collect())
 }
 
@@ -771,6 +784,27 @@ mod tests {
         for pattern in config::DEFAULT_EXCLUDE {
             assert!(help.contains(pattern), "{pattern} missing from {help}");
         }
+    }
+
+    #[test]
+    fn a_plan_row_given_twice_is_read_once() {
+        let root = unique_temp_dir("plan_twice");
+        fs::create_dir_all(&root).expect("create root");
+        let plan = root.join("plan.json");
+        fs::write(
+            &plan,
+            br#"[{"source":"/dl/a","target":"/m/a"},{"source":"/dl/a","target":"/m/a"},{"source":"/dl/b","target":"/m/a"}]"#,
+        )
+        .expect("write plan");
+        let pairs = read_plan(&plan).expect("read plan");
+        assert_eq!(
+            pairs,
+            vec![
+                (PathBuf::from("/dl/a"), PathBuf::from("/m/a")),
+                (PathBuf::from("/dl/b"), PathBuf::from("/m/a")),
+            ]
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
