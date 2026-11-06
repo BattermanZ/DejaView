@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use super::cache::CacheKeys;
 use super::cancel::{CancelToken, Cancelled};
 use super::linking::plan_hashed_group_actions;
 use super::report::build_report_entries;
@@ -141,6 +142,7 @@ pub(super) struct HashOptions<'a> {
     /// Full reads are limited by the drive's bandwidth and quick ones by its
     /// latency, so each kind gets its own number of workers.
     pub(super) full_pool: &'a rayon::ThreadPool,
+    pub(super) keys: &'a CacheKeys,
 }
 
 /// One physical file in a size group: every path of it, and what is known of
@@ -233,10 +235,6 @@ fn split_by_inode(group: &[FileInfo]) -> Vec<Vec<usize>> {
     inodes
 }
 
-fn cache_key(file: &FileInfo) -> String {
-    super::cache::cache_key(&file.path)
-}
-
 fn cache_entry_matches(entry: &CacheEntry, file: &FileInfo) -> bool {
     entry.size == file.size
         && entry.mtime_ns == file.mtime_ns
@@ -249,6 +247,7 @@ fn cache_entry_matches(entry: &CacheEntry, file: &FileInfo) -> bool {
 /// its paths whose entry is still valid.
 fn cached_hashes(
     cache: &Cache,
+    keys: &CacheKeys,
     group: &[FileInfo],
     members: &[usize],
 ) -> (Option<String>, Option<String>) {
@@ -256,7 +255,7 @@ fn cached_hashes(
     for &idx in members {
         let file = &group[idx];
         if let Some(entry) = cache
-            .get(&cache_key(file))
+            .get(&keys.key(&file.path, file.in_downloads))
             .filter(|entry| cache_entry_matches(entry, file))
         {
             full = full.or_else(|| entry.hash.clone());
@@ -269,7 +268,7 @@ fn cached_hashes(
 /// None when the group cannot produce an action, so nothing in it is read: it
 /// lacks a download or a library file, every path is one physical file, or
 /// every download already is a library file.
-fn plan_group_work(group: &[FileInfo], cache: &Cache) -> Option<GroupWork> {
+fn plan_group_work(group: &[FileInfo], cache: &Cache, keys: &CacheKeys) -> Option<GroupWork> {
     if !group.iter().any(|file| !file.in_downloads) {
         return None;
     }
@@ -285,7 +284,7 @@ fn plan_group_work(group: &[FileInfo], cache: &Cache) -> Option<GroupWork> {
     let files = inodes
         .into_iter()
         .map(|members| {
-            let (mut full, mut sample) = cached_hashes(cache, group, &members);
+            let (mut full, mut sample) = cached_hashes(cache, keys, group, &members);
             if small {
                 full = full.or(sample);
                 sample = full.clone();
@@ -304,13 +303,13 @@ fn plan_group_work(group: &[FileInfo], cache: &Cache) -> Option<GroupWork> {
 /// whose entry is missing, stale or knows less, so every path of a hardlinked
 /// file is served from cache next run, not only the path that was read.
 /// Returns how many entries were written.
-fn sync_cache(cache: &mut Cache, groups: &[Vec<FileInfo>]) -> usize {
+fn sync_cache(cache: &mut Cache, keys: &CacheKeys, groups: &[Vec<FileInfo>]) -> usize {
     let mut written = 0;
     for file in groups.iter().flatten() {
         if file.hash.is_none() && file.sample.is_none() {
             continue;
         }
-        let key = cache_key(file);
+        let key = keys.key(&file.path, file.in_downloads);
         let valid = cache
             .get(&key)
             .filter(|entry| cache_entry_matches(entry, file));
@@ -393,17 +392,24 @@ impl Stop {
     }
 }
 
+/// What hashing did: how many cache entries it wrote, and whether it
+/// finished. The entries are written either way.
+pub(super) struct Hashed {
+    pub(super) cache_writes: usize,
+    pub(super) result: Result<()>,
+}
+
 pub(super) fn hash_groups_and_update_cache(
     groups: &mut [Vec<FileInfo>],
     cache: &mut Cache,
     options: &HashOptions<'_>,
     warnings: &mut RunWarnings,
-) -> Result<()> {
+) -> Hashed {
     let strict = options.strict;
     let tui_events = options.tui_events;
     let mut works: Vec<Option<GroupWork>> = groups
         .iter()
-        .map(|group| plan_group_work(group, cache))
+        .map(|group| plan_group_work(group, cache, options.keys))
         .collect();
 
     // Groups whose every physical file has a cached full hash need no reads.
@@ -599,7 +605,7 @@ pub(super) fn hash_groups_and_update_cache(
     });
 
     // Hashes finished before a cancel or a strict failure are still valid.
-    sync_cache(cache, groups);
+    let cache_writes = sync_cache(cache, options.keys, groups);
 
     warnings.sample_hash_errors += sample_hash_errors.load(Ordering::Relaxed);
     warnings.full_hash_errors += full_hash_errors.load(Ordering::Relaxed);
@@ -607,7 +613,10 @@ pub(super) fn hash_groups_and_update_cache(
         bar.finish_with_message("Hashing complete ✔".green().bold().to_string());
     }
 
-    stop.into_result()
+    Hashed {
+        cache_writes,
+        result: stop.into_result(),
+    }
 }
 
 #[cfg(test)]
@@ -647,6 +656,14 @@ mod tests {
             hash: hash.map(str::to_string),
             sample: sample.map(str::to_string),
         }
+    }
+
+    fn keys() -> CacheKeys {
+        CacheKeys::new(Path::new("/dl"), Path::new("/media"))
+    }
+
+    fn key(file: &FileInfo) -> String {
+        keys().key(&file.path, file.in_downloads)
     }
 
     fn members(work: &GroupWork) -> Vec<Vec<usize>> {
@@ -726,19 +743,19 @@ mod tests {
     #[test]
     fn group_of_one_physical_file_needs_no_work() {
         let group = vec![file("/dl/a", 1, 7, 0), file("/media/a", 1, 7, 0)];
-        assert!(plan_group_work(&group, &Cache::new()).is_none());
+        assert!(plan_group_work(&group, &Cache::new(), &keys()).is_none());
     }
 
     #[test]
     fn group_without_a_library_file_is_not_read() {
         let group = vec![file("/dl/a", 1, 7, 0), file("/dl/b", 1, 8, 0)];
-        assert!(plan_group_work(&group, &Cache::new()).is_none());
+        assert!(plan_group_work(&group, &Cache::new(), &keys()).is_none());
     }
 
     #[test]
     fn group_without_a_download_is_not_read() {
         let group = vec![file("/media/a", 1, 7, 0), file("/media/b", 1, 8, 0)];
-        assert!(plan_group_work(&group, &Cache::new()).is_none());
+        assert!(plan_group_work(&group, &Cache::new(), &keys()).is_none());
     }
 
     #[test]
@@ -750,7 +767,7 @@ mod tests {
             file("/media/a", 1, 7, 0),
             file("/media/b", 1, 8, 0),
         ];
-        assert!(plan_group_work(&group, &Cache::new()).is_none());
+        assert!(plan_group_work(&group, &Cache::new(), &keys()).is_none());
     }
 
     #[test]
@@ -760,7 +777,7 @@ mod tests {
             file("/media/a", 1, 7, 0),
             file("/dl/copy", 1, 9, 0),
         ];
-        let work = plan_group_work(&group, &Cache::new()).expect("two physical files");
+        let work = plan_group_work(&group, &Cache::new(), &keys()).expect("two physical files");
         assert_eq!(members(&work), vec![vec![0, 1], vec![2]]);
         assert!(work.needs_reading());
         assert_eq!(to_sample(&work), 2);
@@ -769,7 +786,7 @@ mod tests {
     #[test]
     fn same_inode_on_another_device_is_a_different_file() {
         let group = vec![file("/dl/a", 1, 7, 0), file("/media/a", 2, 7, 0)];
-        let work = plan_group_work(&group, &Cache::new()).expect("two physical files");
+        let work = plan_group_work(&group, &Cache::new(), &keys()).expect("two physical files");
         assert_eq!(work.files.len(), 2);
     }
 
@@ -780,7 +797,7 @@ mod tests {
         let mut other = file("/media/b", 1, 7, 5);
         other.ctime_ns = 5;
         let group = vec![file("/dl/a", 1, 7, 0), other];
-        let work = plan_group_work(&group, &Cache::new()).expect("two physical files");
+        let work = plan_group_work(&group, &Cache::new(), &keys()).expect("two physical files");
         assert_eq!(work.files.len(), 2);
     }
 
@@ -792,9 +809,9 @@ mod tests {
             file("/dl/copy", 1, 9, 0),
         ];
         let mut cache = Cache::new();
-        cache.insert("/media/a".into(), entry_for(&group[1], Some("h"), None));
-        cache.insert("/dl/copy".into(), entry_for(&group[2], Some("h"), None));
-        let work = plan_group_work(&group, &cache).expect("two physical files");
+        cache.insert(key(&group[1]), entry_for(&group[1], Some("h"), None));
+        cache.insert(key(&group[2]), entry_for(&group[2], Some("h"), None));
+        let work = plan_group_work(&group, &cache, &keys()).expect("two physical files");
         let full: Vec<_> = work.files.iter().map(|file| file.full.clone()).collect();
         assert_eq!(full, vec![Some("h".into()), Some("h".into())]);
         assert!(!work.needs_reading());
@@ -805,8 +822,8 @@ mod tests {
         let group = vec![file("/dl/a", 1, 7, 5), file("/media/a", 1, 8, 0)];
         let mut cache = Cache::new();
         let stale = file("/dl/a", 1, 7, 4);
-        cache.insert("/dl/a".into(), entry_for(&stale, Some("old"), None));
-        let work = plan_group_work(&group, &cache).expect("two physical files");
+        cache.insert(key(&stale), entry_for(&stale, Some("old"), None));
+        let work = plan_group_work(&group, &cache, &keys()).expect("two physical files");
         assert_eq!(work.files[0].full, None);
         assert_eq!(to_sample(&work), 2);
     }
@@ -814,7 +831,7 @@ mod tests {
     #[test]
     fn a_small_file_s_quick_hash_is_its_full_hash() {
         let group = vec![file("/dl/a", 1, 7, 0), file("/media/a", 1, 8, 0)];
-        let mut work = plan_group_work(&group, &Cache::new()).expect("two physical files");
+        let mut work = plan_group_work(&group, &Cache::new(), &keys()).expect("two physical files");
         work.set_sample(0, "h".into());
         work.set_sample(1, "h".into());
         assert!(!work.needs_reading());
@@ -825,8 +842,8 @@ mod tests {
     fn a_small_file_s_cached_full_hash_needs_no_quick_hash() {
         let group = vec![file("/dl/a", 1, 7, 0), file("/media/a", 1, 8, 0)];
         let mut cache = Cache::new();
-        cache.insert("/media/a".into(), entry_for(&group[1], Some("h"), None));
-        let work = plan_group_work(&group, &cache).expect("two physical files");
+        cache.insert(key(&group[1]), entry_for(&group[1], Some("h"), None));
+        let work = plan_group_work(&group, &cache, &keys()).expect("two physical files");
         assert_eq!(to_sample(&work), 1);
         assert_eq!(work.files[1].sample.as_deref(), Some("h"));
     }
@@ -837,9 +854,9 @@ mod tests {
         // neither file is read again while both stay unchanged.
         let group = vec![large("/dl/a", 7), large("/media/a", 8)];
         let mut cache = Cache::new();
-        cache.insert("/dl/a".into(), entry_for(&group[0], None, Some("s1")));
-        cache.insert("/media/a".into(), entry_for(&group[1], None, Some("s2")));
-        let work = plan_group_work(&group, &cache).expect("two physical files");
+        cache.insert(key(&group[0]), entry_for(&group[0], None, Some("s1")));
+        cache.insert(key(&group[1]), entry_for(&group[1], None, Some("s2")));
+        let work = plan_group_work(&group, &cache, &keys()).expect("two physical files");
         assert!(work.needs_reading());
         assert_eq!(to_sample(&work), 0);
         assert!(work.full_candidates().is_empty());
@@ -853,11 +870,8 @@ mod tests {
             large("/media/b", 9),
         ];
         let mut cache = Cache::new();
-        cache.insert(
-            "/media/a".into(),
-            entry_for(&group[1], Some("f"), Some("s")),
-        );
-        let mut work = plan_group_work(&group, &cache).expect("three physical files");
+        cache.insert(key(&group[1]), entry_for(&group[1], Some("f"), Some("s")));
+        let mut work = plan_group_work(&group, &cache, &keys()).expect("three physical files");
         assert_eq!(to_sample(&work), 2);
         work.set_sample(0, "s".into());
         work.set_sample(2, "other".into());
@@ -875,15 +889,18 @@ mod tests {
         group[1].hash = Some("h".into());
         let mut cache = Cache::new();
         let stale = file("/media/a", 1, 7, 99);
-        cache.insert("/media/a".into(), entry_for(&stale, Some("old"), None));
+        cache.insert(key(&stale), entry_for(&stale, Some("old"), None));
 
-        assert_eq!(sync_cache(&mut cache, std::slice::from_ref(&group)), 2);
+        assert_eq!(
+            sync_cache(&mut cache, &keys(), std::slice::from_ref(&group)),
+            2
+        );
 
         assert_eq!(cache.len(), 2);
-        assert!(cache_entry_matches(&cache["/dl/a"], &group[0]));
-        assert!(cache_entry_matches(&cache["/media/a"], &group[1]));
-        assert_eq!(cache["/media/a"].hash.as_deref(), Some("h"));
-        assert_eq!(sync_cache(&mut cache, &[group]), 0);
+        assert!(cache_entry_matches(&cache[&key(&group[0])], &group[0]));
+        assert!(cache_entry_matches(&cache[&key(&group[1])], &group[1]));
+        assert_eq!(cache[&key(&group[1])].hash.as_deref(), Some("h"));
+        assert_eq!(sync_cache(&mut cache, &keys(), &[group]), 0);
     }
 
     #[test]
@@ -891,9 +908,10 @@ mod tests {
         let mut group = vec![large("/dl/a", 7)];
         group[0].hash = Some("f".into());
         let mut cache = Cache::new();
-        cache.insert("/dl/a".into(), entry_for(&group[0], Some("f"), Some("s")));
+        cache.insert(key(&group[0]), entry_for(&group[0], Some("f"), Some("s")));
 
-        assert_eq!(sync_cache(&mut cache, &[group]), 0);
-        assert_eq!(cache["/dl/a"].sample.as_deref(), Some("s"));
+        let path_key = key(&group[0]);
+        assert_eq!(sync_cache(&mut cache, &keys(), &[group]), 0);
+        assert_eq!(cache[&path_key].sample.as_deref(), Some("s"));
     }
 }

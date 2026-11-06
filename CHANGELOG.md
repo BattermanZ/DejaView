@@ -10,6 +10,7 @@
 - Building DejaView needs Rust 1.89 or newer. [#3]
 - Files under 1 MiB are now skipped by default, so `.nfo` files, text subtitles and artwork are no longer linked. Set `dejaview config set-min-size 1` to link small files again. [#3]
 - `threads` now sets how many files are walked and quick-hashed at once, 16 when unset, where it was every hash's thread count and the number of CPUs when unset. Full reads have their own `full_threads`, 2 when unset; set it to 1 for a single spinning disk.
+- The cache file changes form on the first run: each entry is keyed by its folder and its path below it, and may hold a quick hash only. The change hashes nothing again, but a version older than this one reads the new cache as unusable and hashes every candidate again.
 - Walks now leave out the folders a NAS or an OS keeps for itself: `@eaDir`, `#recycle`, `#snapshot`, `@Recycle`, `.@__thumb`, `.recycle`, `.snapshots`, `.Trash-*`, `$RECYCLE.BIN` and `lost+found`. A file in one of them is no longer linked, nor used as the library file a download links to. `dejaview config set-exclude` changes the list, and with no pattern leaves nothing out.
 
 ### Added
@@ -24,12 +25,15 @@
 
 ### Changed
 
+- The same share mounted at two paths, such as in a Docker cron job and on the host the dashboard runs on, now uses one set of cache entries. Before, each run pruned the other's entries as gone and the next one hashed them again.
+- A run that learns nothing new leaves the cache file as it is. Before, every run rewrote and flushed it, tens of megabytes on a large library.
 - Downloads and media are walked at once, many folders in parallel, so a run on a network drive no longer waits on one `stat` after another before hashing starts.
 - A repeat scan reads only files that are new or changed: the cache now keeps each file's quick hash too, so a file whose quick hash matched no other is not read again, and a file of 1 MiB or less is read once, since its quick hash covers it whole. Before, every file sharing its size with a new or changed one was read again on every run.
 - Files of a size that no download shares with a library file are no longer read, nor are those where every download already is a library file: no link can come of them.
 
 ### Fixed
 
+- A cache file that cannot be read or parsed is named in the log with the reason before DejaView starts over with an empty one. Before, it was replaced silently, and the next run hashed the whole library again with no explanation.
 - The dashboard's Run Log shows its newest lines, and the activity line says how the last run ended. Before, the log stayed on its first few lines, so "Scan finished", a failed link and the reason for it (such as another run holding the lock) showed nowhere. The link confirmations show `y link` and `n cancel` on their border, so a small terminal no longer cuts the prompt off. [#3]
 - Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder. Before, two link runs failed each other's pairs, the later one overwrote the other's report and cache, and `cache cleanup-temp` could delete a link another run was about to rename into place. [#3]
 - A download that already is its library file is reported as `already-linked` and counted apart from applied pairs. On mergerfs without `use_ino` or `inodecalc=hybrid-hash`, which gives one file two inode numbers, such pairs were reported as applied on every run. [#3]

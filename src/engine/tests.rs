@@ -1415,7 +1415,7 @@ fn run_scan_prunes_cache_entries_for_removed_files() {
 
     run_scan(&config, true, false, None);
     let cache_file = downloads.join(".dejaview_cache.json");
-    let gone_key = downloads.join("gone.mkv").to_string_lossy().into_owned();
+    let gone_key = "downloads/gone.mkv".to_string();
     assert!(load_cache(&cache_file).contains_key(&gone_key));
 
     fs::remove_file(downloads.join("gone.mkv")).expect("remove download");
@@ -1426,7 +1426,7 @@ fn run_scan_prunes_cache_entries_for_removed_files() {
         !cache.contains_key(&gone_key),
         "removed path must be pruned"
     );
-    let keep_key = downloads.join("keep.mkv").to_string_lossy().into_owned();
+    let keep_key = "downloads/keep.mkv".to_string();
     assert!(
         cache.contains_key(&keep_key),
         "present path must stay cached"
@@ -2222,4 +2222,104 @@ fn a_cancelled_walk_stops_with_cancelled() {
     assert!(result.expect_err("cancelled").is::<Cancelled>());
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_cache_with_the_old_absolute_keys_is_renamed_without_reading_anything() {
+    let root = unique_temp_dir("cache_migrate");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_file(&downloads.join("Movie/movie.mkv"), b"same-content");
+    write_file(&media.join("Movies/movie.mkv"), b"same-content");
+    let config = make_config(&downloads, &media, 0);
+    run_scan(&config, true, false, None);
+    let reads = super::hashing::read_log::reads_under(&root);
+
+    // Write the cache as a version keyed by absolute path would have.
+    let cache_file = downloads.join(".dejaview_cache.json");
+    let old: Cache = load_cache(&cache_file)
+        .into_iter()
+        .map(|(key, entry)| {
+            let path = match key.split_once('/') {
+                Some(("downloads", rel)) => downloads.join(rel),
+                Some(("media", rel)) => media.join(rel),
+                _ => panic!("unexpected key {key}"),
+            };
+            (path.to_string_lossy().into_owned(), entry)
+        })
+        .collect();
+    save_cache(&cache_file, &old).expect("write old cache");
+
+    run_scan(&config, true, false, None);
+    assert_eq!(super::hashing::read_log::reads_under(&root), reads);
+    let mut keys: Vec<String> = load_cache(&cache_file).into_keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["downloads/Movie/movie.mkv", "media/Movies/movie.mkv"]
+    );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn an_unchanged_cache_is_not_written_again() {
+    let root = unique_temp_dir("cache_unchanged");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_file(&downloads.join("movie.mkv"), b"same-content");
+    write_file(&media.join("movie.mkv"), b"same-content");
+    let config = make_config(&downloads, &media, 0);
+    let cache_file = downloads.join(".dejaview_cache.json");
+
+    run_scan(&config, true, false, None);
+    let written = fs::metadata(&cache_file).expect("cache written").ino();
+    run_scan(&config, true, false, None);
+    // A save writes a new file and renames it into place.
+    assert_eq!(fs::metadata(&cache_file).expect("cache").ino(), written);
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn cache_keys_name_the_root_so_two_mounts_of_one_share_agree() {
+    let host = super::cache::CacheKeys::new(
+        Path::new("/mnt/pool/torrents"),
+        Path::new("/mnt/pool/media"),
+    );
+    let container =
+        super::cache::CacheKeys::new(Path::new("/data/torrents"), Path::new("/data/media"));
+    assert_eq!(
+        host.key(Path::new("/mnt/pool/media/Movies/a.mkv"), false),
+        container.key(Path::new("/data/media/Movies/a.mkv"), false)
+    );
+    assert_eq!(
+        host.key(Path::new("/mnt/pool/torrents/a.mkv"), true),
+        "downloads/a.mkv"
+    );
+    // A cache kept by the old version: absolute keys, one outside both roots.
+    let mut cache = Cache::new();
+    let entry = CacheEntry {
+        size: 1,
+        mtime_ns: 0,
+        ctime_ns: 0,
+        dev: 1,
+        inode: 1,
+        hash: Some("h".into()),
+        sample: None,
+    };
+    cache.insert("/data/media/Movies/a.mkv".into(), entry.clone());
+    cache.insert("/elsewhere/b.mkv".into(), entry.clone());
+    cache.insert("media/Movies/c.mkv".into(), entry);
+    assert_eq!(container.migrate(&mut cache), 1);
+    let mut keys: Vec<&String> = cache.keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "/elsewhere/b.mkv",
+            "media/Movies/a.mkv",
+            "media/Movies/c.mkv"
+        ]
+    );
 }

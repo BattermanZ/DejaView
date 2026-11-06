@@ -17,9 +17,9 @@ pub use types::LinkMode;
 pub use types::ScanRunOptions;
 
 use crate::protocol::TuiEvent;
-use cache::{cache_key, load_cache, prune_cache, save_cache};
+use cache::{CacheKeys, load_cache, prune_cache, save_cache};
 use collect::{CollectOptions, collect_run_files, group_files_by_size};
-use hashing::{HashOptions, hash_groups_and_update_cache};
+use hashing::{HashOptions, Hashed, hash_groups_and_update_cache};
 use linking::{ApplyOptions, ApplyOutcome, apply_actions, plan_actions_and_table};
 use report::{
     RunReportInput, build_report_entries, build_run_report, maybe_confirm_apply,
@@ -243,8 +243,19 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     let cache_path = cache_path(config)?;
     logger::info("run", format!("using cache path {}", cache_path.display()));
     let mut cache = load_cache(&cache_path);
+    let keys = CacheKeys::new(downloads, media);
+    let migrated = keys.migrate(&mut cache);
+    if migrated > 0 {
+        logger::info(
+            "cache",
+            format!("renamed {migrated} entries to keys relative to their folder"),
+        );
+    }
 
-    let seen_paths: HashSet<String> = files.iter().map(|file| cache_key(&file.path)).collect();
+    let seen_paths: HashSet<String> = files
+        .iter()
+        .map(|file| keys.key(&file.path, file.in_downloads))
+        .collect();
     let mut groups = group_files_by_size(files);
     if !options.only_sources.is_empty() {
         // Linking selected rows: only the size groups holding those sources can
@@ -255,7 +266,10 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
                 .any(|file| file.in_downloads && options.only_sources.contains(&file.path))
         });
     }
-    let hash_result = quick_pool.install(|| {
+    let Hashed {
+        cache_writes,
+        result: hash_result,
+    } = quick_pool.install(|| {
         hash_groups_and_update_cache(
             &mut groups,
             &mut cache,
@@ -267,12 +281,14 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
                 selection: &options,
                 cancel: &options.cancel,
                 full_pool: &full_pool,
+                keys: &keys,
             },
             &mut warnings,
         )
     });
+    let mut pruned = 0;
     if hash_result.is_ok() && warnings.walk_errors == 0 && warnings.metadata_errors == 0 {
-        let pruned = prune_cache(&mut cache, &seen_paths);
+        pruned = prune_cache(&mut cache, &seen_paths);
         if pruned > 0 {
             logger::info(
                 "cache",
@@ -285,8 +301,14 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
             "walk was incomplete; keeping entries for paths not seen this run",
         );
     }
-    // Hashes finished before a cancel or a strict failure are valid: keep them.
-    save_cache(&cache_path, &cache)?;
+    // Hashes finished before a cancel or a strict failure are valid: keep
+    // them. An unchanged cache is not written again: on a large library that
+    // is tens of megabytes and an fsync every run.
+    if migrated + cache_writes + pruned > 0 {
+        save_cache(&cache_path, &cache)?;
+    } else {
+        logger::info("cache", "cache unchanged; not saved");
+    }
     hash_result?;
 
     let linking::Plan {
