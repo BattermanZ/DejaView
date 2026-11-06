@@ -42,6 +42,8 @@
 
 ### Fixed
 
+- In the dashboard, a scan or link that fails, from a missing path to `--strict` stopping on a file it could not read, shows its error in one line, and a link `--strict` stopped partway shows which rows it linked and which failed. Before, a failure while hashing showed the run's raw error output, a backtrace included, and a link stopped partway left every row planned. [#5]
+- A dashboard left open while DejaView is upgraded keeps working: it runs scans and links with the binary it was started from, and refuses, asking to be restarted, a binary that speaks another version of its event stream. Before, once the binary was replaced on disk, every run failed. [#5]
 - A failed pair's `error` in the report keeps the OS error, such as "Read-only file system", where it said only which step failed, and its `method` and `fallback_reason` no longer claim the planned hardlink. [#5]
 - `--json --strict` prints the report before stopping on a failure. Before, it printed nothing on stdout. [#5]
 - Planned pairs come in download path order in the table, the report, `--json` and the dashboard. Before, the order changed on every run, so two reports could not be compared, and the dashboard's rows reshuffled when a scan finished. [#5]

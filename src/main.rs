@@ -247,31 +247,33 @@ fn run_cli() -> Result<ExitCode> {
             symlink_only,
             output,
         } => {
-            ensure_required_paths(&config)?;
-            if min_size.is_some() {
-                config.min_size = min_size;
-            }
-            let end = engine::run_scan_with_options(
-                &config,
-                engine::ScanRunOptions {
-                    dry_run: true,
-                    strict,
-                    report_path: output.report.as_deref(),
-                    json_output: output.json,
-                    show_progress: progress_enabled(
-                        output.progress,
-                        output.no_progress,
-                        output.json,
-                        output.tui_events,
-                    ),
-                    require_confirm: false,
-                    tui_events: output.tui_events,
-                    link_mode: effective_link_mode(&config, symlink_only),
-                    only_sources: &[],
-                    only_pairs: &[],
-                    cancel: run_cancel_token(output.tui_events),
-                },
-            )?;
+            let end = tui_stream(output.tui_events, || {
+                ensure_required_paths(&config)?;
+                if min_size.is_some() {
+                    config.min_size = min_size;
+                }
+                engine::run_scan_with_options(
+                    &config,
+                    engine::ScanRunOptions {
+                        dry_run: true,
+                        strict,
+                        report_path: output.report.as_deref(),
+                        json_output: output.json,
+                        show_progress: progress_enabled(
+                            output.progress,
+                            output.no_progress,
+                            output.json,
+                            output.tui_events,
+                        ),
+                        require_confirm: false,
+                        tui_events: output.tui_events,
+                        link_mode: effective_link_mode(&config, symlink_only),
+                        only_sources: &[],
+                        only_pairs: &[],
+                        cancel: run_cancel_token(output.tui_events),
+                    },
+                )
+            })?;
             return Ok(exit_code_of(end));
         }
         Commands::Link {
@@ -283,40 +285,42 @@ fn run_cli() -> Result<ExitCode> {
             plan,
             output,
         } => {
-            ensure_required_paths(&config)?;
-            let only_pairs = match &plan {
-                Some(path) => read_plan(path)?,
-                None => Vec::new(),
-            };
-            let only_sources: Vec<PathBuf> = if only_pairs.is_empty() {
-                only_sources
-            } else {
-                only_pairs.iter().map(|(src, _)| src.clone()).collect()
-            };
-            if min_size.is_some() {
-                config.min_size = min_size;
-            }
-            let end = engine::run_scan_with_options(
-                &config,
-                engine::ScanRunOptions {
-                    dry_run: false,
-                    strict,
-                    report_path: output.report.as_deref(),
-                    json_output: output.json,
-                    show_progress: progress_enabled(
-                        output.progress,
-                        output.no_progress,
-                        output.json,
-                        output.tui_events,
-                    ),
-                    require_confirm: confirm,
-                    tui_events: output.tui_events,
-                    link_mode: effective_link_mode(&config, symlink_only),
-                    only_sources: &only_sources,
-                    only_pairs: &only_pairs,
-                    cancel: run_cancel_token(output.tui_events),
-                },
-            )?;
+            let end = tui_stream(output.tui_events, || {
+                ensure_required_paths(&config)?;
+                let only_pairs = match &plan {
+                    Some(path) => read_plan(path)?,
+                    None => Vec::new(),
+                };
+                let only_sources: Vec<PathBuf> = if only_pairs.is_empty() {
+                    only_sources
+                } else {
+                    only_pairs.iter().map(|(src, _)| src.clone()).collect()
+                };
+                if min_size.is_some() {
+                    config.min_size = min_size;
+                }
+                engine::run_scan_with_options(
+                    &config,
+                    engine::ScanRunOptions {
+                        dry_run: false,
+                        strict,
+                        report_path: output.report.as_deref(),
+                        json_output: output.json,
+                        show_progress: progress_enabled(
+                            output.progress,
+                            output.no_progress,
+                            output.json,
+                            output.tui_events,
+                        ),
+                        require_confirm: confirm,
+                        tui_events: output.tui_events,
+                        link_mode: effective_link_mode(&config, symlink_only),
+                        only_sources: &only_sources,
+                        only_pairs: &only_pairs,
+                        cancel: run_cancel_token(output.tui_events),
+                    },
+                )
+            })?;
             return Ok(exit_code_of(end));
         }
         Commands::Config(args) => match args.command {
@@ -422,6 +426,24 @@ fn run_cli() -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Run a scan or link, and when the dashboard drives it, frame its event
+/// stream: `hello` first, and for a run that fails, from a missing path to a
+/// strict failure, one `error` or `cancelled` last. A run that returns emits
+/// its own `done`.
+fn tui_stream<F>(tui_events: bool, run: F) -> Result<engine::RunEnd>
+where
+    F: FnOnce() -> Result<engine::RunEnd>,
+{
+    if tui_events {
+        engine::open_tui_stream();
+    }
+    let result = run();
+    if tui_events && let Err(err) = &result {
+        engine::close_tui_stream_on(err);
+    }
+    result
 }
 
 fn command_name(command: &Commands) -> &'static str {

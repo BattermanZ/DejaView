@@ -1060,9 +1060,19 @@ impl App {
                 self.restore_reviewed_rows();
                 true
             }
-            TuiEvent::Error { message } => {
+            TuiEvent::Error { message, report } => {
                 self.running_job = None;
                 self.finish_live_run();
+                // A link --strict stopped partway reports which pairs it
+                // linked before the failure: show that, not the plan.
+                if let Some(report) = report {
+                    self.active_workers.clear();
+                    self.hash_progress_done = None;
+                    self.hash_progress_total = None;
+                    self.merge_report(kind.clone(), *report);
+                    self.report_before_link = None;
+                    self.live_entries.clear();
+                }
                 let label = match kind {
                     JobKind::Scan => "Scan",
                     JobKind::LinkAll | JobKind::LinkSelected(_) => "Link",
@@ -1073,6 +1083,8 @@ impl App {
                 self.restore_reviewed_rows();
                 true
             }
+            // The runner checks it before passing anything on.
+            TuiEvent::Hello { .. } => false,
             TuiEvent::Done { report } => {
                 let report = *report;
                 let planned = report.planned_actions;
@@ -1590,6 +1602,43 @@ mod tests {
         }
         let sources: Vec<_> = app.rows().iter().map(|row| row.source.as_str()).collect();
         assert_eq!(sources, ["/dl/a.mkv", "/dl/b.mkv", "/dl/c.mkv"]);
+    }
+
+    #[test]
+    fn a_link_stopped_by_strict_shows_the_pairs_it_linked() {
+        let mut app = App::new(&Config::default(), false);
+        let row = |source: &str, status: &str| LinkReportEntry {
+            source: source.to_string(),
+            target: format!("/media{source}"),
+            size: 10,
+            status: status.to_string(),
+            method: None,
+            fallback_reason: None,
+            error: None,
+        };
+        let mut scanned = sample_report();
+        scanned.entries = vec![row("/dl/a.mkv", "planned"), row("/dl/b.mkv", "planned")];
+        app.report_before_link = Some(scanned);
+        let mut partial = sample_report();
+        partial.mode = "link".to_string();
+        partial.outcome = "failed".to_string();
+        partial.entries = vec![row("/dl/a.mkv", "applied"), row("/dl/b.mkv", "failed")];
+
+        assert!(app.apply_tui_event(
+            JobKind::LinkAll,
+            TuiEvent::Error {
+                message: "--strict stopped the run at its first failed link".to_string(),
+                report: Some(Box::new(partial)),
+            },
+        ));
+
+        let statuses: Vec<_> = app.rows().iter().map(|row| row.status.as_str()).collect();
+        assert_eq!(statuses, ["applied", "failed"]);
+        assert!(app.report_before_link.is_none());
+        assert!(
+            app.activity_message()
+                .starts_with("Link failed: --strict stopped")
+        );
     }
 
     #[test]

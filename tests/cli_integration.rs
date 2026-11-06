@@ -1568,3 +1568,205 @@ fn a_strict_json_run_prints_its_report_before_the_error() {
     assert_eq!(report["applied_actions"], 1);
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+/// The events of a `--tui-events` run, whatever its exit code.
+fn stream_of(out: &std::process::Output) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line is one event"))
+        .collect()
+}
+
+/// A stream opens with hello and ends with exactly one done, error or
+/// cancelled, which it returns.
+fn final_event_of(events: &[serde_json::Value]) -> &serde_json::Value {
+    assert_eq!(
+        events.first().expect("events")["type"],
+        "hello",
+        "{events:?}"
+    );
+    assert_eq!(events[0]["protocol"], 1);
+    let finals: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            ["done", "error", "cancelled"].contains(&event["type"].as_str().unwrap_or(""))
+        })
+        .collect();
+    assert_eq!(finals.len(), 1, "exactly one final event: {events:?}");
+    let last = events.last().expect("events");
+    assert_eq!(finals[0], last, "the final event is the last: {events:?}");
+    last
+}
+
+#[test]
+fn a_config_error_ends_the_event_stream_with_one_error() {
+    let root = unique_temp_dir("stream_config_error");
+    fs::create_dir_all(&root).expect("create root");
+
+    let out = run_cmd(&root, &["scan", "--tui-events", "--no-progress"]);
+
+    assert_eq!(out.status.code(), Some(1));
+    let events = stream_of(&out);
+    let last = final_event_of(&events);
+    assert_eq!(last["type"], "error");
+    assert!(
+        last["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("set-downloads")),
+        "{last}"
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+/// Run as a user that cannot read a file of mode 000: this one, or `nobody`
+/// under root, which reads anything. Under root the tree is handed to nobody.
+fn run_unprivileged(root: &Path, args: &[&str]) -> std::process::Output {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dejaview"));
+    command
+        .args(args)
+        .env("XDG_CONFIG_HOME", root.join("xdg"))
+        .env("HOME", root.join("home"));
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "0");
+    if is_root {
+        const NOBODY: u32 = 65534;
+        for entry in walkdir_all(root) {
+            std::os::unix::fs::lchown(&entry, Some(NOBODY), Some(NOBODY)).expect("chown");
+        }
+        command.uid(NOBODY).gid(NOBODY);
+    }
+    command.output().expect("run command")
+}
+
+/// Every path under `root`, `root` included.
+fn walkdir_all(root: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![root.to_path_buf()];
+    let mut index = 0;
+    while index < paths.len() {
+        if paths[index].is_dir() && !paths[index].is_symlink() {
+            for entry in fs::read_dir(&paths[index]).expect("read dir") {
+                paths.push(entry.expect("entry").path());
+            }
+        }
+        index += 1;
+    }
+    paths
+}
+
+#[test]
+fn a_strict_hash_failure_ends_the_event_stream_with_one_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = unique_temp_dir("stream_hash_error");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("unreadable.mkv"), 4000, 1);
+    write_seeded(&media.join("unreadable.mkv"), 4000, 1);
+    configure_small_files(&root, &downloads, &media);
+    fs::create_dir_all(root.join("home")).expect("create home");
+    fs::set_permissions(
+        downloads.join("unreadable.mkv"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .expect("make unreadable");
+
+    let out = run_unprivileged(
+        &root,
+        &["scan", "--strict", "--tui-events", "--no-progress"],
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr={stderr}");
+    let events = stream_of(&out);
+    let last = final_event_of(&events);
+    assert_eq!(last["type"], "error");
+    assert!(
+        last["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unreadable.mkv")
+                && message.contains("Permission denied")),
+        "the whole cause: {last}"
+    );
+    fs::set_permissions(
+        downloads.join("unreadable.mkv"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .expect("make readable");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_strict_link_failure_ends_the_event_stream_with_its_report() {
+    let root = unique_temp_dir("stream_link_error");
+    let Some((_downloads, mount)) = tree_with_one_pair_that_cannot_link(&root) else {
+        eprintln!("skipped: this process may not mount");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    };
+
+    let out = run_cmd(
+        &root,
+        &["link", "--strict", "--tui-events", "--no-progress"],
+    );
+    drop(mount);
+
+    assert_eq!(out.status.code(), Some(1));
+    let events = stream_of(&out);
+    let last = final_event_of(&events);
+    assert_eq!(last["type"], "error");
+    let statuses: Vec<_> = last["report"]["entries"]
+        .as_array()
+        .expect("the report of the pairs before the failure")
+        .iter()
+        .map(|entry| entry["status"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(statuses, ["applied", "failed"]);
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_cancel_ends_the_event_stream_with_one_cancelled() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let root = unique_temp_dir("stream_cancel");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    fs::create_dir_all(&downloads).expect("create downloads");
+    fs::create_dir_all(&media).expect("create media");
+    // Sparse files take no disk, and their full hashes take long enough for
+    // the cancel to land while they are read.
+    for path in [media.join("big.mkv"), downloads.join("big.mkv")] {
+        let file = fs::File::create(&path).expect("create sparse file");
+        file.set_len(4 << 30).expect("size sparse file");
+    }
+    configure_small_files(&root, &downloads, &media);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dejaview"))
+        .args(["scan", "--tui-events", "--no-progress"])
+        .env("XDG_CONFIG_HOME", root.join("xdg"))
+        .env("HOME", root.join("home"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start scan");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut events = Vec::new();
+    for line in BufReader::new(child.stdout.take().expect("stdout")).lines() {
+        let event: serde_json::Value =
+            serde_json::from_str(&line.expect("read event")).expect("parse event");
+        if event["type"] == "phase" && event["phase"] == "hashing_full" {
+            stdin.write_all(b"cancel\n").expect("send cancel");
+            stdin.flush().expect("flush cancel");
+        }
+        events.push(event);
+    }
+    let out = child.wait_with_output().expect("wait for scan");
+
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(final_event_of(&events)["type"], "cancelled");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}

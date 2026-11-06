@@ -114,9 +114,21 @@ pub struct RunReport {
     pub entries: Vec<LinkReportEntry>,
 }
 
+/// The version of the `--tui-events` stream. The dashboard refuses a child
+/// that speaks another, such as a binary an upgrade replaced on disk while
+/// the dashboard was open. Raise it whenever an event changes shape.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// One line of the `--tui-events` stream. It opens with `hello` and ends with
+/// exactly one `done`, `error` or `cancelled`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TuiEvent {
+    /// The first event: which stream this is and which DejaView sends it.
+    Hello {
+        protocol: u32,
+        version: String,
+    },
     Phase {
         phase: String,
     },
@@ -146,8 +158,13 @@ pub enum TuiEvent {
     Done {
         report: Box<RunReport>,
     },
+    /// The run stopped on an error. `report` is there when the run got far
+    /// enough to build one, as a link `--strict` stopped partway does: its
+    /// entries say which pairs were linked before the failure.
     Error {
         message: String,
+        #[serde(default)]
+        report: Option<Box<RunReport>>,
     },
     /// The run stopped on request before changing anything.
     Cancelled,

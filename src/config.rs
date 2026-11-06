@@ -153,14 +153,16 @@ pub fn cache_path(config: &Config) -> Result<PathBuf> {
 }
 
 pub fn validate_runtime_paths(config: &Config) -> Result<()> {
-    let downloads = config
-        .downloads
-        .as_ref()
-        .ok_or_else(|| anyhow!("downloads path not set"))?;
-    let media = config
-        .media
-        .as_ref()
-        .ok_or_else(|| anyhow!("media path not set"))?;
+    let downloads = config.downloads.as_ref().ok_or_else(|| {
+        anyhow!(
+            "downloads path not set; set it with `dejaview config set-downloads PATH`, or with e in the dashboard"
+        )
+    })?;
+    let media = config.media.as_ref().ok_or_else(|| {
+        anyhow!(
+            "media path not set; set it with `dejaview config set-media PATH`, or with e in the dashboard"
+        )
+    })?;
 
     if !downloads.is_absolute() {
         return Err(anyhow!(

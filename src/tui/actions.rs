@@ -10,7 +10,7 @@ use crate::engine;
 use crate::fsutil::safe_write_bytes;
 
 use super::model::{RunReport, TuiEvent};
-use crate::protocol::PlannedPair;
+use crate::protocol::{PROTOCOL_VERSION, PlannedPair};
 
 /// A child that already ended its stream with a done, error or cancelled
 /// event has said how it ended; its exit code (2 for a run with failures, 1
@@ -44,6 +44,38 @@ fn child_failure_message(subcommand: &str, status: &str, stderr: &str) -> String
     }
 }
 
+/// The binary to run a scan or link with: this one. After an upgrade
+/// replaces it on disk, `current_exe()` names a path that is gone, while
+/// `/proc/self/exe` still reaches the binary this dashboard runs, which
+/// speaks its protocol.
+fn own_executable() -> Result<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let proc_exe = Path::new("/proc/self/exe");
+        if proc_exe.exists() {
+            return Ok(proc_exe.to_path_buf());
+        }
+    }
+    std::env::current_exe().context("resolve current executable")
+}
+
+/// Check the child's first event: a `hello` in this dashboard's protocol.
+/// Anything else is another version of DejaView, whose events this one may
+/// read wrongly.
+fn check_hello(event: &TuiEvent, exe: &Path) -> Result<()> {
+    match event {
+        TuiEvent::Hello { protocol, .. } if *protocol == PROTOCOL_VERSION => Ok(()),
+        TuiEvent::Hello { protocol, version } => Err(anyhow!(
+            "{} is DejaView {version}, whose event stream (protocol {protocol}) this dashboard (protocol {PROTOCOL_VERSION}) cannot read; quit and start the dashboard again",
+            exe.display()
+        )),
+        _ => Err(anyhow!(
+            "{} did not open its event stream with hello, so it is another version of DejaView; quit and start the dashboard again",
+            exe.display()
+        )),
+    }
+}
+
 fn stream_subcommand_events(
     subcommand: &str,
     strict: bool,
@@ -51,9 +83,18 @@ fn stream_subcommand_events(
     tx: Sender<Result<TuiEvent>>,
     cancel_rx: Receiver<()>,
 ) -> Result<()> {
-    let exe = std::env::current_exe().context("resolve current executable")?;
-    let mut cmd = Command::new(exe);
-    cmd.arg(subcommand)
+    let exe = own_executable()?;
+    let mut cmd = Command::new(&exe);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.arg0("dejaview");
+    }
+    // A failing child's stderr is shown when it sends no final event; a
+    // backtrace there is noise.
+    cmd.env("RUST_BACKTRACE", "0")
+        .env("RUST_LIB_BACKTRACE", "0")
+        .arg(subcommand)
         .arg("--tui-events")
         .arg("--no-progress")
         .stdin(Stdio::piped())
@@ -80,6 +121,7 @@ fn stream_subcommand_events(
 
     let mut saw_done = false;
     let mut saw_error_event = false;
+    let mut saw_hello = false;
     for line in BufReader::new(stdout).lines() {
         let line = match line {
             Ok(line) => line,
@@ -108,6 +150,16 @@ fn stream_subcommand_events(
                 return Err(err);
             }
         };
+        if !saw_hello {
+            if let Err(err) = check_hello(&event, &exe) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = tx.send(Err(anyhow!("{err:#}")));
+                return Err(err);
+            }
+            saw_hello = true;
+            continue;
+        }
         if matches!(event, TuiEvent::Done { .. }) {
             saw_done = true;
         }
@@ -294,6 +346,26 @@ mod tests {
             child_failure_message("scan", "exit status: 1", "  \n"),
             "scan exited with exit status: 1"
         );
+    }
+
+    #[test]
+    fn a_child_that_speaks_another_protocol_is_refused() {
+        let exe = Path::new("/usr/bin/dejaview");
+        let hello = |protocol| TuiEvent::Hello {
+            protocol,
+            version: "9.9.9".to_string(),
+        };
+        assert!(check_hello(&hello(PROTOCOL_VERSION), exe).is_ok());
+        let err = check_hello(&hello(PROTOCOL_VERSION + 1), exe).expect_err("newer protocol");
+        assert!(
+            err.to_string().contains("start the dashboard again"),
+            "{err}"
+        );
+        // A binary from before the handshake opens with a phase.
+        let older = TuiEvent::Phase {
+            phase: "collecting".to_string(),
+        };
+        assert!(check_hello(&older, exe).is_err());
     }
 
     #[test]

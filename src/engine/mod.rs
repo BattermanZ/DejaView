@@ -143,16 +143,55 @@ pub enum RunEnd {
     Cancelled,
 }
 
+/// A run `--strict` stopped after building its report, which the error
+/// carries so the dashboard can show which pairs were linked before it.
+#[derive(Debug)]
+pub struct StoppedWithReport {
+    report: Box<crate::protocol::RunReport>,
+    error: anyhow::Error,
+}
+
+impl std::fmt::Display for StoppedWithReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.error)
+    }
+}
+
+impl std::error::Error for StoppedWithReport {}
+
+/// Open a `--tui-events` stream. The first event names the protocol, so the
+/// dashboard can refuse a binary that speaks another.
+pub fn open_tui_stream() {
+    let _ = types::emit_tui_event(&TuiEvent::Hello {
+        protocol: crate::protocol::PROTOCOL_VERSION,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    });
+}
+
+/// Close a `--tui-events` stream for a run that returned an error, from a
+/// config error before it started to a strict failure partway: exactly one
+/// final event, `cancelled` for a cancel and `error` for anything else, with
+/// the whole cause and the report when the run built one.
+pub fn close_tui_stream_on(err: &anyhow::Error) {
+    let event = if err.is::<Cancelled>() {
+        TuiEvent::Cancelled
+    } else {
+        TuiEvent::Error {
+            message: format!("{err:#}"),
+            report: err
+                .downcast_ref::<StoppedWithReport>()
+                .map(|stopped| stopped.report.clone()),
+        }
+    };
+    let _ = types::emit_tui_event(&event);
+}
+
 pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
-    let tui_events = options.tui_events;
     let result = run(config, options);
     if let Err(err) = &result
         && err.is::<Cancelled>()
     {
         logger::info("run", "cancelled by user before any change was made");
-        if tui_events {
-            let _ = types::emit_tui_event(&TuiEvent::Cancelled);
-        }
     }
     result
 }
@@ -403,13 +442,11 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         ),
     );
 
-    if let Some(err) = strict_error {
-        if options.tui_events {
-            let _ = types::emit_tui_event(&TuiEvent::Error {
-                message: format!("{err:#}"),
-            });
-        }
-        return Err(err);
+    if let Some(error) = strict_error {
+        return Err(anyhow::Error::new(StoppedWithReport {
+            report: Box::new(report),
+            error,
+        }));
     }
 
     let failures = report.warning_total() > 0;
