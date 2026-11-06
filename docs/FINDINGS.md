@@ -27,7 +27,7 @@ Dependencies updated to latest (ratatui 0.30, crossterm 0.29, comfy-table 8, ind
 Ask before acting on these:
 
 1. Decided: the symlink fallback stays the default (`docs/adr/0001-a-download-that-cannot-be-hardlinked-becomes-a-symlink.md`). S3's other fixes stand.
-2. Default minimum file size: 1 byte (skip only empty files) or 1 MiB (also skips .nfo, .srt, thumbnails)? See S2 and P1.
+2. Decided: files under 1 MiB are skipped by default, empty files always (`docs/adr/0002-files-under-1-mib-are-left-alone.md`). This settles the size floor in S2 and P1.
 3. New dependencies need approval (AGENTS.md): a signal handler for Ctrl+C/SIGTERM (`signal-hook` or `ctrlc`, P5), optionally `jwalk` for the parallel walk (P3, can be done with rayon instead), optionally `libc` for `flock`/`fadvise` (C2; note `std::fs::File::try_lock` exists from Rust 1.89 while the MSRV is 1.88).
 4. Change what the CLI returns: a distinct exit code for "finished with failures", and timestamped reports instead of one overwritten file.
 
@@ -47,7 +47,7 @@ Severity: High, Medium, Low. Evidence tags: **[verified]** reproduced in the mai
 **S2. High. Empty files are planned and linked; later writes land in the library.** **[verified]**
 - Where: `src/engine/collect.rs:87` and `158-164` (no size floor), `linking.rs:334-361`.
 - Every empty download is linked to the first empty media file: an empty `.keep` was linked to the library's `.plexignore`. With `min_age` 0, a file a torrent client has created but not yet written qualifies; the client then writes into the shared inode and the library file changes. Tiny sidecars (a 9-byte .srt, .nfo files) are linked too, saving nothing and tying unrelated library files to downloads.
-- Fix (tiny): skip `size == 0` in collect. Then add `min_size` (see P1 and the decision above).
+- Fix (tiny): skip `size == 0` in collect, whatever the floor. Then add `min_size`, default 1 MiB (P1, ADR 0002).
 
 **S3. High. The silent symlink fallback is unsafe for *arr setups.** **[reproduced]**
 - Where: `linking.rs:282-323`, `collect.rs:23-25` (the walk skips symlinks, so a symlinked download is never looked at again), `types.rs` `LinkMode { Best, SymlinkOnly }`.
