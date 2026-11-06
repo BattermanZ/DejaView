@@ -1,3 +1,7 @@
+// Printing goes through report::print_out, which keeps stdout for the
+// dashboard's event stream in --tui-events mode, and report::print_err.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use anyhow::{Result, anyhow};
 use colored::*;
 use std::collections::HashSet;
@@ -18,7 +22,8 @@ pub use types::LinkMode;
 pub use types::ScanRunOptions;
 
 use crate::protocol::Outcome;
-use crate::protocol::TuiEvent;
+use crate::protocol::WarningSummary;
+use crate::protocol::{Counts, Phase, TuiEvent};
 use cache::{CacheKeys, load_cache, prune_cache, save_cache};
 use collect::{CollectOptions, collect_run_files, group_files_by_size};
 use hashing::{CHECKPOINT_EVERY, Checkpoint, HashOptions, Hashed, hash_groups_and_update_cache};
@@ -27,7 +32,7 @@ use report::{
     RunReportInput, build_report_entries, build_run_report, maybe_confirm_apply, planned_bytes,
     print_run_summary, resolve_report_path, strict_failure, try_write_run_report,
 };
-use types::{Audience, Cache, LinkAction, RunMetrics, RunWarnings};
+use types::{Audience, Cache, LinkAction, RunMetrics};
 
 use crate::config::{Config, cache_path};
 use crate::logger;
@@ -243,7 +248,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
     let exclude = collect::Exclude::new(config.effective_exclude());
     let quick_pool = build_pool("quick", config.effective_threads())?;
     let full_pool = build_pool("full", config.effective_full_threads())?;
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut metrics = RunMetrics::default();
     let cache_path = cache_path(config)?;
     logger::info("run", format!("using cache path {}", cache_path.display()));
@@ -304,7 +309,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         if options.tui_events {
             let _ = types::emit_tui_event(&TuiEvent::Log { message });
         } else if audience.is_chatty() {
-            eprintln!("{} {message}", "⚠".yellow());
+            report::print_warning(message);
         }
     }
     let bytes_to_free = planned_bytes(&actions);
@@ -318,23 +323,22 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
     );
     if options.tui_events {
         let _ = types::emit_tui_event(&TuiEvent::Phase {
-            phase: "planning".to_string(),
+            phase: Phase::Planning,
         });
-        let _ = types::emit_tui_event(&TuiEvent::Count {
+        let _ = types::emit_tui_event(&TuiEvent::Count(Counts {
             files_seen: Some(files_seen),
             groups_found: Some(groups_found),
             planned_actions: Some(planned_actions),
             applied_actions: Some(0),
-            hash_progress_done: None,
-            hash_progress_total: None,
-        });
+            ..Counts::default()
+        }));
         let _ = types::emit_tui_event(&TuiEvent::Log {
             message: format!("Planning complete. {planned_actions} action(s) queued."),
         });
     }
 
     if audience.is_chatty() {
-        report::print_plan(&actions, downloads, media, bytes_to_free);
+        report::print_plan(audience, &actions, downloads, media, bytes_to_free);
     }
     let out_path = resolve_report_path(downloads, &options, planned_actions);
     let mut report_entries = build_report_entries(&actions, options.link_mode);
@@ -353,7 +357,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         }
         if options.tui_events {
             let _ = types::emit_tui_event(&TuiEvent::Phase {
-                phase: "applying".to_string(),
+                phase: Phase::Applying,
             });
             let _ = types::emit_tui_event(&TuiEvent::Log {
                 message: "Applying filesystem changes".to_string(),
@@ -362,7 +366,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         maybe_confirm_apply(options.require_confirm, planned_actions)?;
         logger::info("run", "starting apply phase");
         if audience.is_chatty() && planned_actions > 0 {
-            println!("{} Linking…", "▶".cyan());
+            report::print_out(audience, format_args!("{} Linking…", "▶".cyan()));
         }
         apply_actions(
             &actions,
@@ -389,7 +393,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
                 message: message.clone(),
             });
         } else if audience.is_person() {
-            eprintln!("{} {message}", "⚠".yellow());
+            report::print_warning(message);
         }
     }
 
@@ -401,13 +405,16 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
             .filter(|entry| entry.is_skipped())
             .filter_map(|entry| entry.error.as_deref())
         {
-            eprintln!("{} {reason}", "⚠".yellow());
+            report::print_warning(reason);
         }
         if applied.already_linked > 0 {
-            println!(
-                "{} {} pair(s) already were one file; nothing changed. The filesystem gives one file different inode numbers: on mergerfs, mount with inodecalc=hybrid-hash, or use_ino on older versions.",
-                "ℹ".cyan(),
-                applied.already_linked
+            report::print_out(
+                audience,
+                format_args!(
+                    "{} {} pair(s) already were one file; nothing changed. The filesystem gives one file different inode numbers: on mergerfs, mount with inodecalc=hybrid-hash, or use_ino on older versions.",
+                    "ℹ".cyan(),
+                    applied.already_linked
+                ),
             );
         }
         report::print_dangling_symlinks(&metrics.dangling_symlinks);
@@ -453,7 +460,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
     match audience {
         // A script reading --json gets the report of a run --strict
         // stopped too.
-        Audience::Script => println!("{}", serde_json::to_string_pretty(&report)?),
+        Audience::Script => report::print_out(audience, serde_json::to_string_pretty(&report)?),
         Audience::Person | Audience::Quiet if !options.dry_run => report::Verdict {
             planned: planned_actions,
             applied,
@@ -463,9 +470,12 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
             report: out_path.as_deref(),
         }
         .print(audience),
-        Audience::Person if planned_actions > 0 => println!(
-            "{} Scan only: nothing was changed. `dejaview link` links them.",
-            "ℹ".cyan()
+        Audience::Person if planned_actions > 0 => report::print_out(
+            audience,
+            format_args!(
+                "{} Scan only: nothing was changed. `dejaview link` links them.",
+                "ℹ".cyan()
+            ),
         ),
         _ => {}
     }
@@ -473,11 +483,11 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         "run",
         format!(
             "finished mode={} outcome={:?} planned={} applied={} warnings={}",
-            report.mode,
+            report.mode.as_str(),
             report.outcome,
             report.planned_actions,
             report.applied_actions,
-            report.warning_total()
+            report.warnings.total()
         ),
     );
 
@@ -488,7 +498,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         }));
     }
 
-    let end = RunEnd::of(outcome, report.warning_total() > 0);
+    let end = RunEnd::of(outcome, report.warnings.total() > 0);
     if options.tui_events {
         let _ = types::emit_tui_event(&TuiEvent::Done {
             report: Box::new(report),
@@ -508,9 +518,9 @@ fn stopped_before_planning(
     started_at: std::time::SystemTime,
     (downloads, media): (&std::path::Path, &std::path::Path),
     metrics: RunMetrics,
-    warnings: RunWarnings,
+    warnings: WarningSummary,
 ) -> anyhow::Error {
-    if !options.strict || err.is::<Cancelled>() || report::warning_total(&warnings) == 0 {
+    if !options.strict || err.is::<Cancelled>() || warnings.total() == 0 {
         return err;
     }
     let report = build_run_report(
@@ -535,7 +545,7 @@ fn stopped_before_planning(
     if options.audience() == Audience::Script
         && let Ok(json) = serde_json::to_string_pretty(&report)
     {
-        println!("{json}");
+        report::print_out(Audience::Script, json);
     }
     anyhow::Error::new(StoppedWithReport {
         report: Box::new(report),
@@ -636,12 +646,12 @@ fn plan_by_walking(
     cache_path: &std::path::Path,
     filters: &reviewed::Filters<'_>,
     pools: Pools<'_>,
-    warnings: &mut RunWarnings,
+    warnings: &mut WarningSummary,
     metrics: &mut RunMetrics,
 ) -> Result<Planned> {
     if options.tui_events {
         let _ = types::emit_tui_event(&TuiEvent::Phase {
-            phase: "collecting".to_string(),
+            phase: Phase::Collecting,
         });
         let _ = types::emit_tui_event(&TuiEvent::Log {
             message: "Collecting candidate files".to_string(),
@@ -685,16 +695,12 @@ fn plan_by_walking(
         });
     }
     if options.tui_events {
-        let _ = types::emit_tui_event(&TuiEvent::Count {
+        let _ = types::emit_tui_event(&TuiEvent::Count(Counts {
             files_seen: Some(files_seen),
-            groups_found: None,
-            planned_actions: None,
-            applied_actions: None,
-            hash_progress_done: None,
-            hash_progress_total: None,
-        });
+            ..Counts::default()
+        }));
         let _ = types::emit_tui_event(&TuiEvent::Phase {
-            phase: "hashing_sample".to_string(),
+            phase: Phase::HashingSample,
         });
         let _ = types::emit_tui_event(&TuiEvent::Log {
             message: "Hashing files to identify duplicate candidates".to_string(),
@@ -840,10 +846,11 @@ fn report_second_mount_skips(
         Audience::Dashboard => {
             let _ = types::emit_tui_event(&TuiEvent::Log { message });
         }
-        Audience::Person => eprintln!("{} {message}", "⚠".yellow()),
+        Audience::Person => report::print_warning(message),
         Audience::Quiet | Audience::Script => {}
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::print_stderr)]
 mod tests;

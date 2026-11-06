@@ -18,11 +18,28 @@ fn logger_slot() -> &'static Mutex<Option<LoggerState>> {
     LOGGER.get_or_init(|| Mutex::new(None))
 }
 
-fn timestamp_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+/// Now, in UTC to the millisecond: `2026-11-06T03:17:00.123Z`.
+fn timestamp() -> String {
+    crate::human::rfc3339_utc_millis(SystemTime::now())
+}
+
+/// A message as `msg="..."` holds it: backslashes, quotes and control
+/// characters escaped, so every entry is one line whatever it quotes, such
+/// as an OS error or a file name with a line break in it.
+fn escape_message(message: &str) -> String {
+    let mut escaped = String::with_capacity(message.len());
+    for ch in message.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => escaped.push_str(&format!("\\u{{{:x}}}", u32::from(ch))),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn timestamp_nanos() -> u128 {
@@ -88,7 +105,7 @@ fn install(mut sink: Box<dyn Write + Send>, command: &str) -> Result<Session> {
     writeln!(
         sink,
         "ts={} level=INFO run={} op={} msg=\"run started\"",
-        timestamp_secs(),
+        timestamp(),
         run_id,
         command
     )?;
@@ -133,7 +150,7 @@ pub fn init(command: &str) -> (Session, Result<String, String>) {
 }
 
 fn write_line(level: &str, op: &str, message: &str) {
-    let escaped = message.replace('"', "'");
+    let escaped = escape_message(message);
     if let Ok(mut slot) = logger_slot().lock()
         && let Some(state) = slot.as_mut()
     {
@@ -141,7 +158,7 @@ fn write_line(level: &str, op: &str, message: &str) {
         // lands whole, and a log on a network drive costs one round trip.
         let line = format!(
             "ts={} level={} run={} op={} msg=\"{}\"\n",
-            timestamp_secs(),
+            timestamp(),
             level,
             state.run_id,
             op,
@@ -170,7 +187,7 @@ pub fn shutdown() {
             let _ = writeln!(
                 state.sink,
                 "ts={} level=INFO run={} op=shutdown msg=\"run finished\"",
-                timestamp_secs(),
+                timestamp(),
                 state.run_id
             );
             let _ = state.sink.flush();
@@ -220,30 +237,55 @@ pub fn write_test_log(path: &Path, command: &str, message: &str) -> Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_common::TempDir;
+
+    /// One line per entry, stamped in UTC: a message with a line break, a
+    /// quote or a backslash in it, such as an OS error or a file name, is
+    /// written escaped, so it cannot split its entry or end its `msg`.
+    #[test]
+    fn a_line_is_stamped_in_utc_and_its_message_stays_on_it() {
+        let root = TempDir::new("logger_escape");
+        let path = root.join("dejaview.log");
+        let contents = write_test_log(
+            &path,
+            "escape_check",
+            "first\nsecond \"quoted\" back\\slash\ttab\u{7}",
+        )
+        .expect("write test log");
+        // Found by its op: other tests running at once log through the same
+        // global logger, so their lines may land in this file too.
+        let line = contents
+            .lines()
+            .find(|line| line.contains(" op=escape_check "))
+            .unwrap_or_else(|| panic!("the entry: {contents}"));
+        assert!(
+            line.ends_with(r#"msg="first\nsecond \"quoted\" back\\slash\ttab\u{7}""#),
+            "{line}"
+        );
+        let ts = line
+            .strip_prefix("ts=")
+            .and_then(|rest| rest.split(' ').next())
+            .expect("a timestamp");
+        let shape = ts
+            .bytes()
+            .map(|byte| if byte.is_ascii_digit() { b'0' } else { byte })
+            .collect::<Vec<_>>();
+        assert_eq!(shape, b"0000-00-00T00:00:00.000Z", "{ts}");
+    }
 
     #[test]
     fn write_test_log_persists_engine_message() {
-        let root = std::env::temp_dir().join(format!(
-            "dejaview_logger_test_{}_{}",
-            std::process::id(),
-            timestamp_nanos()
-        ));
+        let root = TempDir::new("logger_test");
         let path = root.join("dejaview.log");
         let contents =
             write_test_log(&path, "link", "temp cleanup attempted").expect("write test log");
         assert!(contents.contains("op=link"));
         assert!(contents.contains("temp cleanup attempted"));
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     #[test]
     fn log_past_the_limit_moves_to_dot_one() {
-        let root = std::env::temp_dir().join(format!(
-            "dejaview_logger_rotate_{}_{}",
-            std::process::id(),
-            timestamp_nanos()
-        ));
-        fs::create_dir_all(&root).expect("create root");
+        let root = TempDir::new("logger_rotate");
         let path = root.join("dejaview.log");
         let rotated = root.join("dejaview.log.1");
         fs::write(&rotated, b"oldest").expect("write previous rotation");
@@ -253,17 +295,11 @@ mod tests {
 
         assert!(!path.exists(), "the full log moves out of the way");
         assert_eq!(fs::read(&rotated).expect("read rotated").len(), 100);
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     #[test]
     fn log_under_the_limit_stays() {
-        let root = std::env::temp_dir().join(format!(
-            "dejaview_logger_keep_{}_{}",
-            std::process::id(),
-            timestamp_nanos()
-        ));
-        fs::create_dir_all(&root).expect("create root");
+        let root = TempDir::new("logger_keep");
         let path = root.join("dejaview.log");
         fs::write(&path, vec![b'x'; 99]).expect("write log");
 
@@ -271,16 +307,11 @@ mod tests {
 
         assert_eq!(fs::read(&path).expect("read log").len(), 99);
         assert!(!root.join("dejaview.log.1").exists());
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     #[test]
     fn session_drop_writes_shutdown_marker() {
-        let root = std::env::temp_dir().join(format!(
-            "dejaview_logger_drop_{}_{}",
-            std::process::id(),
-            timestamp_nanos()
-        ));
+        let root = TempDir::new("logger_drop");
         let path = root.join("dejaview.log");
         let _guard = lock_test_logger();
         {
@@ -289,6 +320,5 @@ mod tests {
         }
         let contents = fs::read_to_string(&path).expect("read log");
         assert!(contents.contains("msg=\"run finished\""));
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 }

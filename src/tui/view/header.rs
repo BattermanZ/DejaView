@@ -7,7 +7,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::pairs::{LinkKind, Tally};
-use super::{cut, format_bytes, group_digits, line_width, pad_left, rule, take_top, wrap_text};
+use super::{cut, format_size, group_digits, line_width, pad_left, rule, take_top, wrap_text};
+use crate::protocol::Phase;
 use crate::tui::app::{App, LinkCheck};
 use crate::tui::bignum;
 use crate::tui::theme::{Theme, Tone};
@@ -23,7 +24,7 @@ struct Hero {
 
 /// A size split into the number drawn big and its unit: `56.0` and `GiB`.
 fn split_size(bytes: u64) -> (String, String) {
-    let text = format_bytes(bytes);
+    let text = format_size(bytes);
     match text.split_once(' ') {
         Some((number, unit)) => (number.to_string(), unit.to_string()),
         None => (text, String::new()),
@@ -36,11 +37,11 @@ fn phase_word(app: &App) -> &'static str {
         return "cancelling";
     }
     match app.phase() {
-        Some("collecting") => "finding files",
-        Some("hashing_sample") => "hashing",
-        Some("hashing_full") => "verifying",
-        Some("planning") => "planning",
-        Some("applying") => "linking",
+        Some(Phase::Collecting) => "finding files",
+        Some(Phase::HashingSample) => "hashing",
+        Some(Phase::HashingFull) => "verifying",
+        Some(Phase::Planning) => "planning",
+        Some(Phase::Applying) => "linking",
         _ if app.scan_running() => "scanning",
         _ => "linking",
     }
@@ -109,7 +110,7 @@ fn stats(app: &App) -> Vec<Stat> {
         let mut stats = Vec::new();
         if app.scan_running() {
             if let Some((done, total)) = app.hash_progress() {
-                let verb = if app.phase() == Some("hashing_full") {
+                let verb = if app.phase() == Some(Phase::HashingFull) {
                     "verified"
                 } else {
                     "hashed"
@@ -247,17 +248,17 @@ fn bar(width: usize, parts: &[(f64, Style)]) -> Line<'static> {
 /// What a running job is doing, in a sentence.
 fn phase_sentence(app: &App) -> String {
     match app.phase() {
-        Some("collecting") => "Walking both folders and sorting files by size".to_string(),
-        Some("hashing_sample") => {
+        Some(Phase::Collecting) => "Walking both folders and sorting files by size".to_string(),
+        Some(Phase::HashingSample) => {
             "Reading the first and last MiB of files that share a size".to_string()
         }
-        Some("hashing_full") => match app.full_pass_progress() {
+        Some(Phase::HashingFull) => match app.full_pass_progress() {
             Some(bytes) => format!("Reading matches in full: {bytes}"),
             None => "Reading matches in full to be sure they are copies".to_string(),
         },
-        Some("planning") => "Pairing each download with its library file".to_string(),
-        Some("applying") => "Replacing downloads with links".to_string(),
-        _ => app.activity_message(),
+        Some(Phase::Planning) => "Pairing each download with its library file".to_string(),
+        Some(Phase::Applying) => "Replacing downloads with links".to_string(),
+        None => app.activity_message(),
     }
 }
 
@@ -312,7 +313,7 @@ fn caption(app: &App) -> (Line<'static>, Line<'static>) {
                     "symlinked"
                 };
                 left.push(Span::styled(
-                    format!("{} {verb}", format_bytes(bytes)),
+                    format!("{} {verb}", format_size(bytes)),
                     kind.style(),
                 ));
             }
@@ -330,7 +331,7 @@ fn caption(app: &App) -> (Line<'static>, Line<'static>) {
         .sum::<u64>();
         let right = if left_over > 0 {
             Line::from(Span::styled(
-                format!("{} not freed", format_bytes(left_over)),
+                format!("{} not freed", format_size(left_over)),
                 Theme::dim(),
             ))
         } else {
@@ -618,6 +619,7 @@ pub(super) fn render_compact(frame: &mut Frame, area: Rect, app: &App) {
 mod tests {
     use super::super::test_support::{app_with_episodes, app_with_link_report, screen};
     use super::*;
+    use crate::protocol::{EntryStatus, LinkMethod, Mode};
 
     #[test]
     fn a_scan_report_shows_the_space_to_free_big() {
@@ -650,23 +652,25 @@ mod tests {
             ..crate::config::Config::default()
         };
         let mut app = App::new(&config, false);
-        let entry = |name: &str, status: &str, method: &str| crate::tui::model::LinkReportEntry {
-            source: format!("/dl/{name}/{name}.mkv"),
-            target: format!("/media/{name}.mkv"),
-            size: 1_073_741_824,
-            status: status.to_string(),
-            method: Some(method.to_string()),
-            ..Default::default()
+        let entry = |name: &str, status: EntryStatus, method: LinkMethod| {
+            crate::tui::model::LinkReportEntry {
+                source: format!("/dl/{name}/{name}.mkv"),
+                target: format!("/media/{name}.mkv"),
+                size: 1_073_741_824,
+                status,
+                method: Some(method),
+                ..Default::default()
+            }
         };
         app.set_report_for_test(crate::protocol::RunReport {
-            mode: "link".to_string(),
+            mode: Mode::Link,
             entries: vec![
-                entry("A", "applied", "hardlink"),
-                entry("B", "applied", "symlink"),
-                entry("C", "failed", "hardlink"),
-                entry("D", "already-linked", "hardlink"),
-                entry("E", "planned", "try-hardlink"),
-                entry("F", "skipped", "hardlink"),
+                entry("A", EntryStatus::Applied, LinkMethod::Hardlink),
+                entry("B", EntryStatus::Applied, LinkMethod::Symlink),
+                entry("C", EntryStatus::Failed, LinkMethod::Hardlink),
+                entry("D", EntryStatus::AlreadyLinked, LinkMethod::Hardlink),
+                entry("E", EntryStatus::Planned, LinkMethod::TryHardlink),
+                entry("F", EntryStatus::Skipped, LinkMethod::Hardlink),
             ],
             ..Default::default()
         });
@@ -685,22 +689,22 @@ mod tests {
             ..crate::config::Config::default()
         };
         let mut app = App::new(&config, false);
-        let planned = |name: &str, method: &str| crate::tui::model::LinkReportEntry {
+        let planned = |name: &str, method: LinkMethod| crate::tui::model::LinkReportEntry {
             source: format!("/dl/{name}/{name}.mkv"),
             target: format!("/media/{name}.mkv"),
             size: 1,
-            status: "planned".to_string(),
-            method: Some(method.to_string()),
+            status: EntryStatus::Planned,
+            method: Some(method),
             ..Default::default()
         };
         app.set_report_for_test(crate::protocol::RunReport {
-            mode: "scan".to_string(),
+            mode: Mode::Scan,
             planned_actions: 3,
             total_saved_bytes: 3,
             entries: vec![
-                planned("A", "try-hardlink"),
-                planned("B", "symlink"),
-                planned("C", "symlink"),
+                planned("A", LinkMethod::TryHardlink),
+                planned("B", LinkMethod::Symlink),
+                planned("C", LinkMethod::Symlink),
             ],
             ..Default::default()
         });
@@ -737,7 +741,7 @@ mod tests {
     fn a_scan_in_progress_shows_how_far_it_is() {
         let mut app = app_with_episodes(0);
         let _cancel = app.set_running_scan_for_test();
-        app.set_hash_activity_for_test("hashing_sample", &[]);
+        app.set_hash_activity_for_test(Phase::HashingSample, &[]);
         app.set_hash_progress_for_test(412, 1290);
         let text = screen(&app, 120, 36);
         assert!(text.contains("%") && text.contains("hashing"), "{text}");
@@ -791,7 +795,7 @@ mod tests {
     fn a_narrow_header_keeps_the_space_counts_whole() {
         let mut app = app_with_episodes(3);
         app.set_report_for_test(crate::protocol::RunReport {
-            mode: "scan".to_string(),
+            mode: Mode::Scan,
             files_considered: 123_456,
             planned_actions: 3,
             total_saved_bytes: 4_500_000_000,

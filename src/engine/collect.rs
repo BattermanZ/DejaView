@@ -12,10 +12,10 @@ use std::time::{Duration, SystemTime};
 use walkdir::WalkDir;
 
 use super::cancel::{CancelToken, FirstError};
-use super::types::{FileInfo, RunMetrics, RunWarnings};
+use super::types::{FileInfo, FileSnapshot, RunMetrics};
 use super::types::{emit_tui_event, progress_due};
 use crate::logger;
-use crate::protocol::TuiEvent;
+use crate::protocol::{Counts, Phase, TuiEvent, WarningSummary};
 
 /// Names every walk leaves out, with everything under them: a folder a NAS
 /// keeps for itself is never read, so a recycle-bin copy never becomes a link
@@ -284,7 +284,7 @@ impl Found {
     fn finish(
         mut self,
         in_downloads: bool,
-        warnings: &mut RunWarnings,
+        warnings: &mut WarningSummary,
         metrics: &mut RunMetrics,
     ) -> Vec<FileInfo> {
         warnings.walk_errors += self.walk_errors;
@@ -466,34 +466,22 @@ impl<'a> Walk<'a> {
             found.skipped_by_min_age += 1;
             return;
         }
-        let mtime_ns = mtime
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
         if self.options.tui_events {
             let seen = shared.files_seen.fetch_add(1, Ordering::Relaxed) + 1;
             if progress_due() {
                 let _ = emit_tui_event(&TuiEvent::File {
-                    phase: Some("collecting".to_string()),
+                    phase: Some(Phase::Collecting),
                     path: path.display().to_string(),
                 });
-                let _ = emit_tui_event(&TuiEvent::Count {
+                let _ = emit_tui_event(&TuiEvent::Count(Counts {
                     files_seen: Some(seen),
-                    groups_found: None,
-                    planned_actions: None,
-                    applied_actions: None,
-                    hash_progress_done: None,
-                    hash_progress_total: None,
-                });
+                    ..Counts::default()
+                }));
             }
         }
         found.files.push(FileInfo {
             path,
-            size: meta.len(),
-            mtime_ns,
-            ctime_ns: (meta.ctime() as i128 * 1_000_000_000) + meta.ctime_nsec() as i128,
-            dev: meta.dev(),
-            inode: meta.ino(),
+            snapshot: FileSnapshot::from_metadata(&meta),
             hash: None,
             sample: None,
             in_downloads: self.in_downloads,
@@ -505,7 +493,7 @@ impl<'a> Walk<'a> {
 /// files in the order given.
 fn walk_roots(
     walks: &[Walk<'_>],
-    warnings: &mut RunWarnings,
+    warnings: &mut WarningSummary,
     metrics: &mut RunMetrics,
 ) -> Result<Vec<Vec<FileInfo>>> {
     let shared = WalkShared::default();
@@ -542,7 +530,7 @@ pub(super) fn collect_files(
     in_downloads: bool,
     min_age: Duration,
     options: &CollectOptions<'_>,
-    warnings: &mut RunWarnings,
+    warnings: &mut WarningSummary,
     metrics: &mut RunMetrics,
 ) -> Result<Vec<FileInfo>> {
     let walks = [Walk::new(root, other_root, in_downloads, min_age, options)];
@@ -557,7 +545,7 @@ pub(super) fn collect_run_files(
     min_age: Duration,
     options: CollectOptions<'_>,
     pool: &rayon::ThreadPool,
-    warnings: &mut RunWarnings,
+    warnings: &mut WarningSummary,
     metrics: &mut RunMetrics,
 ) -> Result<Vec<FileInfo>> {
     let spinner = if options.show_progress {
@@ -593,7 +581,7 @@ pub(super) fn collect_run_files(
 pub(super) fn group_files_by_size(files: Vec<FileInfo>) -> Vec<Vec<FileInfo>> {
     let mut size_map: HashMap<u64, Vec<FileInfo>> = HashMap::new();
     for f in files {
-        size_map.entry(f.size).or_default().push(f);
+        size_map.entry(f.snapshot.size).or_default().push(f);
     }
     size_map.into_values().filter(|v| v.len() > 1).collect()
 }

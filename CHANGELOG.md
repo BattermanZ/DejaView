@@ -4,6 +4,7 @@
 
 ### After upgrading
 
+- Each log line is stamped with its time in UTC, to the millisecond (`ts=2026-11-06T03:17:00.123Z`), where it gave seconds since 1970, so anything that parses the log's `ts` needs to read the new form; and a message's line breaks, quotes and backslashes are written escaped (`\n`, `\"`, `\\`), so every entry is one line. Before, an error with a line break in it split its entry, and quotes became apostrophes. [#7]
 - A scan or link that finishes with a file it could not read, hash or link now exits with code 2, where it exited 0, a link run stopped partway by Ctrl+C, SIGTERM or the dashboard's cancel exits 1, and a command line DejaView cannot read, such as an unknown option, exits 1 where it exited 2. A cron line that alerts on any non-zero code now alerts on those runs; the report and the log say which file failed and why. [#5]
 - `total_saved_bytes` in a link run's report is what the run freed, where it was every planned path's size, failed ones included; in a scan's it counts a cross-seeded download once. `planned_bytes` and `freed_bytes` give both. [#5]
 - Files whose names are not valid UTF-8 are hashed once more on the first run, since their cache entries are now keyed by their exact bytes; every other entry is kept as it is. [#5]
@@ -19,6 +20,7 @@
 
 ### Added
 
+- Each release has a static Linux binary for `x86_64` and `aarch64`, which needs no Rust and no system library, with a `SHA256SUMS` file to check it against; the README says how to install one. [#7]
 - Saving the folders in the dashboard's path editor tries one hardlink between them, as `dejaview config validate` does and after the same check that neither folder reaches the other through a second mount, and the dashboard says whether link runs will make hardlinks or symlinks, and why. In symlink-only mode it makes no test. [#6]
 - `--quiet` (`-q`) on `scan` and `link` prints nothing unless the run linked something or something failed, so a cron job mails only when something happened. The README's cron example uses it. [#5]
 - The report says how its run ended (`outcome`: `complete`, `cancelled` or `failed`), when (`started_at`, `finished_at`), with what (`version`, `downloads`, `media`, `link_mode`), how many downloads became symlinks (`symlinked`) and how many pairs already were one file (`already_linked`, `already_linked_bytes`). [#5]
@@ -43,11 +45,12 @@
 - A repeat scan reads only files it has not hashed before: the cache now keeps each file's quick hash too, so a file whose quick hash matched no other is not read again. Before, every file sharing its size with a new or changed one was read again on every run. [#4]
 - A file of 1 MiB or less is read once, not twice: its quick hash reads it whole and stands as its full hash. [#4]
 - Files of a size that no download shares with a library file are no longer read, nor are those where every download already is a library file: no link can come of them. [#4]
-- The dashboard's logo is "déjàview" in lowercase pixel letters with depth, teal with two orange accents, and shows whenever the full header does, from 100 columns. Before, it was block capitals, and below 119 columns the header showed the name as plain text instead. `dejaview tui-logo-preview` shows the logo on its own. [#6]
+- The dashboard's logo is "déjàview" in lowercase pixel letters with depth, teal with two orange accents, and shows whenever the full header does, from 100 columns. Before, it was block capitals, and below 119 columns the header showed the name as plain text instead. `dejaview tui-logo-preview`, which `--help` leaves out, shows the logo on its own. [#6]
 - The dashboard shows each download beside its library file with the link between them drawn in the middle: a green line for a hardlink, an amber arrow for a symlink, a dashed orange line for a pair not linked yet (ending in an arrow when the plan makes it a symlink), a red ✗ for a failure. A season's episodes sit under their release folder, the space to free (or freed) is drawn big above them with the count of each kind of link, and the selected pair is told in full below, with why it is a symlink or why it failed. While a scan runs it shows its steps and the files it reads. The keys at the foot are the ones that work on the screen shown, the next step first. Before, every row showed the same "PLANNED" and "TRY HARDLINK" chips, a symlink wore the same APPLIED chip as a hardlink, told apart by a lighter shade and the OUTCOME column, which a narrow terminal hid, the counts were repeated in four places, and a running scan's results pane said no duplicates were loaded. The settings the sidebar listed are in Help. [#6]
 
 ### Fixed
 
+- A scan or link run as a user who cannot write to the downloads folder, on a downloads folder with no space left, or as a user who cannot read the media folder, stops before it walks anything and says which folder and why. Before, such a scan could hash for hours and then fail to save its cache. `dejaview config validate`, every scan and link, and the dashboard's path editor now check a configuration the same way and name every problem at once. [#7]
 - A file whose name is not valid UTF-8 can be linked from the dashboard, and two names that differ only in such bytes are told apart: a report entry gives such a path's bytes in hex in `source_raw` or `target_raw`, and the cache keys each name apart. Before, `l` and `L` linked nothing for such a file, its report rows could not be told apart, and the cache kept one entry for both names, so both were hashed again on every run. [#5]
 - `cache audit-temp` and `cache cleanup-temp` find a temporary symlink left beside a download by a run stopped partway, and remove the link without touching the library file it points at. Before, they listed and removed only temporary files. [#5]
 - A folder DejaView cannot read, such as a NAS's recycle bin, no longer stops the cache from forgetting files that are gone: entries under that folder are kept and the rest are dropped as usual. Before, one unreadable folder kept every stale entry for good. The log now names each path a walk could not read, and why. [#5]
@@ -84,3 +87,4 @@
 [#4]: https://github.com/BattermanZ/DejaView/pull/4
 [#5]: https://github.com/BattermanZ/DejaView/pull/5
 [#6]: https://github.com/BattermanZ/DejaView/pull/6
+[#7]: https://github.com/BattermanZ/DejaView/pull/7

@@ -1,9 +1,4 @@
 /target
-
-# Local manual test fixtures
-/test-fixtures/fake-library/downloads/
-/test-fixtures/fake-library/media/
-/test-fixtures/fake-library/**/*.json
 .remote-debug/dejaview.remote.log
 
 # CodeGraph local index (machine-local, do not commit)

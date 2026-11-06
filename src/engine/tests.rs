@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::Config;
+use crate::test_common::TempDir;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
@@ -15,16 +16,8 @@ use super::linking::{
     Applied, ApplyOptions, ApplyOutcome, CanonicalRoots, LinkRequest, Linked, apply_actions,
     ensure_target_within_media_root, plan_group_actions, replace_file_with_best_link_with,
 };
-use super::types::{Cache, CacheEntry, FileInfo, LinkMode, RunMetrics, RunWarnings};
-use crate::protocol::LinkReportEntry;
-
-fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time before epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("dejaview_{prefix}_{}_{}", std::process::id(), ts))
-}
+use super::types::{Cache, CacheEntry, FileInfo, FileSnapshot, LinkMode, RunMetrics};
+use crate::protocol::{EntryStatus, LinkMethod, LinkReportEntry};
 
 fn make_config(downloads: &Path, media: &Path, min_age: u64) -> Config {
     Config {
@@ -50,11 +43,13 @@ fn write_file(path: &Path, content: &[u8]) {
 fn sample_file_info(path: &str, dev: u64, inode: u64, in_downloads: bool) -> FileInfo {
     FileInfo {
         path: PathBuf::from(path),
-        size: 10,
-        mtime_ns: 0,
-        ctime_ns: inode as i128,
-        dev,
-        inode,
+        snapshot: FileSnapshot {
+            size: 10,
+            mtime_ns: 0,
+            ctime_ns: inode as i128,
+            dev,
+            inode,
+        },
         hash: Some("h".into()),
         sample: None,
         in_downloads,
@@ -65,18 +60,9 @@ fn run_scan(config: &Config, dry_run: bool, strict: bool, report_path: Option<&P
     run_scan_with_options(
         config,
         ScanRunOptions {
-            dry_run,
             strict,
             report_path,
-            json_output: false,
-            quiet: false,
-            show_progress: false,
-            require_confirm: false,
-            tui_events: false,
-            link_mode: LinkMode::Best,
-            only_sources: &[],
-            only_pairs: &[],
-            cancel: CancelToken::default(),
+            ..ScanRunOptions::for_test(dry_run)
         },
     )
     .expect("run scan");
@@ -154,7 +140,7 @@ fn running_as_root() -> bool {
 
 #[test]
 fn allows_target_inside_media_root() {
-    let root = unique_temp_dir("inside");
+    let root = TempDir::new("inside");
     let media = root.join("media");
     let nested = media.join("movies");
     let target = nested.join("a.mkv");
@@ -163,13 +149,11 @@ fn allows_target_inside_media_root() {
 
     let result = ensure_target_within_media_root(&media, &target);
     assert!(result.is_ok());
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn rejects_target_outside_media_root() {
-    let root = unique_temp_dir("outside");
+    let root = TempDir::new("outside");
     let media = root.join("media");
     let other = root.join("other");
     let target = other.join("b.mkv");
@@ -179,8 +163,6 @@ fn rejects_target_outside_media_root() {
 
     let result = ensure_target_within_media_root(&media, &target);
     assert!(result.is_err());
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -194,7 +176,7 @@ fn rejects_symlink_target_inside_media_root() {
     {
         use std::os::unix::fs::symlink;
 
-        let root = unique_temp_dir("symlink_target");
+        let root = TempDir::new("symlink_target");
         let media = root.join("media");
         let real = root.join("real");
         let target = media.join("movie.mkv");
@@ -211,14 +193,12 @@ fn rejects_symlink_target_inside_media_root() {
                 .to_string()
                 .contains("refusing to link to symlink target")
         );
-
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 }
 
 #[test]
 fn replaces_file_with_relative_symlink_atomically() {
-    let root = unique_temp_dir("replace");
+    let root = TempDir::new("replace");
     let downloads = root.join("downloads");
     let media = root.join("media");
     fs::create_dir_all(&downloads).expect("create downloads dir");
@@ -239,7 +219,7 @@ fn replaces_file_with_relative_symlink_atomically() {
         |from, to| fs::rename(from, to),
     )
     .expect("replace with symlink");
-    assert_eq!(linked.method, "symlink");
+    assert_eq!(linked.method, LinkMethod::Symlink);
 
     let meta = fs::symlink_metadata(&src).expect("metadata");
     assert!(meta.file_type().is_symlink());
@@ -248,13 +228,11 @@ fn replaces_file_with_relative_symlink_atomically() {
         PathBuf::from("../media/canonical.mkv")
     );
     assert_eq!(fs::read(&src).expect("read through link"), b"new");
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn replace_file_with_best_link_falls_back_to_symlink_on_hardlink_error() {
-    let root = unique_temp_dir("fallback_symlink");
+    let root = TempDir::new("fallback_symlink");
     let downloads = root.join("downloads");
     let media = root.join("media");
     fs::create_dir_all(&downloads).expect("create downloads dir");
@@ -281,7 +259,7 @@ fn replace_file_with_best_link_falls_back_to_symlink_on_hardlink_error() {
     )
     .expect("replace with fallback");
 
-    assert_eq!(result.method, "symlink");
+    assert_eq!(result.method, LinkMethod::Symlink);
     let fallback_reason = result.fallback_reason.expect("fallback reason");
     assert!(fallback_reason.contains("hardlink failed"));
     assert!(fallback_reason.contains("symlink applied successfully"));
@@ -297,13 +275,11 @@ fn replace_file_with_best_link_falls_back_to_symlink_on_hardlink_error() {
     let meta = fs::symlink_metadata(&src).expect("source metadata");
     assert!(meta.file_type().is_symlink());
     assert_eq!(fs::read(&src).expect("read through symlink"), b"new");
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn hardlink_replace_cleans_up_temp_name_that_survives_rename() {
-    let root = unique_temp_dir("leftover_temp_hardlink");
+    let root = TempDir::new("leftover_temp_hardlink");
     let downloads = root.join("downloads");
     let media = root.join("media");
     fs::create_dir_all(&downloads).expect("create downloads dir");
@@ -343,8 +319,6 @@ fn hardlink_replace_cleans_up_temp_name_that_survives_rename() {
         })
         .count();
     assert_eq!(leftovers, 0);
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 fn planned_entry_for(action: &super::types::LinkAction) -> LinkReportEntry {
@@ -352,7 +326,7 @@ fn planned_entry_for(action: &super::types::LinkAction) -> LinkReportEntry {
         source: action.src.display().to_string(),
         target: action.tgt.display().to_string(),
         size: action.size,
-        status: "planned".to_string(),
+        status: EntryStatus::Planned,
         method: None,
         fallback_reason: None,
         error: None,
@@ -362,32 +336,30 @@ fn planned_entry_for(action: &super::types::LinkAction) -> LinkReportEntry {
 
 #[test]
 fn clear_cache_file_is_idempotent() {
-    let root = unique_temp_dir("cache_clear");
-    fs::create_dir_all(&root).expect("create temp dir");
+    let root = TempDir::new("cache_clear");
     let cache = root.join(".dejaview_cache.json");
 
     clear_cache_file(&cache).expect("first clear on missing file");
     fs::write(&cache, b"{}").expect("write cache");
     clear_cache_file(&cache).expect("second clear removes file");
     clear_cache_file(&cache).expect("third clear still ok");
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn save_cache_writes_json() {
-    let root = unique_temp_dir("save_cache");
-    fs::create_dir_all(&root).expect("create temp dir");
+    let root = TempDir::new("save_cache");
     let cache_path = root.join(".dejaview_cache.json");
     let mut cache = Cache::new();
     cache.insert(
         "foo".into(),
         CacheEntry {
-            size: 42,
-            mtime_ns: 123,
-            ctime_ns: 456,
-            dev: 7,
-            inode: 8,
+            snapshot: FileSnapshot {
+                size: 42,
+                mtime_ns: 123,
+                ctime_ns: 456,
+                dev: 7,
+                inode: 8,
+            },
             hash: Some("abc".into()),
             sample: None,
         },
@@ -400,8 +372,6 @@ fn save_cache_writes_json() {
         loaded.get("foo").expect("foo key").hash.as_deref(),
         Some("abc")
     );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -449,7 +419,7 @@ fn plan_group_actions_skips_library_file_seen_through_a_second_mount() {
     // timestamps; its only copy must not be replaced.
     let pool_view = sample_file_info("/pool/media/m.mkv", 1, 10, false);
     let mut branch_view = sample_file_info("/disk1/media/m.mkv", 2, 500, true);
-    branch_view.ctime_ns = pool_view.ctime_ns;
+    branch_view.snapshot.ctime_ns = pool_view.snapshot.ctime_ns;
     assert!(plan_group_actions(&[&pool_view, &branch_view]).is_empty());
 
     // The same holds when the library has a second copy that sorts first: the
@@ -457,7 +427,7 @@ fn plan_group_actions_skips_library_file_seen_through_a_second_mount() {
     let copy_a = sample_file_info("/pool/media/A/m.mkv", 1, 10, false);
     let copy_b = sample_file_info("/pool/media/B/m.mkv", 1, 11, false);
     let mut branch_b = sample_file_info("/disk1/media/B/m.mkv", 2, 501, true);
-    branch_b.ctime_ns = copy_b.ctime_ns;
+    branch_b.snapshot.ctime_ns = copy_b.snapshot.ctime_ns;
     assert!(plan_group_actions(&[&copy_a, &copy_b, &branch_b]).is_empty());
 
     // A real copy on another device has its own ctime and is still planned.
@@ -467,7 +437,7 @@ fn plan_group_actions_skips_library_file_seen_through_a_second_mount() {
 
 #[test]
 fn link_run_keeps_a_download_hardlinked_to_a_second_library_copy() {
-    let root = unique_temp_dir("second_library_copy");
+    let root = TempDir::new("second_library_copy");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let copy_a = media.join("A Movies").join("m.mkv");
@@ -486,7 +456,6 @@ fn link_run_keeps_a_download_hardlinked_to_a_second_library_copy() {
         fs::metadata(&copy_b).expect("copy b").ino(),
         "the download keeps its hardlink to B"
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -500,7 +469,7 @@ fn plan_group_actions_requires_both_sides() {
 #[test]
 fn collect_files_strict_fails_on_walk_error() {
     let missing = PathBuf::from("/this/path/does/not/exist/dejaview");
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut metrics = RunMetrics::default();
     let result = collect_files(
         &test_root(&missing),
@@ -524,7 +493,7 @@ fn collect_files_strict_fails_on_walk_error() {
 
 #[test]
 fn partially_linked_groups_still_plan_remaining_download_duplicates() {
-    let root = unique_temp_dir("partial_group");
+    let root = TempDir::new("partial_group");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let linked_download = downloads.join("movie.mkv");
@@ -536,7 +505,7 @@ fn partially_linked_groups_still_plan_remaining_download_duplicates() {
         .expect("create downloads");
     fs::hard_link(&target, &linked_download).expect("create already-linked download");
 
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut metrics = RunMetrics::default();
     let mut files = collect_run_files(
         &downloads,
@@ -566,13 +535,11 @@ fn partially_linked_groups_still_plan_remaining_download_duplicates() {
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].src, remaining_download);
     assert_eq!(actions[0].tgt, target);
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn run_scan_dry_run_does_not_replace_file() {
-    let root = unique_temp_dir("dry_run");
+    let root = TempDir::new("dry_run");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let src = downloads.join("movie.mkv");
@@ -585,12 +552,11 @@ fn run_scan_dry_run_does_not_replace_file() {
 
     let meta = fs::symlink_metadata(&src).expect("source metadata");
     assert!(meta.file_type().is_file());
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn run_scan_apply_prefers_hardlink_when_possible() {
-    let root = unique_temp_dir("apply_run");
+    let root = TempDir::new("apply_run");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let src = downloads.join("movie.mkv");
@@ -609,12 +575,11 @@ fn run_scan_apply_prefers_hardlink_when_possible() {
         fs::read(&src).expect("read through hardlink"),
         b"same-content"
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn run_scan_writes_link_report_manifest() {
-    let root = unique_temp_dir("report_manifest");
+    let root = TempDir::new("report_manifest");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let report = root.join("report.json");
@@ -653,13 +618,11 @@ fn run_scan_writes_link_report_manifest() {
             .expect("status"),
         "applied"
     );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn apply_actions_rejects_source_metadata_change_after_planning() {
-    let root = unique_temp_dir("source_changed");
+    let root = TempDir::new("source_changed");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let src = downloads.join("movie.mkv");
@@ -673,35 +636,13 @@ fn apply_actions_rejects_source_metadata_change_after_planning() {
         src: src.clone(),
         tgt: tgt.clone(),
         size: src_meta.len(),
-        src_snapshot: super::types::FileSnapshot {
-            size: src_meta.len(),
-            mtime_ns: src_meta
-                .modified()
-                .expect("src modified")
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("src mtime")
-                .as_nanos(),
-            ctime_ns: (src_meta.ctime() as i128 * 1_000_000_000) + src_meta.ctime_nsec() as i128,
-            dev: src_meta.dev(),
-            inode: src_meta.ino(),
-        },
-        tgt_snapshot: super::types::FileSnapshot {
-            size: tgt_meta.len(),
-            mtime_ns: tgt_meta
-                .modified()
-                .expect("tgt modified")
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("tgt mtime")
-                .as_nanos(),
-            ctime_ns: (tgt_meta.ctime() as i128 * 1_000_000_000) + tgt_meta.ctime_nsec() as i128,
-            dev: tgt_meta.dev(),
-            inode: tgt_meta.ino(),
-        },
+        src_snapshot: FileSnapshot::from_metadata(&src_meta),
+        tgt_snapshot: FileSnapshot::from_metadata(&tgt_meta),
     };
     std::thread::sleep(Duration::from_millis(2));
     write_file(&src, b"changed-content");
 
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut report_entries = vec![planned_entry_for(&action)];
     let ApplyOutcome {
         counts: Applied { applied, .. },
@@ -724,7 +665,7 @@ fn apply_actions_rejects_source_metadata_change_after_planning() {
     assert_eq!(applied, 0);
     assert!(strict_error.is_none());
     assert_eq!(warnings.link_errors, 1);
-    assert_eq!(report_entries[0].status, "failed");
+    assert_eq!(report_entries[0].status, EntryStatus::Failed);
     assert!(
         report_entries[0]
             .error
@@ -733,13 +674,11 @@ fn apply_actions_rejects_source_metadata_change_after_planning() {
             .contains("source changed since planning")
     );
     assert_eq!(fs::read(&src).expect("read src"), b"changed-content");
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn apply_actions_rejects_target_metadata_change_after_planning() {
-    let root = unique_temp_dir("target_changed");
+    let root = TempDir::new("target_changed");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let src = downloads.join("movie.mkv");
@@ -753,35 +692,13 @@ fn apply_actions_rejects_target_metadata_change_after_planning() {
         src: src.clone(),
         tgt: tgt.clone(),
         size: src_meta.len(),
-        src_snapshot: super::types::FileSnapshot {
-            size: src_meta.len(),
-            mtime_ns: src_meta
-                .modified()
-                .expect("src modified")
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("src mtime")
-                .as_nanos(),
-            ctime_ns: (src_meta.ctime() as i128 * 1_000_000_000) + src_meta.ctime_nsec() as i128,
-            dev: src_meta.dev(),
-            inode: src_meta.ino(),
-        },
-        tgt_snapshot: super::types::FileSnapshot {
-            size: tgt_meta.len(),
-            mtime_ns: tgt_meta
-                .modified()
-                .expect("tgt modified")
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("tgt mtime")
-                .as_nanos(),
-            ctime_ns: (tgt_meta.ctime() as i128 * 1_000_000_000) + tgt_meta.ctime_nsec() as i128,
-            dev: tgt_meta.dev(),
-            inode: tgt_meta.ino(),
-        },
+        src_snapshot: FileSnapshot::from_metadata(&src_meta),
+        tgt_snapshot: FileSnapshot::from_metadata(&tgt_meta),
     };
     std::thread::sleep(Duration::from_millis(2));
     write_file(&tgt, b"changed-content");
 
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut report_entries = vec![planned_entry_for(&action)];
     let ApplyOutcome {
         counts: Applied { applied, .. },
@@ -804,7 +721,7 @@ fn apply_actions_rejects_target_metadata_change_after_planning() {
     assert_eq!(applied, 0);
     assert!(strict_error.is_none());
     assert_eq!(warnings.link_errors, 1);
-    assert_eq!(report_entries[0].status, "failed");
+    assert_eq!(report_entries[0].status, EntryStatus::Failed);
     assert!(
         report_entries[0]
             .error
@@ -814,13 +731,11 @@ fn apply_actions_rejects_target_metadata_change_after_planning() {
     );
     let meta = fs::symlink_metadata(&src).expect("src metadata after reject");
     assert!(meta.file_type().is_file());
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn apply_actions_allow_multiple_sources_for_same_target_in_one_run() {
-    let root = unique_temp_dir("multi_source_same_target");
+    let root = TempDir::new("multi_source_same_target");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let src_a = downloads.join("movie-a.mkv");
@@ -833,60 +748,25 @@ fn apply_actions_allow_multiple_sources_for_same_target_in_one_run() {
     let src_a_meta = fs::metadata(&src_a).expect("src_a metadata");
     let src_b_meta = fs::metadata(&src_b).expect("src_b metadata");
     let tgt_meta = fs::metadata(&tgt).expect("tgt metadata");
-    let tgt_snapshot = super::types::FileSnapshot {
-        size: tgt_meta.len(),
-        mtime_ns: tgt_meta
-            .modified()
-            .expect("tgt modified")
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("tgt mtime")
-            .as_nanos(),
-        ctime_ns: (tgt_meta.ctime() as i128 * 1_000_000_000) + tgt_meta.ctime_nsec() as i128,
-        dev: tgt_meta.dev(),
-        inode: tgt_meta.ino(),
-    };
+    let tgt_snapshot = FileSnapshot::from_metadata(&tgt_meta);
     let actions = vec![
         super::types::LinkAction {
             src: src_a.clone(),
             tgt: tgt.clone(),
             size: src_a_meta.len(),
-            src_snapshot: super::types::FileSnapshot {
-                size: src_a_meta.len(),
-                mtime_ns: src_a_meta
-                    .modified()
-                    .expect("src_a modified")
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .expect("src_a mtime")
-                    .as_nanos(),
-                ctime_ns: (src_a_meta.ctime() as i128 * 1_000_000_000)
-                    + src_a_meta.ctime_nsec() as i128,
-                dev: src_a_meta.dev(),
-                inode: src_a_meta.ino(),
-            },
-            tgt_snapshot: tgt_snapshot.clone(),
+            src_snapshot: FileSnapshot::from_metadata(&src_a_meta),
+            tgt_snapshot,
         },
         super::types::LinkAction {
             src: src_b.clone(),
             tgt: tgt.clone(),
             size: src_b_meta.len(),
-            src_snapshot: super::types::FileSnapshot {
-                size: src_b_meta.len(),
-                mtime_ns: src_b_meta
-                    .modified()
-                    .expect("src_b modified")
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .expect("src_b mtime")
-                    .as_nanos(),
-                ctime_ns: (src_b_meta.ctime() as i128 * 1_000_000_000)
-                    + src_b_meta.ctime_nsec() as i128,
-                dev: src_b_meta.dev(),
-                inode: src_b_meta.ino(),
-            },
+            src_snapshot: FileSnapshot::from_metadata(&src_b_meta),
             tgt_snapshot,
         },
     ];
 
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut report_entries = actions.iter().map(planned_entry_for).collect::<Vec<_>>();
     let ApplyOutcome {
         counts: Applied { applied, .. },
@@ -909,7 +789,11 @@ fn apply_actions_allow_multiple_sources_for_same_target_in_one_run() {
     assert_eq!(applied, 2);
     assert!(strict_error.is_none());
     assert_eq!(warnings.link_errors, 0);
-    assert!(report_entries.iter().all(|entry| entry.status == "applied"));
+    assert!(
+        report_entries
+            .iter()
+            .all(|entry| entry.status == EntryStatus::Applied)
+    );
 
     let src_a_meta = fs::metadata(&src_a).expect("src_a metadata after apply");
     let src_b_meta = fs::metadata(&src_b).expect("src_b metadata after apply");
@@ -918,8 +802,6 @@ fn apply_actions_allow_multiple_sources_for_same_target_in_one_run() {
     assert_eq!(src_b_meta.ino(), tgt_meta.ino());
     assert_eq!(src_a_meta.dev(), tgt_meta.dev());
     assert_eq!(src_b_meta.dev(), tgt_meta.dev());
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -933,7 +815,7 @@ fn run_scan_report_write_refuses_symlink_target() {
     {
         use std::os::unix::fs::symlink;
 
-        let root = unique_temp_dir("report_symlink");
+        let root = TempDir::new("report_symlink");
         let downloads = root.join("downloads");
         let media = root.join("media");
         let src = downloads.join("movie.mkv");
@@ -952,8 +834,6 @@ fn run_scan_report_write_refuses_symlink_target() {
         let src_meta = fs::metadata(&src).expect("src metadata");
         let tgt_meta = fs::metadata(&tgt).expect("tgt metadata");
         assert_eq!(src_meta.ino(), tgt_meta.ino());
-
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 }
 
@@ -962,7 +842,7 @@ fn run_scan_report_write_failure_is_non_fatal() {
     if running_as_root() {
         return;
     }
-    let root = unique_temp_dir("report_write_failure");
+    let root = TempDir::new("report_write_failure");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let report_dir = root.join("readonly_report");
@@ -990,25 +870,140 @@ fn run_scan_report_write_failure_is_non_fatal() {
         .permissions();
     reset.set_mode(0o755);
     fs::set_permissions(&report_dir, reset).expect("reset perms");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
+/// A link leaves files younger than `min_age` alone, and links the same
+/// pair once no minimum age keeps it out: the second run is the control that
+/// shows the first had something to leave alone.
 #[test]
 fn run_scan_respects_min_age_filter() {
-    let root = unique_temp_dir("min_age");
+    let root = TempDir::new("min_age");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let src = downloads.join("movie.mkv");
     let tgt = media.join("movie.mkv");
     write_file(&src, b"same-content");
     write_file(&tgt, b"same-content");
-    let config = make_config(&downloads, &media, 3600);
+    let inode = |path: &Path| fs::metadata(path).expect("metadata").ino();
+    let src_inode = inode(&src);
+    let report = root.join("report.json");
 
-    run_scan(&config, false, false, None);
+    run_scan(
+        &make_config(&downloads, &media, 3600),
+        false,
+        false,
+        Some(&report),
+    );
+    assert_eq!(inode(&src), src_inode, "an hour old at most: left alone");
+    let written: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("report")).expect("parse report");
+    assert_eq!(written["skipped_by_min_age"], 2);
+    assert_eq!(written["planned_actions"], 0);
 
-    let meta = fs::symlink_metadata(&src).expect("source metadata");
-    assert!(meta.file_type().is_file());
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
+    run_scan(&make_config(&downloads, &media, 0), false, false, None);
+    assert_eq!(inode(&src), inode(&tgt), "with no minimum age, linked");
+}
+
+/// A link run that links one pair and fails the other finishes, exits with
+/// code 2 (ADR 0003), and reports each pair as it ended: the failure with
+/// its OS error and no planned method, and only the linked pair's bytes as
+/// freed. Root writes into any folder, so as root this returns early; `just
+/// test` runs it again as nobody.
+#[test]
+fn a_link_run_with_one_failed_pair_reports_each_pair_as_it_ended() {
+    if running_as_root() {
+        return;
+    }
+    let root = TempDir::new("partial_failure");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_file(&downloads.join("locked/b.mkv"), b"second-content");
+    write_file(&downloads.join("open/a.mkv"), b"first");
+    write_file(&media.join("b.mkv"), b"second-content");
+    write_file(&media.join("a.mkv"), b"first");
+    let locked = downloads.join("locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).expect("lock folder");
+    let report = root.join("report.json");
+
+    let end = run_scan_with_options(
+        &make_config(&downloads, &media, 0),
+        ScanRunOptions {
+            report_path: Some(&report),
+            ..ScanRunOptions::for_test(false)
+        },
+    )
+    .expect("a run with a failed pair still finishes");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("unlock folder");
+
+    assert_eq!(end, RunEnd::WithFailures);
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("report")).expect("parse report");
+    assert_eq!(report["outcome"], "complete");
+    assert_eq!(report["planned_actions"], 2);
+    assert_eq!(report["applied_actions"], 1);
+    assert_eq!(report["warnings"]["link_errors"], 1);
+    let failed = &report["entries"][0];
+    assert!(
+        failed["source"]
+            .as_str()
+            .is_some_and(|source| source.ends_with("locked/b.mkv"))
+    );
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["method"], serde_json::Value::Null);
+    assert!(
+        failed["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("Permission denied")),
+        "{failed}"
+    );
+    assert_eq!(report["entries"][1]["status"], "applied");
+    assert_eq!(report["entries"][1]["method"], "hardlink");
+    assert_eq!(report["planned_bytes"], 19);
+    assert_eq!(report["freed_bytes"], 5, "only the linked pair's bytes");
+    assert_eq!(report["total_saved_bytes"], 5);
+}
+
+/// A dashboard link of reviewed rows stopped before its first pair still
+/// writes its report: outcome `cancelled`, every pair still planned, nothing
+/// freed, and the run ends as cancelled, which exits 1.
+#[test]
+fn a_link_cancelled_before_its_first_pair_reports_cancelled() {
+    let root = TempDir::new("cancelled_report");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let src = downloads.join("movie.mkv");
+    let tgt = media.join("movie.mkv");
+    write_file(&src, b"same-content");
+    write_file(&tgt, b"same-content");
+    let src_inode = fs::metadata(&src).expect("meta").ino();
+    let config = make_config(&downloads, &media, 0);
+    // The scan caches both hashes, so the reviewed row is planned from the
+    // cache and the cancel is first seen when linking starts.
+    run_scan(&config, true, false, None);
+    let cancel = CancelToken::default();
+    cancel.cancel();
+    let pairs = [(src.clone(), tgt.clone())];
+    let report = root.join("report.json");
+
+    let end = run_scan_with_options(
+        &config,
+        ScanRunOptions {
+            only_pairs: &pairs,
+            cancel,
+            report_path: Some(&report),
+            ..ScanRunOptions::for_test(false)
+        },
+    )
+    .expect("a link cancelled partway returns how it ended");
+
+    assert_eq!(end, RunEnd::Cancelled);
+    assert_eq!(fs::metadata(&src).expect("meta").ino(), src_inode);
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("report")).expect("parse report");
+    assert_eq!(report["outcome"], "cancelled");
+    assert_eq!(report["applied_actions"], 0);
+    assert_eq!(report["freed_bytes"], 0);
+    assert_eq!(report["entries"][0]["status"], "planned");
 }
 
 #[test]
@@ -1016,7 +1011,7 @@ fn run_scan_strict_fails_on_sample_hash_error() {
     if running_as_root() {
         return;
     }
-    let root = unique_temp_dir("strict_hash");
+    let root = TempDir::new("strict_hash");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let src = downloads.join("bad.mkv");
@@ -1031,44 +1026,17 @@ fn run_scan_strict_fails_on_sample_hash_error() {
     let strict_result = run_scan_with_options(
         &config,
         ScanRunOptions {
-            dry_run: true,
             strict: true,
-            report_path: None,
-            json_output: false,
-            quiet: false,
-            show_progress: false,
-            require_confirm: false,
-            tui_events: false,
-            link_mode: LinkMode::Best,
-            only_sources: &[],
-            only_pairs: &[],
-            cancel: CancelToken::default(),
+            ..ScanRunOptions::for_test(true)
         },
     );
     assert!(strict_result.is_err());
-    let non_strict_result = run_scan_with_options(
-        &config,
-        ScanRunOptions {
-            dry_run: true,
-            strict: false,
-            report_path: None,
-            json_output: false,
-            quiet: false,
-            show_progress: false,
-            require_confirm: false,
-            tui_events: false,
-            link_mode: LinkMode::Best,
-            only_sources: &[],
-            only_pairs: &[],
-            cancel: CancelToken::default(),
-        },
-    );
+    let non_strict_result = run_scan_with_options(&config, ScanRunOptions::for_test(true));
     assert!(non_strict_result.is_ok());
 
     let mut reset = fs::metadata(&src).expect("src metadata").permissions();
     reset.set_mode(0o644);
     fs::set_permissions(&src, reset).expect("reset perms");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -1076,7 +1044,7 @@ fn run_scan_non_strict_link_failure_continues() {
     if running_as_root() {
         return;
     }
-    let root = unique_temp_dir("link_fail_non_strict");
+    let root = TempDir::new("link_fail_non_strict");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let src_dir = downloads.join("readonly");
@@ -1091,23 +1059,7 @@ fn run_scan_non_strict_link_failure_continues() {
     fs::set_permissions(&src_dir, dir_perms).expect("make dir readonly");
     let config = make_config(&downloads, &media, 0);
 
-    let result = run_scan_with_options(
-        &config,
-        ScanRunOptions {
-            dry_run: false,
-            strict: false,
-            report_path: None,
-            json_output: false,
-            quiet: false,
-            show_progress: false,
-            require_confirm: false,
-            tui_events: false,
-            link_mode: LinkMode::Best,
-            only_sources: &[],
-            only_pairs: &[],
-            cancel: CancelToken::default(),
-        },
-    );
+    let result = run_scan_with_options(&config, ScanRunOptions::for_test(false));
     // ADR 0003: exit code 2, finished with a failure.
     assert_eq!(result.expect("the run finishes"), RunEnd::WithFailures);
     let meta = fs::symlink_metadata(&src).expect("source metadata");
@@ -1118,7 +1070,6 @@ fn run_scan_non_strict_link_failure_continues() {
         .permissions();
     reset.set_mode(0o755);
     fs::set_permissions(&src_dir, reset).expect("reset dir perms");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -1126,7 +1077,7 @@ fn run_scan_strict_link_failure_returns_error() {
     if running_as_root() {
         return;
     }
-    let root = unique_temp_dir("link_fail_strict");
+    let root = TempDir::new("link_fail_strict");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let src_dir = downloads.join("readonly");
@@ -1144,18 +1095,8 @@ fn run_scan_strict_link_failure_returns_error() {
     let result = run_scan_with_options(
         &config,
         ScanRunOptions {
-            dry_run: false,
             strict: true,
-            report_path: None,
-            json_output: false,
-            quiet: false,
-            show_progress: false,
-            require_confirm: false,
-            tui_events: false,
-            link_mode: LinkMode::Best,
-            only_sources: &[],
-            only_pairs: &[],
-            cancel: CancelToken::default(),
+            ..ScanRunOptions::for_test(false)
         },
     );
     assert!(result.is_err());
@@ -1171,12 +1112,11 @@ fn run_scan_strict_link_failure_returns_error() {
         .permissions();
     reset.set_mode(0o755);
     fs::set_permissions(&src_dir, reset).expect("reset dir perms");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn run_scan_creates_and_reuses_cache_file() {
-    let root = unique_temp_dir("cache_reuse");
+    let root = TempDir::new("cache_reuse");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let src = downloads.join("movie.mkv");
@@ -1194,8 +1134,6 @@ fn run_scan_creates_and_reuses_cache_file() {
     run_scan(&config, true, false, None);
     let second_cache = load_cache(&cache_file);
     assert_eq!(second_cache.len(), first_cache.len());
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -1203,8 +1141,7 @@ fn save_cache_failure_cleans_up_temp_file() {
     if running_as_root() {
         return;
     }
-    let root = unique_temp_dir("cache_fail");
-    fs::create_dir_all(&root).expect("create root");
+    let root = TempDir::new("cache_fail");
     let cache_file = root.join(".dejaview_cache.json");
     let mut perms = fs::metadata(&root).expect("root metadata").permissions();
     perms.set_mode(0o555);
@@ -1214,11 +1151,13 @@ fn save_cache_failure_cleans_up_temp_file() {
     cache.insert(
         "k".into(),
         CacheEntry {
-            size: 1,
-            mtime_ns: 1,
-            ctime_ns: 2,
-            dev: 3,
-            inode: 4,
+            snapshot: FileSnapshot {
+                size: 1,
+                mtime_ns: 1,
+                ctime_ns: 2,
+                dev: 3,
+                inode: 4,
+            },
             hash: Some("h".into()),
             sample: None,
         },
@@ -1240,28 +1179,15 @@ fn save_cache_failure_cleans_up_temp_file() {
     let mut reset = fs::metadata(&root).expect("root metadata").permissions();
     reset.set_mode(0o755);
     fs::set_permissions(&root, reset).expect("reset perms");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
-fn snapshot_of(path: &Path) -> super::types::FileSnapshot {
-    let meta = fs::metadata(path).expect("metadata");
-    super::types::FileSnapshot {
-        size: meta.len(),
-        mtime_ns: meta
-            .modified()
-            .expect("modified")
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("mtime")
-            .as_nanos(),
-        ctime_ns: (meta.ctime() as i128 * 1_000_000_000) + meta.ctime_nsec() as i128,
-        dev: meta.dev(),
-        inode: meta.ino(),
-    }
+fn snapshot_of(path: &Path) -> FileSnapshot {
+    FileSnapshot::from_metadata(&fs::symlink_metadata(path).expect("metadata"))
 }
 
 #[test]
 fn apply_actions_refuses_to_replace_a_file_inside_the_media_root() {
-    let root = unique_temp_dir("source_in_media");
+    let root = TempDir::new("source_in_media");
     let media = root.join("media");
     let canonical = media.join("a.mkv");
     let library_copy = media.join("b.mkv");
@@ -1276,7 +1202,7 @@ fn apply_actions_refuses_to_replace_a_file_inside_the_media_root() {
         src_snapshot: snapshot_of(&library_copy),
         tgt_snapshot: snapshot_of(&canonical),
     };
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut report_entries = vec![planned_entry_for(&action)];
     let ApplyOutcome {
         counts: Applied { applied, .. },
@@ -1309,22 +1235,20 @@ fn apply_actions_refuses_to_replace_a_file_inside_the_media_root() {
         library_copy_inode,
         "library file must not be replaced"
     );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn collect_refuses_a_directory_that_is_the_other_root() {
     // Without mount rights, stand in for a bind mount: the other root's device
     // and inode are those of a folder inside the tree being walked.
-    let root = unique_temp_dir("other_root_inside");
+    let root = TempDir::new("other_root_inside");
     let downloads = root.join("downloads");
     let library_view = downloads.join("data").join("media");
     write_file(&library_view.join("m.mkv"), b"library bytes");
     let mut media = RootId::of("media", &library_view).expect("media id");
     media.path = root.join("media");
 
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut metrics = RunMetrics::default();
     let err = collect_files(
         &test_root(&downloads),
@@ -1364,12 +1288,11 @@ fn collect_refuses_a_directory_that_is_the_other_root() {
         )
         .is_ok()
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn collect_files_skips_dejaview_own_files() {
-    let root = unique_temp_dir("own_files");
+    let root = TempDir::new("own_files");
     write_file(&root.join("movie.mkv"), b"content");
     write_file(&root.join(".dejaview_cache.json"), b"{}");
     write_file(&root.join(".dejaview_link_report.json"), b"{}");
@@ -1380,7 +1303,7 @@ fn collect_files_skips_dejaview_own_files() {
     );
     write_file(&root.join(".dejaview-notes.txt"), b"not ours");
 
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut metrics = RunMetrics::default();
     let files = collect_files(
         &test_root(&root),
@@ -1406,12 +1329,11 @@ fn collect_files_skips_dejaview_own_files() {
     names.sort();
 
     assert_eq!(names, vec![".dejaview-notes.txt", "movie.mkv"]);
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn run_scan_prunes_cache_entries_for_removed_files() {
-    let root = unique_temp_dir("cache_prune");
+    let root = TempDir::new("cache_prune");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_file(&downloads.join("keep.mkv"), b"keep-content");
@@ -1438,18 +1360,18 @@ fn run_scan_prunes_cache_entries_for_removed_files() {
         cache.contains_key(&keep_key),
         "present path must stay cached"
     );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn prune_cache_keeps_entries_under_what_the_walk_could_not_read() {
     let entry = CacheEntry {
-        size: 1,
-        mtime_ns: 0,
-        ctime_ns: 0,
-        dev: 1,
-        inode: 1,
+        snapshot: FileSnapshot {
+            size: 1,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            dev: 1,
+            inode: 1,
+        },
         hash: Some("h".into()),
         sample: None,
     };
@@ -1492,7 +1414,7 @@ fn a_folder_the_walk_cannot_read_keeps_its_entries_and_the_rest_is_pruned() {
     if running_as_root() {
         return;
     }
-    let root = unique_temp_dir("prune_unreadable");
+    let root = TempDir::new("prune_unreadable");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let locked = media.join("locked");
@@ -1507,23 +1429,7 @@ fn a_folder_the_walk_cannot_read_keeps_its_entries_and_the_rest_is_pruned() {
 
     fs::remove_file(media.join("gone.mkv")).expect("remove library file");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("lock folder");
-    let result = run_scan_with_options(
-        &config,
-        ScanRunOptions {
-            dry_run: true,
-            strict: false,
-            report_path: None,
-            json_output: false,
-            quiet: false,
-            show_progress: false,
-            require_confirm: false,
-            tui_events: false,
-            link_mode: LinkMode::Best,
-            only_sources: &[],
-            only_pairs: &[],
-            cancel: CancelToken::default(),
-        },
-    );
+    let result = run_scan_with_options(&config, ScanRunOptions::for_test(true));
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("unlock folder");
 
     assert_eq!(result.expect("the scan finishes"), RunEnd::WithFailures);
@@ -1533,7 +1439,6 @@ fn a_folder_the_walk_cannot_read_keeps_its_entries_and_the_rest_is_pruned() {
         "kept under the folder that could not be read"
     );
     assert!(!cache.contains_key("media/gone.mkv"), "pruned elsewhere");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -1543,11 +1448,13 @@ fn prune_cache_keeps_only_seen_paths() {
         cache.insert(
             path.to_string(),
             CacheEntry {
-                size: 1,
-                mtime_ns: 0,
-                ctime_ns: 0,
-                dev: 1,
-                inode: 1,
+                snapshot: FileSnapshot {
+                    size: 1,
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                    dev: 1,
+                    inode: 1,
+                },
                 hash: Some("h".into()),
                 sample: None,
             },
@@ -1567,7 +1474,7 @@ fn prune_cache_keeps_only_seen_paths() {
 
 #[test]
 fn cancelled_link_run_returns_cancelled_and_changes_nothing() {
-    let root = unique_temp_dir("cancelled_run");
+    let root = TempDir::new("cancelled_run");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_file(&downloads.join("movie.mkv"), b"same-content");
@@ -1582,18 +1489,8 @@ fn cancelled_link_run_returns_cancelled_and_changes_nothing() {
     let err = run_scan_with_options(
         &config,
         ScanRunOptions {
-            dry_run: false,
-            strict: false,
-            report_path: None,
-            json_output: false,
-            quiet: false,
-            show_progress: false,
-            require_confirm: false,
-            tui_events: false,
-            link_mode: LinkMode::Best,
-            only_sources: &[],
-            only_pairs: &[],
             cancel,
+            ..ScanRunOptions::for_test(false)
         },
     )
     .expect_err("a cancelled run returns an error");
@@ -1606,12 +1503,11 @@ fn cancelled_link_run_returns_cancelled_and_changes_nothing() {
         download_inode
     );
     assert!(!downloads.join(".dejaview_link_report.json").exists());
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn apply_actions_stops_before_the_next_file_when_cancelled() {
-    let root = unique_temp_dir("cancelled_apply");
+    let root = TempDir::new("cancelled_apply");
     let src = root.join("downloads").join("movie.mkv");
     let tgt = root.join("media").join("movie.mkv");
     write_file(&src, b"same-content");
@@ -1626,7 +1522,7 @@ fn apply_actions_stops_before_the_next_file_when_cancelled() {
     };
     let cancel = CancelToken::default();
     cancel.cancel();
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut report_entries = vec![planned_entry_for(&action)];
 
     let outcome = apply_actions(
@@ -1645,14 +1541,13 @@ fn apply_actions_stops_before_the_next_file_when_cancelled() {
 
     assert!(outcome.cancelled);
     assert_eq!(outcome.counts.applied, 0);
-    assert_eq!(report_entries[0].status, "planned");
+    assert_eq!(report_entries[0].status, EntryStatus::Planned);
     assert_eq!(fs::metadata(&src).expect("meta").ino(), src_inode);
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn full_digest_stops_when_cancelled() {
-    let root = unique_temp_dir("cancelled_digest");
+    let root = TempDir::new("cancelled_digest");
     let path = root.join("big.bin");
     write_file(&path, &[1u8; 4096]);
     let cancel = CancelToken::default();
@@ -1662,12 +1557,11 @@ fn full_digest_stops_when_cancelled() {
         super::hashing::full_digest(&path, 4096, &cancel, &|_| {}).expect_err("cancelled digest");
 
     assert!(err.is::<Cancelled>());
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn link_run_leaves_empty_files_alone() {
-    let root = unique_temp_dir("empty_files");
+    let root = TempDir::new("empty_files");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let keep = downloads.join("Show.S01").join(".keep");
@@ -1689,7 +1583,6 @@ fn link_run_leaves_empty_files_alone() {
         plexignore_meta.ino(),
         "an empty download must not share the library file's inode"
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -1697,7 +1590,7 @@ fn cross_seeded_downloads_sharing_an_inode_are_all_linked() {
     // Two torrents seed one file through two hardlinked paths; the library
     // holds its own copy. Replacing the first path changes the shared inode's
     // link count and ctime, which must not fail the second.
-    let root = unique_temp_dir("cross_seed");
+    let root = TempDir::new("cross_seed");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let first = downloads.join("t1").join("movie.mkv");
@@ -1713,18 +1606,9 @@ fn cross_seeded_downloads_sharing_an_inode_are_all_linked() {
     run_scan_with_options(
         &config,
         ScanRunOptions {
-            dry_run: false,
             strict: true,
             report_path: Some(&report),
-            json_output: false,
-            quiet: false,
-            show_progress: false,
-            require_confirm: false,
-            tui_events: false,
-            link_mode: LinkMode::Best,
-            only_sources: &[],
-            only_pairs: &[],
-            cancel: CancelToken::default(),
+            ..ScanRunOptions::for_test(false)
         },
     )
     .expect("a strict run links both paths");
@@ -1737,7 +1621,6 @@ fn cross_seeded_downloads_sharing_an_inode_are_all_linked() {
             .expect("parse report");
     assert_eq!(report["applied_actions"], 2);
     assert_eq!(report["warnings"]["link_errors"], 0);
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -1749,7 +1632,7 @@ fn link_that_would_lock_out_the_download_owner_is_refused() {
     // The torrent client owns its download; the library copy belongs to the
     // *arr user and is closed to everyone else. A hardlink would hand the
     // download the library's owner and mode, and seeding would stop.
-    let root = unique_temp_dir("owner_lockout");
+    let root = TempDir::new("owner_lockout");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let download = downloads.join("movie.mkv");
@@ -1781,7 +1664,6 @@ fn link_that_would_lock_out_the_download_owner_is_refused() {
         error.contains("uid 1001"),
         "names who loses access: {error}"
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -1814,7 +1696,7 @@ fn a_download_found_to_be_the_library_file_at_link_time_is_already_linked() {
     // mergerfs without use_ino reports two inode numbers for one file, so the
     // plan sees a copy. rename(2) of one name over another of the same file
     // does nothing, and the temp name survives: nothing was linked.
-    let root = unique_temp_dir("already_linked");
+    let root = TempDir::new("already_linked");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let src = downloads.join("movie.mkv");
@@ -1829,7 +1711,7 @@ fn a_download_found_to_be_the_library_file_at_link_time_is_already_linked() {
         src_snapshot: snapshot_of(&src),
         tgt_snapshot: snapshot_of(&tgt),
     };
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut report_entries = vec![planned_entry_for(&action)];
 
     let outcome = apply_actions(
@@ -1849,7 +1731,7 @@ fn a_download_found_to_be_the_library_file_at_link_time_is_already_linked() {
     assert!(outcome.strict_error.is_none());
     assert_eq!(outcome.counts.applied, 0, "nothing was linked");
     assert_eq!(outcome.counts.already_linked, 1);
-    assert_eq!(report_entries[0].status, "already-linked");
+    assert_eq!(report_entries[0].status, EntryStatus::AlreadyLinked);
     assert_eq!(warnings.link_errors, 0);
     let leftovers = fs::read_dir(&downloads)
         .expect("read downloads")
@@ -1857,14 +1739,13 @@ fn a_download_found_to_be_the_library_file_at_link_time_is_already_linked() {
         .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
         .count();
     assert_eq!(leftovers, 0, "the surviving temp name is removed");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_symlink_the_filesystem_made_for_a_hardlink_is_reported_as_a_symlink() {
     // mergerfs's link-exdev option answers link(2) across disks with a symlink
     // to the library file and reports success.
-    let root = unique_temp_dir("link_exdev");
+    let root = TempDir::new("link_exdev");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let src = downloads.join("movie.mkv");
@@ -1883,7 +1764,11 @@ fn a_symlink_the_filesystem_made_for_a_hardlink_is_reported_as_a_symlink() {
     )
     .expect("link");
 
-    assert_eq!(linked.method, "symlink", "the report says what is on disk");
+    assert_eq!(
+        linked.method,
+        LinkMethod::Symlink,
+        "the report says what is on disk"
+    );
     assert!(
         linked
             .fallback_reason
@@ -1898,7 +1783,6 @@ fn a_symlink_the_filesystem_made_for_a_hardlink_is_reported_as_a_symlink() {
             .file_type()
             .is_symlink()
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -1906,7 +1790,7 @@ fn a_library_file_replaced_while_linking_leaves_the_download_alone() {
     // Sonarr renames an upgrade over the library file between the pre-link
     // checks and the hardlink. The download must not end up a link to the new
     // file, hard or symbolic: its own bytes would be gone.
-    let root = unique_temp_dir("replaced_target");
+    let root = TempDir::new("replaced_target");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let upgrade = root.join("upgrade.mkv");
@@ -1939,7 +1823,6 @@ fn a_library_file_replaced_while_linking_leaves_the_download_alone() {
     let meta = fs::symlink_metadata(&src).expect("src");
     assert!(meta.file_type().is_file(), "the download is still a file");
     assert_eq!(fs::read(&src).expect("read src"), b"same-bytes");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -1947,7 +1830,7 @@ fn a_library_path_swapped_for_a_symlink_while_linking_is_refused() {
     // link(2) does not follow a symlink: a library path swapped for one after
     // the checks leaves a symlink to wherever it points at the temp name. No
     // link of any kind may then replace the download.
-    let root = unique_temp_dir("swapped_target");
+    let root = TempDir::new("swapped_target");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let elsewhere = root.join("elsewhere").join("secret");
@@ -1976,14 +1859,13 @@ fn a_library_path_swapped_for_a_symlink_while_linking_is_refused() {
     let meta = fs::symlink_metadata(&src).expect("src");
     assert!(meta.file_type().is_file(), "the download is still a file");
     assert_eq!(fs::read(&src).expect("read src"), b"same-bytes");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_download_replaced_while_linking_is_not_overwritten() {
     // The torrent client re-creates the download after the checks: the rename
     // must not replace a file the plan never saw.
-    let root = unique_temp_dir("replaced_source");
+    let root = TempDir::new("replaced_source");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let fresh = root.join("fresh.mkv");
@@ -2015,13 +1897,12 @@ fn a_download_replaced_while_linking_is_not_overwritten() {
         .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
         .count();
     assert_eq!(leftovers, 0);
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn a_folder_swapped_for_a_symlink_while_linking_cannot_redirect_the_rename() {
-    let root = unique_temp_dir("swapped_folder");
+    let root = TempDir::new("swapped_folder");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let folder = downloads.join("Movie.2016");
@@ -2051,7 +1932,7 @@ fn a_folder_swapped_for_a_symlink_while_linking_cannot_redirect_the_rename() {
     )
     .expect("link");
 
-    assert_eq!(linked.method, "hardlink");
+    assert_eq!(linked.method, LinkMethod::Hardlink);
     assert_eq!(
         fs::read(elsewhere.join("movie.mkv")).expect("decoy"),
         b"someone else's file",
@@ -2062,12 +1943,11 @@ fn a_folder_swapped_for_a_symlink_while_linking_cannot_redirect_the_rename() {
         fs::metadata(&tgt).expect("tgt").ino(),
         "the download in the folder that was opened is the one linked"
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_download_whose_folder_resolves_outside_downloads_is_refused() {
-    let root = unique_temp_dir("folder_outside");
+    let root = TempDir::new("folder_outside");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let elsewhere = root.join("elsewhere");
@@ -2102,7 +1982,6 @@ fn a_download_whose_folder_resolves_outside_downloads_is_refused() {
             .ino(),
         before
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -2111,7 +1990,7 @@ fn a_pair_left_alone_for_access_does_not_stop_a_strict_run() {
         eprintln!("skipped: changing file owners needs root");
         return;
     }
-    let root = unique_temp_dir("access_skip_strict");
+    let root = TempDir::new("access_skip_strict");
     let downloads = root.join("downloads");
     let media = root.join("media");
     // Sorts first: its library copy is closed to the download's owner.
@@ -2133,18 +2012,9 @@ fn a_pair_left_alone_for_access_does_not_stop_a_strict_run() {
     run_scan_with_options(
         &config,
         ScanRunOptions {
-            dry_run: false,
             strict: true,
             report_path: Some(&report),
-            json_output: false,
-            quiet: false,
-            show_progress: false,
-            require_confirm: false,
-            tui_events: false,
-            link_mode: LinkMode::Best,
-            only_sources: &[],
-            only_pairs: &[],
-            cancel: CancelToken::default(),
+            ..ScanRunOptions::for_test(false)
         },
     )
     .expect("a deliberate skip is not a failure");
@@ -2169,12 +2039,11 @@ fn a_pair_left_alone_for_access_does_not_stop_a_strict_run() {
         .expect("locked entry");
     assert_eq!(locked_entry["status"], "skipped");
     assert_eq!(report["warnings"]["link_errors"], 0);
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_warm_scan_reads_no_file_it_already_knows() {
-    let root = unique_temp_dir("warm_reads");
+    let root = TempDir::new("warm_reads");
     let downloads = root.join("downloads");
     let media = root.join("media");
     // Same size, different content: the quick hashes differ, so neither file
@@ -2191,13 +2060,11 @@ fn a_warm_scan_reads_no_file_it_already_knows() {
     assert_eq!(super::hashing::read_log::reads_under(&root), 4);
     run_scan(&config, true, false, None);
     assert_eq!(super::hashing::read_log::reads_under(&root), 4);
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn excluded_folders_are_never_walked() {
-    let root = unique_temp_dir("exclude");
+    let root = TempDir::new("exclude");
     let downloads = root.join("downloads");
     let media = root.join("media");
     // A recycle-bin copy sorts first by bytes, so without the exclude list it
@@ -2208,7 +2075,7 @@ fn excluded_folders_are_never_walked() {
     write_file(&downloads.join("@eaDir/thumb.mkv"), b"same-content");
     let config = make_config(&downloads, &media, 0);
     let exclude = Exclude::new(config.effective_exclude());
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut metrics = RunMetrics::default();
 
     let files = collect_run_files(
@@ -2236,13 +2103,11 @@ fn excluded_folders_are_never_walked() {
     );
     // Each excluded folder counts once, whatever it holds.
     assert_eq!(metrics.skipped_by_exclude, 2);
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn the_parallel_walk_finds_every_file_in_a_wide_tree() {
-    let root = unique_temp_dir("wide_walk");
+    let root = TempDir::new("wide_walk");
     let downloads = root.join("downloads");
     let media = root.join("media");
     for show in 0..12 {
@@ -2260,7 +2125,7 @@ fn the_parallel_walk_finds_every_file_in_a_wide_tree() {
     }
     let config = make_config(&downloads, &media, 0);
     let exclude = Exclude::new(config.effective_exclude());
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut metrics = RunMetrics::default();
 
     let files = collect_run_files(
@@ -2293,13 +2158,11 @@ fn the_parallel_walk_finds_every_file_in_a_wide_tree() {
         downloads_sorted,
         "each root's files come back sorted by path"
     );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_cancelled_walk_stops_with_cancelled() {
-    let root = unique_temp_dir("cancelled_walk");
+    let root = TempDir::new("cancelled_walk");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_file(&downloads.join("a/b.mkv"), b"x");
@@ -2321,17 +2184,15 @@ fn a_cancelled_walk_stops_with_cancelled() {
             cancel: &cancel,
         },
         &test_pool(),
-        &mut RunWarnings::default(),
+        &mut WarningSummary::default(),
         &mut RunMetrics::default(),
     );
     assert!(result.expect_err("cancelled").is::<Cancelled>());
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_cache_with_the_old_absolute_keys_is_renamed_without_reading_anything() {
-    let root = unique_temp_dir("cache_migrate");
+    let root = TempDir::new("cache_migrate");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_file(&downloads.join("Movie/movie.mkv"), b"same-content");
@@ -2363,13 +2224,11 @@ fn a_cache_with_the_old_absolute_keys_is_renamed_without_reading_anything() {
         keys,
         vec!["downloads/Movie/movie.mkv", "media/Movies/movie.mkv"]
     );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn an_unchanged_cache_is_not_written_again() {
-    let root = unique_temp_dir("cache_unchanged");
+    let root = TempDir::new("cache_unchanged");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_file(&downloads.join("movie.mkv"), b"same-content");
@@ -2382,8 +2241,6 @@ fn an_unchanged_cache_is_not_written_again() {
     run_scan(&config, true, false, None);
     // A save writes a new file and renames it into place.
     assert_eq!(fs::metadata(&cache_file).expect("cache").ino(), written);
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -2405,11 +2262,13 @@ fn cache_keys_name_the_root_so_two_mounts_of_one_share_agree() {
     // A cache kept by the old version: absolute keys, one outside both roots.
     let mut cache = Cache::new();
     let entry = CacheEntry {
-        size: 1,
-        mtime_ns: 0,
-        ctime_ns: 0,
-        dev: 1,
-        inode: 1,
+        snapshot: FileSnapshot {
+            size: 1,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            dev: 1,
+            inode: 1,
+        },
         hash: Some("h".into()),
         sample: None,
     };
@@ -2432,13 +2291,13 @@ fn cache_keys_name_the_root_so_two_mounts_of_one_share_agree() {
 #[test]
 fn hashing_saves_the_cache_as_it_goes() {
     use super::hashing::{Checkpoint, HashOptions, hash_groups_and_update_cache};
-    let root = unique_temp_dir("checkpoint");
+    let root = TempDir::new("checkpoint");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_file(&downloads.join("movie.mkv"), b"same-content");
     write_file(&media.join("movie.mkv"), b"same-content");
     let exclude = Exclude::default();
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let files = collect_run_files(
         &downloads,
         &media,
@@ -2459,18 +2318,8 @@ fn hashing_saves_the_cache_as_it_goes() {
     let mut groups = group_files_by_size(files);
     let cache_file = root.join("checkpoint.json");
     let selection = ScanRunOptions {
-        dry_run: true,
         strict: true,
-        report_path: None,
-        json_output: false,
-        quiet: false,
-        show_progress: false,
-        require_confirm: false,
-        tui_events: false,
-        link_mode: LinkMode::Best,
-        only_sources: &[],
-        only_pairs: &[],
-        cancel: CancelToken::default(),
+        ..ScanRunOptions::for_test(true)
     };
     let keys = super::cache::CacheKeys::new(&downloads, &media);
     let mut cache = Cache::new();
@@ -2500,13 +2349,11 @@ fn hashing_saves_the_cache_as_it_goes() {
     let saved = load_cache(&cache_file);
     assert_eq!(saved.len(), 2, "{saved:?}");
     assert_eq!(hashed.cache_writes, 2);
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn the_cache_vouches_only_for_rows_the_walk_would_plan_the_same() {
-    let root = unique_temp_dir("vouch");
+    let root = TempDir::new("vouch");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_file(&downloads.join("a.mkv"), b"same-content");
@@ -2554,13 +2401,11 @@ fn the_cache_vouches_only_for_rows_the_walk_would_plan_the_same() {
     fs::hard_link(media.join("a.mkv"), downloads.join("a.mkv")).expect("hardlink");
     let why = vouch(&downloads.join("a.mkv"), &media.join("a.mkv")).expect_err("hardlinked");
     assert!(why.contains("other hardlinks"), "{why}");
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn the_cache_does_not_vouch_for_a_download_that_is_a_library_file_through_a_mount() {
-    let root = unique_temp_dir("vouch_mount");
+    let root = TempDir::new("vouch_mount");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_file(&downloads.join("a.mkv"), b"same-content");
@@ -2604,15 +2449,16 @@ fn the_cache_does_not_vouch_for_a_download_that_is_a_library_file_through_a_moun
     cache.insert(
         "media/B/a.mkv".into(),
         CacheEntry {
-            dev: download.dev + 1,
-            inode: download.inode + 1,
+            snapshot: FileSnapshot {
+                dev: download.snapshot.dev + 1,
+                inode: download.snapshot.inode + 1,
+                ..download.snapshot
+            },
             ..download
         },
     );
     let why = vouch(&cache).expect_err("second device");
     assert!(why.contains("seen through a second mount"), "{why}");
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 /// A link run over `downloads` and `media` that writes its report to
@@ -2629,7 +2475,7 @@ fn link_and_read_report(downloads: &Path, media: &Path, report: &Path) -> serde_
 
 #[test]
 fn a_failed_pair_names_the_os_error_and_drops_the_planned_method() {
-    let root = unique_temp_dir("failed_pair_chain");
+    let root = TempDir::new("failed_pair_chain");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let src = downloads.join("movie.mkv");
@@ -2644,12 +2490,12 @@ fn a_failed_pair_names_the_os_error_and_drops_the_planned_method() {
         tgt_snapshot: snapshot_of(&tgt),
     };
     let mut entry = planned_entry_for(&action);
-    entry.method = Some("try-hardlink".to_string());
+    entry.method = Some(LinkMethod::TryHardlink);
     entry.fallback_reason = Some("tries hardlink first; may fall back to symlink".to_string());
     // Gone between the plan and the link, as when a torrent is removed.
     fs::remove_file(&src).expect("remove download");
 
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut report_entries = vec![entry];
     apply_actions(
         &[action],
@@ -2666,7 +2512,7 @@ fn a_failed_pair_names_the_os_error_and_drops_the_planned_method() {
     );
 
     let entry = &report_entries[0];
-    assert_eq!(entry.status, "failed");
+    assert_eq!(entry.status, EntryStatus::Failed);
     let error = entry.error.as_deref().expect("error");
     assert!(error.contains("cannot look up"), "{error}");
     assert!(
@@ -2675,12 +2521,11 @@ fn a_failed_pair_names_the_os_error_and_drops_the_planned_method() {
     );
     assert_eq!(entry.method, None, "nothing was linked");
     assert_eq!(entry.fallback_reason, None);
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn freed_bytes_count_a_cross_seeded_download_once() {
-    let root = unique_temp_dir("freed_bytes");
+    let root = TempDir::new("freed_bytes");
     let downloads = root.join("downloads");
     let media = root.join("media");
     // Two torrents seed one 18-byte file; a third download is its own file.
@@ -2699,12 +2544,11 @@ fn freed_bytes_count_a_cross_seeded_download_once() {
     assert_eq!(report["planned_bytes"], 18 + 10);
     assert_eq!(report["freed_bytes"], 18 + 10, "{report}");
     assert_eq!(report["total_saved_bytes"], 18 + 10);
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_scan_counts_a_cross_seeded_download_once() {
-    let root = unique_temp_dir("planned_bytes");
+    let root = TempDir::new("planned_bytes");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let first = downloads.join("t1").join("movie.mkv");
@@ -2729,12 +2573,11 @@ fn a_scan_counts_a_cross_seeded_download_once() {
     assert_eq!(report["planned_bytes"], 18);
     assert_eq!(report["total_saved_bytes"], 18);
     assert_eq!(report["freed_bytes"], 0);
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_link_run_that_planned_nothing_leaves_the_last_report_alone() {
-    let root = unique_temp_dir("report_left_alone");
+    let root = TempDir::new("report_left_alone");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_file(&downloads.join("unique.mkv"), b"only in downloads");
@@ -2753,12 +2596,11 @@ fn a_link_run_that_planned_nothing_leaves_the_last_report_alone() {
     let asked = root.join("asked.json");
     run_scan(&config, false, false, Some(&asked));
     assert!(asked.exists());
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_report_says_when_and_how_its_run_ended() {
-    let root = unique_temp_dir("report_fields");
+    let root = TempDir::new("report_fields");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_file(&downloads.join("movie.mkv"), b"same-content");
@@ -2781,12 +2623,11 @@ fn a_report_says_when_and_how_its_run_ended() {
     assert_eq!(report["link_mode"], "best");
     assert_eq!(report["symlinked"], 0);
     assert_eq!(report["already_linked"], 0);
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn report_times_are_rfc_3339_in_utc() {
-    let at = |secs| super::report::rfc3339_utc(UNIX_EPOCH + Duration::from_secs(secs));
+    let at = |secs| crate::human::rfc3339_utc(UNIX_EPOCH + Duration::from_secs(secs));
     assert_eq!(at(0), "1970-01-01T00:00:00Z");
     assert_eq!(at(951_782_400), "2000-02-29T00:00:00Z");
     assert_eq!(at(1_762_399_020), "2025-11-06T03:17:00Z");
@@ -2802,8 +2643,8 @@ fn a_plan_comes_out_in_download_path_order() {
         let mut download = sample_file_info(&format!("/downloads/{n:02}.mkv"), 2, 2000 + n, true);
         library.hash = Some(format!("h{n}"));
         download.hash = Some(format!("h{n}"));
-        library.size = 10 + n;
-        download.size = 10 + n;
+        library.snapshot.size = 10 + n;
+        download.snapshot.size = 10 + n;
         groups.push(vec![library, download]);
     }
     groups.reverse();
@@ -2862,5 +2703,40 @@ fn cache_keys_keep_bytes_that_are_not_utf8() {
     assert_eq!(
         keys.key(Path::new("/dl/Show/é.mkv"), true),
         "downloads/Show/é.mkv"
+    );
+}
+
+#[test]
+fn a_cache_entry_is_one_flat_object_on_disk() {
+    let full = CacheEntry {
+        snapshot: FileSnapshot {
+            size: 42,
+            mtime_ns: 1_700_000_000_123_456_789,
+            ctime_ns: 1_700_000_000_987_654_321,
+            dev: 2049,
+            inode: 131_073,
+        },
+        hash: Some("ab".into()),
+        sample: Some("cd".into()),
+    };
+    let json = serde_json::to_string(&full).expect("serialise");
+    assert_eq!(
+        json,
+        r#"{"size":42,"mtime_ns":1700000000123456789,"ctime_ns":1700000000987654321,"dev":2049,"inode":131073,"hash":"ab","sample":"cd"}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<CacheEntry>(&json).expect("parse"),
+        full
+    );
+    // A quick hash alone leaves the full hash out, as before.
+    let quick = CacheEntry { hash: None, ..full };
+    let json = serde_json::to_string(&quick).expect("serialise");
+    assert_eq!(
+        json,
+        r#"{"size":42,"mtime_ns":1700000000123456789,"ctime_ns":1700000000987654321,"dev":2049,"inode":131073,"sample":"cd"}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<CacheEntry>(&json).expect("parse"),
+        quick
     );
 }

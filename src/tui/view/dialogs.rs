@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use super::pairs::{LinkKind, Tally};
-use super::{SYMLINK_BREAKS, format_bytes, pad, sentence, trim_keep_name, wrap_text};
+use super::{SYMLINK_BREAKS, format_size, pad, sentence, trim_keep_name, wrap_text};
 use crate::tui::app::{App, ConfigEditor, ConfigField, ConfirmLinkMode, LinkCheck};
 use crate::tui::theme::Theme;
 
@@ -201,7 +201,7 @@ fn help_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     lines.push(Line::raw(""));
     for (name, value) in [
         ("Min age", format!("{}s", app.min_age_secs())),
-        ("Min size", format_bytes(app.min_size_bytes())),
+        ("Min size", format_size(app.min_size_bytes())),
         ("Threads", app.threads_label()),
         ("Full reads", app.full_threads_label()),
         ("Link mode", app.link_mode_label().to_string()),
@@ -434,7 +434,7 @@ pub(super) fn render_confirm_link(frame: &mut Frame, app: &App, mode: ConfirmLin
             let mut text = format!(
                 "{how}\n\nOnly the pairs this scan showed are linked: files found since are left alone, and so is a pair whose files changed.\n\n{pairs} {}, {} to free",
                 if pairs == 1 { "pair" } else { "pairs" },
-                format_bytes(bytes)
+                format_size(bytes)
             );
             if with_errors > 0 {
                 text.push_str(&format!(
@@ -526,6 +526,7 @@ pub(super) fn render_notice(frame: &mut Frame, app: &App, message: &str) {
 mod tests {
     use super::super::test_support::{app_with_episodes, screen};
     use super::*;
+    use crate::protocol::{LinkMethod, Mode};
     use crossterm::event::{KeyCode, KeyModifiers};
 
     fn press(app: &mut App, code: KeyCode) {
@@ -570,7 +571,7 @@ mod tests {
         let mut app = app_with_episodes(2);
         // Two paths of one download: the scan counts its bytes once.
         let mut report = crate::protocol::RunReport {
-            mode: "scan".to_string(),
+            mode: Mode::Scan,
             planned_actions: 2,
             total_saved_bytes: 1_500_000_000,
             entries: app.rows().to_vec(),
@@ -587,9 +588,9 @@ mod tests {
     fn link_all_says_which_pairs_become_symlinks() {
         let mut app = app_with_episodes(2);
         let mut entries = app.rows().to_vec();
-        entries[1].method = Some("symlink".to_string());
+        entries[1].method = Some(LinkMethod::Symlink);
         app.set_report_for_test(crate::protocol::RunReport {
-            mode: "scan".to_string(),
+            mode: Mode::Scan,
             planned_actions: 2,
             total_saved_bytes: 3_000_000_000,
             entries,

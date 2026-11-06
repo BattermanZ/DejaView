@@ -15,12 +15,12 @@ use std::time::{Duration, Instant};
 
 use super::cache::CacheKeys;
 use super::cancel::{CancelToken, Cancelled, FirstError};
-use super::linking::{plan_hashed_group_actions, snapshot_from_file_info};
+use super::linking::plan_hashed_group_actions;
 use super::report::build_report_entries;
-use super::types::{Cache, CacheEntry, FileInfo, LinkMode, RunWarnings};
+use super::types::{Cache, CacheEntry, FileInfo, FileSnapshot, LinkMode};
 use super::types::{emit_tui_event, progress_due};
 use crate::logger;
-use crate::protocol::TuiEvent;
+use crate::protocol::{Counts, Phase, TuiEvent, WarningSummary};
 
 /// Every path a hash opened, so a test can count reads under its own folder.
 #[cfg(test)]
@@ -108,10 +108,10 @@ fn worker_id() -> usize {
     current_thread_index().map_or(1, |idx| idx + 1)
 }
 
-fn emit_worker_activity(phase: &str, worker: usize, path: Option<String>, tui_events: bool) {
+fn emit_worker_activity(phase: Phase, worker: usize, path: Option<String>, tui_events: bool) {
     if tui_events {
         let _ = emit_tui_event(&TuiEvent::WorkerActivity {
-            phase: phase.to_string(),
+            phase,
             worker,
             path,
         });
@@ -121,14 +121,11 @@ fn emit_worker_activity(phase: &str, worker: usize, path: Option<String>, tui_ev
 /// Hashing progress for the TUI, paced except at a phase's start and end.
 fn emit_hash_progress(done: usize, total: usize, tui_events: bool) {
     if tui_events && (done == 0 || done == total || progress_due()) {
-        let _ = emit_tui_event(&TuiEvent::Count {
-            files_seen: None,
-            groups_found: None,
-            planned_actions: None,
-            applied_actions: None,
+        let _ = emit_tui_event(&TuiEvent::Count(Counts {
             hash_progress_done: Some(done),
             hash_progress_total: Some(total),
-        });
+            ..Counts::default()
+        }));
     }
 }
 
@@ -269,10 +266,10 @@ impl GroupWork {
 }
 
 fn split_by_inode(group: &[FileInfo]) -> Vec<Vec<usize>> {
-    let mut index: HashMap<(u64, u64, u128, i128), usize> = HashMap::new();
+    let mut index: HashMap<FileSnapshot, usize> = HashMap::new();
     let mut inodes: Vec<Vec<usize>> = Vec::new();
     for (idx, file) in group.iter().enumerate() {
-        match index.entry((file.dev, file.inode, file.mtime_ns, file.ctime_ns)) {
+        match index.entry(file.snapshot) {
             Entry::Occupied(slot) => inodes[*slot.get()].push(idx),
             Entry::Vacant(slot) => {
                 slot.insert(inodes.len());
@@ -284,7 +281,7 @@ fn split_by_inode(group: &[FileInfo]) -> Vec<Vec<usize>> {
 }
 
 fn cache_entry_matches(entry: &CacheEntry, file: &FileInfo) -> bool {
-    entry.snapshot() == snapshot_from_file_info(file)
+    file.snapshot.matches_source(&entry.snapshot)
 }
 
 /// The full and quick hashes the cache holds for a physical file, from any of
@@ -324,7 +321,7 @@ fn plan_group_work(group: &[FileInfo], cache: &Cache, keys: &CacheKeys) -> Optio
     if !inodes.iter().any(download_only) {
         return None;
     }
-    let small = group[0].size <= SAMPLE_BYTES;
+    let small = group[0].snapshot.size <= SAMPLE_BYTES;
     let files = inodes
         .into_iter()
         .map(|members| {
@@ -361,11 +358,7 @@ fn upsert_entry(
         .get(&key)
         .filter(|entry| cache_entry_matches(entry, file));
     let entry = CacheEntry {
-        size: file.size,
-        mtime_ns: file.mtime_ns,
-        ctime_ns: file.ctime_ns,
-        dev: file.dev,
-        inode: file.inode,
+        snapshot: file.snapshot,
         hash: hash
             .cloned()
             .or_else(|| valid.and_then(|entry| entry.hash.clone())),
@@ -491,7 +484,7 @@ pub(super) fn hash_groups_and_update_cache(
     groups: &mut [Vec<FileInfo>],
     cache: &mut Cache,
     options: &HashOptions<'_>,
-    warnings: &mut RunWarnings,
+    warnings: &mut WarningSummary,
 ) -> Hashed {
     let strict = options.strict;
     let tui_events = options.tui_events;
@@ -567,18 +560,18 @@ pub(super) fn hash_groups_and_update_cache(
                     let worker = worker_id();
                     let file = &group[physical.members[0]];
                     emit_worker_activity(
-                        "hashing_sample",
+                        Phase::HashingSample,
                         worker,
                         Some(file.path.display().to_string()),
                         tui_events,
                     );
-                    let digest_result = sample_digest(&file.path, file.size);
+                    let digest_result = sample_digest(&file.path, file.snapshot.size);
                     let done = sample_done.fetch_add(1, Ordering::Relaxed) + 1;
                     emit_hash_progress(done as usize, total_sample_files, tui_events);
                     if let Some(progress_bar) = &bar {
                         progress_bar.inc(1);
                     }
-                    emit_worker_activity("hashing_sample", worker, None, tui_events);
+                    emit_worker_activity(Phase::HashingSample, worker, None, tui_events);
                     match digest_result {
                         Ok(digest) => {
                             let sample = blake3::Hash::from(digest).to_hex().to_string();
@@ -627,11 +620,13 @@ pub(super) fn hash_groups_and_update_cache(
     let total_full_bytes: u64 = full_candidates
         .iter()
         .zip(groups.iter())
-        .map(|(candidates, group)| candidates.len() as u64 * group.first().map_or(0, |f| f.size))
+        .map(|(candidates, group)| {
+            candidates.len() as u64 * group.first().map_or(0, |f| f.snapshot.size)
+        })
         .sum();
     if tui_events && total_full_files > 0 {
         let _ = emit_tui_event(&TuiEvent::Phase {
-            phase: "hashing_full".to_string(),
+            phase: Phase::HashingFull,
         });
         let _ = emit_tui_event(&TuiEvent::Log {
             message: format!("Verifying {total_full_files} duplicate candidate file(s)"),
@@ -671,14 +666,11 @@ pub(super) fn hash_groups_and_update_cache(
                 done,
                 total: total_full_bytes,
             });
-            let _ = emit_tui_event(&TuiEvent::Count {
-                files_seen: None,
-                groups_found: None,
-                planned_actions: None,
-                applied_actions: None,
+            let _ = emit_tui_event(&TuiEvent::Count(Counts {
                 hash_progress_done: Some(full_done.load(Ordering::Relaxed) as usize),
                 hash_progress_total: Some(total_full_files),
-            });
+                ..Counts::default()
+            }));
         }
     };
 
@@ -705,20 +697,20 @@ pub(super) fn hash_groups_and_update_cache(
                         let file = &group[work.files[idx].members[0]];
                         let path = &file.path;
                         emit_worker_activity(
-                            "hashing_full",
+                            Phase::HashingFull,
                             worker,
                             Some(path.display().to_string()),
                             tui_events,
                         );
                         let digest_result =
-                            full_digest(path, file.size, options.cancel, &on_chunk);
+                            full_digest(path, file.snapshot.size, options.cancel, &on_chunk);
                         // Only a file read to its end is verified: one that
                         // failed or that a cancel stopped is not.
                         if digest_result.is_ok() {
                             let done = full_done.fetch_add(1, Ordering::Relaxed) + 1;
                             emit_hash_progress(done as usize, total_full_files, tui_events);
                         }
-                        emit_worker_activity("hashing_full", worker, None, tui_events);
+                        emit_worker_activity(Phase::HashingFull, worker, None, tui_events);
                         match digest_result {
                             Ok(hash) => {
                                 let physical = &work.files[idx];
@@ -789,11 +781,13 @@ mod tests {
     fn file(path: &str, dev: u64, inode: u64, mtime_ns: u128) -> FileInfo {
         FileInfo {
             path: PathBuf::from(path),
-            size: 10,
-            mtime_ns,
-            ctime_ns: 0,
-            dev,
-            inode,
+            snapshot: FileSnapshot {
+                size: 10,
+                mtime_ns,
+                ctime_ns: 0,
+                dev,
+                inode,
+            },
             hash: None,
             sample: None,
             in_downloads: path.starts_with("/dl"),
@@ -802,19 +796,14 @@ mod tests {
 
     /// A file bigger than the sample, so its quick hash is not its full hash.
     fn large(path: &str, inode: u64) -> FileInfo {
-        FileInfo {
-            size: SAMPLE_BYTES + 1,
-            ..file(path, 1, inode, 0)
-        }
+        let mut file = file(path, 1, inode, 0);
+        file.snapshot.size = SAMPLE_BYTES + 1;
+        file
     }
 
     fn entry_for(file: &FileInfo, hash: Option<&str>, sample: Option<&str>) -> CacheEntry {
         CacheEntry {
-            size: file.size,
-            mtime_ns: file.mtime_ns,
-            ctime_ns: file.ctime_ns,
-            dev: file.dev,
-            inode: file.inode,
+            snapshot: file.snapshot,
             hash: hash.map(str::to_string),
             sample: sample.map(str::to_string),
         }
@@ -1026,7 +1015,7 @@ mod tests {
         // mergerfs inodecalc=passthrough can report one inode for different files on
         // different branches; a real hardlink always shares its timestamps too.
         let mut other = file("/media/b", 1, 7, 5);
-        other.ctime_ns = 5;
+        other.snapshot.ctime_ns = 5;
         let group = vec![file("/dl/a", 1, 7, 0), other];
         let work = plan_group_work(&group, &Cache::new(), &keys()).expect("two physical files");
         assert_eq!(work.files.len(), 2);

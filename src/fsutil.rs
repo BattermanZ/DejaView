@@ -80,25 +80,14 @@ pub fn safe_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_common::{TempDir, unique_temp_path};
 
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
-    fn unique_temp_dir(prefix: &str) -> PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time before epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "dejaview_fsutil_{prefix}_{}_{}",
-            std::process::id(),
-            ts
-        ))
-    }
-
     #[test]
     fn a_folder_that_cannot_be_used_is_named_in_the_error() {
-        let missing = unique_temp_dir("missing").join("nope");
+        let missing = unique_temp_path("missing").join("nope");
         let err = normalize_runtime_dir(&missing).expect_err("missing folder");
         let message = format!("{err:#}");
         assert!(
@@ -136,8 +125,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            let root = unique_temp_dir("symlink_target");
-            fs::create_dir_all(&root).expect("create root");
+            let root = TempDir::new("symlink_target");
             let victim = root.join("victim.json");
             let link = root.join("report.json");
             fs::write(&victim, b"keep").expect("write victim");
@@ -149,8 +137,6 @@ mod tests {
                     .contains("refusing to overwrite symlink target")
             );
             assert_eq!(fs::read(&victim).expect("read victim"), b"keep");
-
-            fs::remove_dir_all(&root).expect("cleanup temp dir");
         }
     }
 }

@@ -53,10 +53,24 @@ What it is not:
 
 ## Quick start
 
-You need a Rust toolchain ([rustup](https://rustup.rs/)). From a clone of this repository:
+Each [release](https://github.com/BattermanZ/DejaView/releases/latest) has a static Linux binary for `x86_64` (most PCs and NAS boxes) and `aarch64` (a Raspberry Pi, an ARM NAS). Static means it needs no library from the system, so it runs on any distribution and in an empty container. Download the archive for your machine and `SHA256SUMS` into one folder, then check, unpack and install it, with the release's version in place of `v0.1.0`:
 
 ```bash
-cargo install --path .
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+```bash
+tar -xzf dejaview-v0.1.0-x86_64-unknown-linux-musl.tar.gz
+```
+
+```bash
+sudo install dejaview-v0.1.0-x86_64-unknown-linux-musl/dejaview /usr/local/bin/
+```
+
+To build it instead, you need Rust 1.89 or newer ([rustup](https://rustup.rs/)); with rustup, the first build in a clone fetches the version `rust-toolchain.toml` pins. From a clone of this repository:
+
+```bash
+cargo install --locked --path .
 ```
 
 Point DejaView at your two folders:
@@ -127,7 +141,7 @@ For a cron job, give the binary's absolute path (cron's `PATH` is short), run wi
 
 ```bash
 # Every night at 03:17. The report stays at <downloads>/.dejaview_link_report.json.
-17 3 * * * out=$(/home/me/.cargo/bin/dejaview link --quiet 2>&1); [ "$?" -ne 3 ] && [ -n "$out" ] && echo "$out"
+17 3 * * * out=$(/usr/local/bin/dejaview link --quiet 2>&1); [ "$?" -ne 3 ] && [ -n "$out" ] && echo "$out"
 ```
 
 A quiet run prints a line only when it linked something or something failed, and the line prints it unless the run exited with 3, so cron mails only on a night something happened. The report and the log keep the rest, such as symlinks into the library that no longer resolve.
@@ -212,6 +226,8 @@ Cancelling a scan stops it almost at once, even partway through a large file, an
 
 The configuration lives in `~/.config/dejaview/config.json` (under `$XDG_CONFIG_HOME` when that is set). Change it with the `config` commands rather than by hand.
 
+On macOS the config and the log are both in `~/Library/Application Support/dejaview/`, and the `XDG_` variables are not read; `DEJAVIEW_CONFIG` and `DEJAVIEW_LOG` below still move them. DejaView builds on macOS, but only Linux is tested.
+
 Two environment variables move DejaView's own files, for a container or a service run as a user with no home folder:
 
 | Variable | Effect |
@@ -240,7 +256,7 @@ If the log cannot be written, DejaView warns once, naming the path, and runs wit
 | `<downloads>/.dejaview_link_report.json` | Every link run without `--report` that planned something. |
 | `<downloads>/.dejaview_tui_report.json` | When you press `R` in the dashboard. |
 | `<downloads>/.dejaview_lock` | Every scan, link and `cache cleanup-temp`, which lock it while they run. It stays, empty; deleting it between runs is harmless. |
-| `~/.local/state/dejaview/dejaview.log` | Every command (under `$XDG_STATE_HOME` when set, or at `$DEJAVIEW_LOG`). Once it passes 5 MiB it moves to `dejaview.log.1`, replacing the previous one, so the two together stay near 10 MiB. |
+| `~/.local/state/dejaview/dejaview.log` | Every command (under `$XDG_STATE_HOME` when set, or at `$DEJAVIEW_LOG`), one line per entry, stamped in UTC: `ts=2026-11-06T03:17:00.123Z level=WARN run=… op=cache msg="…"`. Once it passes 5 MiB it moves to `dejaview.log.1`, replacing the previous one, so the two together stay near 10 MiB. |
 
 Files whose name starts with `.dejaview_` are never treated as duplicates.
 
@@ -265,7 +281,7 @@ Files whose name starts with `.dejaview_` are never treated as duplicates.
 
 **A pair failed with "source changed since planning".** The download changed between the scan and the link, usually because a client was still writing it. Run again later, or raise `min_age`.
 
-**Files named `.dejaview_hardlink.tmp.*` or `.dejaview_link.tmp.*` in downloads.** A link run was killed in the middle of a replacement. `dejaview cache audit-temp` lists them and `dejaview cache cleanup-temp` deletes them.
+**Files named `.dejaview_hardlink.tmp.*` or `.dejaview_link.tmp.*` in downloads.** A link run was killed in the middle of a replacement. A `.dejaview_validate_write.*` file is the check every run makes that it can write there, left by a run killed at that moment. `dejaview cache audit-temp` lists them and `dejaview cache cleanup-temp` deletes them.
 
 **A scan reads a file it read before.** A cache entry is valid only while the file's size, modification time, change time and inode stay the same. A link run or a `chmod` changes the change time, so that file is hashed once more.
 
@@ -282,19 +298,27 @@ Files whose name starts with `.dejaview_` are never treated as duplicates.
 
 ## Development
 
+`rust-toolchain.toml` pins the Rust that builds, lints and tests DejaView, and rustup installs it on the first `cargo` command in the repository. Every check runs through [`just`](https://github.com/casey/just), as CI runs it:
+
 ```bash
-cargo test
+just check
 ```
+
+```bash
+just test
+```
+
+`just check` is `cargo fmt --check` and clippy with warnings as errors; `just test` runs every test, and under root runs the unit tests a second time as `nobody`. CI also builds with the oldest Rust DejaView supports, `rust-version` in `Cargo.toml`, and checks the dependencies against the RustSec advisories every week. A `v*` tag builds the release binaries.
 
 An ignored performance harness times a cold and a warm scan on generated datasets:
 
 ```bash
-cargo test --release --test perf_harness -- --ignored --nocapture
+just perf
 ```
 
 Each profile has a time limit you can tighten with `DEJAVIEW_PERF_SMALL_COLD_MS`, `DEJAVIEW_PERF_SMALL_WARM_MS`, and the matching `MEDIUM` and `LARGE` variables (milliseconds).
 
-`dejaview tui-logo-preview` shows the dashboard's logo on its own, to judge it in a real terminal and font.
+`dejaview tui-logo-preview`, which `--help` leaves out, shows the dashboard's logo on its own, to judge it in a real terminal and font.
 
 ## License
 

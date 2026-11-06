@@ -1,0 +1,120 @@
+name: Release
+
+# Pushing a tag such as v0.1.0 builds static Linux binaries for x86_64 and
+# aarch64 and attaches them, with a SHA256SUMS file, to a GitHub release of
+# that tag. Tag a commit on `main`, at a release, once `version` in
+# Cargo.toml matches the tag and CHANGELOG.md has a `## <version>` section,
+# whose text becomes the release notes.
+#
+# A pull request that changes how the binaries are built builds them too,
+# and publishes nothing, so a broken build shows before a tag needs it.
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # What the archives are named after: the tag, or "test" on a pull request.
+  LABEL: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'test' }}
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          # Built on an arm64 runner: blake3's C code does not cross-compile
+          # to aarch64 musl from x86_64 without a cross sysroot.
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag names the version in Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::the tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+            exit 1
+          fi
+      - name: Install Rust and musl
+        run: |
+          rustup toolchain install
+          rustup target add "${{ matrix.target }}"
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      # musl-gcc is the C compiler musl-tools installs. Named here because,
+      # for aarch64 musl, cc-rs looks only for aarch64-linux-musl-gcc, which
+      # Ubuntu does not ship, and blake3 compiles C for NEON there.
+      - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Run it
+        run: |
+          binary="target/${{ matrix.target }}/release/dejaview"
+          file "$binary"
+          "$binary" --version
+      - name: Package
+        run: |
+          name="dejaview-$LABEL-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/dejaview" README.md CHANGELOG.md LICENSE "$name/"
+          tar -czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dejaview-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: publish the release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum dejaview-*.tar.gz > SHA256SUMS
+      - name: Release notes from the changelog
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v heading="## $version" '
+            index($0, "## ") == 1 { if (found) exit; found = ($0 == heading); next }
+            found
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no '## $version' section to take the notes from"
+            exit 1
+          fi
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "DejaView $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            dist/dejaview-*.tar.gz dist/SHA256SUMS

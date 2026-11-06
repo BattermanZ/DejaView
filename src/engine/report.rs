@@ -3,46 +3,60 @@ use colored::*;
 use std::path::{Path, PathBuf};
 
 use crate::fsutil::safe_write_bytes;
+use crate::human::format_size;
 use crate::logger;
-use crate::protocol::{LinkReportEntry, Outcome, RunReport, WarningSummary};
+use crate::protocol::{
+    EntryStatus, LinkMethod, LinkReportEntry, Mode, Outcome, RunReport, WarningSummary,
+};
 
 use super::linking::Applied;
-use super::types::{Audience, LinkAction, LinkMode, RunMetrics, RunWarnings, ScanRunOptions};
+use super::types::{Audience, LinkAction, LinkMode, RunMetrics, ScanRunOptions};
 
-/// A size for a person, in binary units: `8.0 MiB`.
-pub(super) fn format_size(bytes: u64) -> String {
-    let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
-    let mut size = bytes as f64;
-    let mut unit_index = 0;
-    while size >= 1024.0 && unit_index < units.len() - 1 {
-        size /= 1024.0;
-        unit_index += 1;
+/// A line on stdout: for a person, or the report a script reads with
+/// `--json`. With `--tui-events` stdout is the dashboard's event stream, so
+/// nothing goes there. The engine denies printing anywhere else, so every
+/// line it writes to stdout passes this check.
+#[allow(clippy::print_stdout)]
+pub(super) fn print_out(audience: Audience, line: impl std::fmt::Display) {
+    if audience != Audience::Dashboard {
+        println!("{line}");
     }
-    if unit_index == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{size:.1} {}", units[unit_index])
-    }
+}
+
+/// A line on stderr, which no audience parses: warnings and the paths
+/// listed under them.
+#[allow(clippy::print_stderr)]
+pub(super) fn print_err(line: impl std::fmt::Display) {
+    eprintln!("{line}");
+}
+
+/// A warning for a person on stderr: `⚠ message`.
+pub(super) fn print_warning(message: impl std::fmt::Display) {
+    print_err(format_args!("{} {message}", "⚠".yellow()));
 }
 
 /// The plan for a person: the two folders once, then one row per pair with
 /// paths below them, or that there is nothing to do.
-pub(super) fn print_plan(actions: &[LinkAction], downloads: &Path, media: &Path, bytes: u64) {
-    println!("Downloads: {}", downloads.display());
-    println!("Media:     {}", media.display());
+pub(super) fn print_plan(
+    audience: Audience,
+    actions: &[LinkAction],
+    downloads: &Path,
+    media: &Path,
+    bytes: u64,
+) {
+    let say = |line: String| print_out(audience, line);
+    say(format!("Downloads: {}", downloads.display()));
+    say(format!("Media:     {}", media.display()));
     if actions.is_empty() {
-        println!("{} No duplicates found.", "✔".green());
+        say(format!("{} No duplicates found.", "✔".green()));
         return;
     }
-    println!(
-        "{}",
-        super::linking::action_table(actions, downloads, media)
-    );
-    println!(
+    say(super::linking::action_table(actions, downloads, media).to_string());
+    say(format!(
         "Found {} duplicate(s): {} could be freed.",
         actions.len(),
         format_size(bytes)
-    );
+    ));
 }
 
 /// What the run looked at and what went wrong, for a person. A quiet run
@@ -51,7 +65,7 @@ pub(super) fn print_run_summary(
     files_seen: usize,
     metrics: &RunMetrics,
     symlinked: usize,
-    warnings: &RunWarnings,
+    warnings: &WarningSummary,
     audience: Audience,
 ) {
     if audience.is_chatty() {
@@ -75,23 +89,32 @@ pub(super) fn print_run_summary(
             ));
         }
         if left_out.is_empty() {
-            println!("{} Considered {files_seen} file(s).", "ℹ".cyan());
+            print_out(
+                audience,
+                format!("{} Considered {files_seen} file(s).", "ℹ".cyan()),
+            );
         } else {
-            println!(
-                "{} Considered {files_seen} file(s); left out {}.",
-                "ℹ".cyan(),
-                left_out.join(", ")
+            print_out(
+                audience,
+                format!(
+                    "{} Considered {files_seen} file(s); left out {}.",
+                    "ℹ".cyan(),
+                    left_out.join(", ")
+                ),
             );
         }
         if symlinked > 0 {
-            println!(
-                "{} {symlinked} download(s) became symlinks: each points at its library file and breaks if Sonarr or Radarr upgrades, renames or deletes that file. `fallback_reason` in the report says why each is not a hardlink.",
-                "⚠".yellow()
+            print_out(
+                audience,
+                format!(
+                    "{} {symlinked} download(s) became symlinks: each points at its library file and breaks if Sonarr or Radarr upgrades, renames or deletes that file. `fallback_reason` in the report says why each is not a hardlink.",
+                    "⚠".yellow()
+                ),
             );
         }
     }
 
-    let total = warning_total(warnings);
+    let total = warnings.total();
     if total > 0 {
         let counts = [
             ("walk", warnings.walk_errors),
@@ -105,10 +128,9 @@ pub(super) fn print_run_summary(
         .map(|(what, count)| format!("{what} {count}"))
         .collect::<Vec<_>>()
         .join(", ");
-        eprintln!(
-            "{} {total} file(s) could not be read, hashed or linked ({counts}); the log names each.",
-            "⚠".yellow()
-        );
+        print_warning(format_args!(
+            "{total} file(s) could not be read, hashed or linked ({counts}); the log names each."
+        ));
     }
 }
 
@@ -168,7 +190,7 @@ impl Verdict<'_> {
         } else {
             "✔".green()
         };
-        println!("{mark} {}", self.line());
+        print_out(audience, format_args!("{mark} {}", self.line()));
     }
 }
 
@@ -178,23 +200,26 @@ pub(super) fn print_dangling_symlinks(dangling: &[PathBuf]) {
     if dangling.is_empty() {
         return;
     }
-    eprintln!(
-        "{} {} symlink(s) in downloads point into the library and no longer resolve, so their torrents cannot seed. The library file was probably upgraded, renamed or deleted; re-download or remove them:",
-        "⚠".yellow(),
+    print_warning(format_args!(
+        "{} symlink(s) in downloads point into the library and no longer resolve, so their torrents cannot seed. The library file was probably upgraded, renamed or deleted; re-download or remove them:",
         dangling.len()
-    );
+    ));
     const SHOWN: usize = 10;
     for path in dangling.iter().take(SHOWN) {
-        eprintln!("    {}", path.display());
+        print_err(format_args!("    {}", path.display()));
     }
     if dangling.len() > SHOWN {
-        eprintln!(
+        print_err(format_args!(
             "    and {} more; `dangling_symlinks` in the --json report lists them all",
             dangling.len() - SHOWN
-        );
+        ));
     }
 }
 
+/// Ask a person at a terminal before linking. Only `--confirm` asks, which
+/// refuses a run that is not interactive and is never given with
+/// `--tui-events`, so the prompt cannot reach the dashboard's stream.
+#[allow(clippy::print_stdout)]
 pub(super) fn maybe_confirm_apply(require_confirm: bool, planned_actions: usize) -> Result<()> {
     if !require_confirm || planned_actions == 0 {
         return Ok(());
@@ -229,14 +254,6 @@ pub(super) fn symlinked_count(entries: &[LinkReportEntry]) -> usize {
         .count()
 }
 
-pub(super) fn warning_total(warnings: &RunWarnings) -> u64 {
-    warnings.walk_errors
-        + warnings.metadata_errors
-        + warnings.sample_hash_errors
-        + warnings.full_hash_errors
-        + warnings.link_errors
-}
-
 fn write_run_report(path: &Path, report: &RunReport) -> Result<()> {
     let json = serde_json::to_vec_pretty(report)?;
     safe_write_bytes(path, &json)?;
@@ -250,12 +267,10 @@ pub(super) fn try_write_run_report(path: &Path, report: &RunReport) {
             "report",
             format!("failed to write run report {}: {}", path.display(), err),
         );
-        eprintln!(
-            "{} Failed to write link report at {}: {}",
-            "⚠".yellow(),
-            path.display(),
-            err
-        );
+        print_warning(format_args!(
+            "Failed to write link report at {}: {err}",
+            path.display()
+        ));
     }
 }
 
@@ -289,28 +304,6 @@ pub(super) fn planned_bytes(actions: &[LinkAction]) -> u64 {
         .sum()
 }
 
-/// `time` in UTC as RFC 3339, to the second: `2026-11-06T03:17:00Z`.
-pub(super) fn rfc3339_utc(time: std::time::SystemTime) -> String {
-    let secs = time
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
-    let (days, rest) = (secs / 86_400, secs % 86_400);
-    let (hour, minute, second) = (rest / 3600, rest % 3600 / 60, rest % 60);
-    // Days since 1970-01-01 to a civil date, by the well-known
-    // civil-from-days algorithm; every value here is non-negative.
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + u64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
 pub(super) fn build_report_entries(
     actions: &[LinkAction],
     link_mode: LinkMode,
@@ -323,16 +316,15 @@ pub(super) fn build_report_entries(
             source_raw: crate::protocol::raw_path_hex(&action.src),
             target_raw: crate::protocol::raw_path_hex(&action.tgt),
             size: action.size,
-            status: "planned".to_string(),
+            status: EntryStatus::Planned,
             method: Some(
-                if link_mode == LinkMode::SymlinkOnly {
-                    "symlink"
-                } else if action.src_snapshot.dev == action.tgt_snapshot.dev {
-                    "try-hardlink"
+                if link_mode == LinkMode::SymlinkOnly
+                    || action.src_snapshot.dev != action.tgt_snapshot.dev
+                {
+                    LinkMethod::Symlink
                 } else {
-                    "symlink"
-                }
-                .to_string(),
+                    LinkMethod::TryHardlink
+                },
             ),
             fallback_reason: if link_mode == LinkMode::SymlinkOnly {
                 Some("symlink-only mode enabled".to_string())
@@ -349,14 +341,14 @@ pub(super) fn build_report_entries(
 pub(super) fn build_run_report(options: &ScanRunOptions<'_>, input: RunReportInput) -> RunReport {
     RunReport {
         mode: if options.dry_run {
-            "scan".to_string()
+            Mode::Scan
         } else {
-            "link".to_string()
+            Mode::Link
         },
         outcome: input.outcome,
         version: env!("CARGO_PKG_VERSION").to_string(),
-        started_at: rfc3339_utc(input.started_at),
-        finished_at: rfc3339_utc(std::time::SystemTime::now()),
+        started_at: crate::human::rfc3339_utc(input.started_at),
+        finished_at: crate::human::rfc3339_utc(std::time::SystemTime::now()),
         downloads: input.downloads.display().to_string(),
         media: input.media.display().to_string(),
         link_mode: options.link_mode,
@@ -385,13 +377,7 @@ pub(super) fn build_run_report(options: &ScanRunOptions<'_>, input: RunReportInp
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
-        warnings: WarningSummary {
-            walk_errors: input.warnings.walk_errors,
-            metadata_errors: input.warnings.metadata_errors,
-            sample_hash_errors: input.warnings.sample_hash_errors,
-            full_hash_errors: input.warnings.full_hash_errors,
-            link_errors: input.warnings.link_errors,
-        },
+        warnings: input.warnings,
         entries: input.entries,
     }
 }
@@ -406,7 +392,7 @@ pub(super) struct RunReportInput<'a> {
     pub(super) planned_bytes: u64,
     pub(super) applied: Applied,
     pub(super) metrics: RunMetrics,
-    pub(super) warnings: RunWarnings,
+    pub(super) warnings: WarningSummary,
     pub(super) entries: Vec<LinkReportEntry>,
 }
 
@@ -414,15 +400,15 @@ pub(super) struct RunReportInput<'a> {
 pub(super) fn strict_failure(
     strict_link_error: Option<anyhow::Error>,
     strict: bool,
-    warnings: &RunWarnings,
+    warnings: &WarningSummary,
 ) -> Option<anyhow::Error> {
     if strict_link_error.is_some() {
         return strict_link_error;
     }
-    if strict && warning_total(warnings) > 0 {
+    if strict && warnings.total() > 0 {
         return Some(anyhow!(
             "--strict stopped the run: {} file(s) could not be read, hashed or linked; the log names each. Make them readable, leave their folder out with `dejaview config set-exclude`, or run without --strict",
-            warning_total(warnings)
+            warnings.total()
         ));
     }
     None

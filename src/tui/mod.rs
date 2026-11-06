@@ -5,6 +5,7 @@ mod events;
 mod layout;
 mod model;
 mod preview;
+mod run_state;
 mod theme;
 mod view;
 mod wordmark;

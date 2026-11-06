@@ -152,67 +152,144 @@ pub fn cache_path(config: &Config) -> Result<PathBuf> {
     Ok(downloads.join(".dejaview_cache.json"))
 }
 
-pub fn validate_runtime_paths(config: &Config) -> Result<()> {
-    let downloads = config.downloads.as_ref().ok_or_else(|| {
-        anyhow!(
-            "downloads path not set; set it with `dejaview config set-downloads PATH`, or with e in the dashboard"
-        )
-    })?;
-    let media = config.media.as_ref().ok_or_else(|| {
-        anyhow!(
-            "media path not set; set it with `dejaview config set-media PATH`, or with e in the dashboard"
-        )
-    })?;
+/// What [`check`] found wrong with a configuration: every problem, each a
+/// sentence that names the path and what to do.
+#[derive(Debug)]
+pub struct Problems(pub Vec<String>);
 
-    if !downloads.is_absolute() {
-        return Err(anyhow!(
-            "downloads path must be absolute: {}",
-            downloads.display()
-        ));
+impl std::fmt::Display for Problems {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.join("; "))
     }
-    if !media.is_absolute() {
-        return Err(anyhow!("media path must be absolute: {}", media.display()));
-    }
+}
 
-    if !downloads.exists() {
-        return Err(anyhow!(
-            "downloads path does not exist: {}",
+impl std::error::Error for Problems {}
+
+/// The two folders of a configuration that [`check`] passed, resolved.
+#[derive(Debug)]
+pub struct Folders {
+    pub downloads: PathBuf,
+    pub media: PathBuf,
+}
+
+/// Everything a configuration must pass before a run may use it, the one
+/// check `config validate`, every scan and link, and the dashboard's path
+/// editor make: both folders set, absolute and existing; downloads writable,
+/// since every run writes its cache and lock there and a link run its links;
+/// media readable; and neither folder inside the other, nesting behind a
+/// symlink included. It reports every problem, not just the first.
+///
+/// It does not walk the folders. A library reached through a second mount
+/// (a bind mount, a mergerfs branch) is found by
+/// `engine::ensure_roots_not_mounted_inside`, which `config validate` and
+/// the path editor call after this, and by every walk.
+pub fn check(config: &Config) -> std::result::Result<Folders, Problems> {
+    let mut problems = Vec::new();
+    let downloads = check_folder(
+        "downloads",
+        config.downloads.as_deref(),
+        "set-downloads",
+        &mut problems,
+    );
+    let media = check_folder("media", config.media.as_deref(), "set-media", &mut problems);
+    if let Some(downloads) = &downloads
+        && let Err(err) = probe_directory_writable(downloads)
+    {
+        problems.push(format!(
+            "downloads path is not writable: {} ({err}); every run writes its cache there, and a link run its links. Free space on it, or let the user DejaView runs as write to it",
             downloads.display()
         ));
     }
-    if !media.exists() {
-        return Err(anyhow!("media path does not exist: {}", media.display()));
-    }
-    if !downloads.is_dir() {
-        return Err(anyhow!(
-            "downloads path is not a directory: {}",
-            downloads.display()
-        ));
-    }
-    if !media.is_dir() {
-        return Err(anyhow!(
-            "media path is not a directory: {}",
+    if let Some(media) = &media
+        && let Err(err) = fs::read_dir(media)
+    {
+        problems.push(format!(
+            "media path is not readable: {} ({err}); let the user DejaView runs as read it",
             media.display()
         ));
     }
-
-    let normalized_downloads = normalize_runtime_dir(downloads)?;
-    let normalized_media = normalize_runtime_dir(media)?;
-
-    if !normalized_downloads.is_absolute() {
-        return Err(anyhow!(
-            "downloads path must be absolute: {}",
-            normalized_downloads.display()
-        ));
+    match (downloads, media) {
+        (Some(downloads), Some(media)) if problems.is_empty() => {
+            match ensure_roots_disjoint(&downloads, &media) {
+                Ok(()) => Ok(Folders { downloads, media }),
+                Err(err) => Err(Problems(vec![format!("{err:#}")])),
+            }
+        }
+        _ => Err(Problems(problems)),
     }
-    if !normalized_media.is_absolute() {
-        return Err(anyhow!(
-            "media path must be absolute: {}",
-            normalized_media.display()
-        ));
-    }
+}
 
-    ensure_roots_disjoint(&normalized_downloads, &normalized_media)
+/// One folder of the configuration, resolved, or None with its problem
+/// pushed.
+fn check_folder(
+    name: &str,
+    path: Option<&Path>,
+    command: &str,
+    problems: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let Some(path) = path else {
+        problems.push(format!(
+            "{name} path not set; set it with `dejaview config {command} PATH`, or with e in the dashboard"
+        ));
+        return None;
+    };
+    let problem = if !path.is_absolute() {
+        "must be absolute"
+    } else if !path.exists() {
+        "does not exist"
+    } else if !path.is_dir() {
+        "is not a directory"
+    } else {
+        return match normalize_runtime_dir(path) {
+            Ok(resolved) => Some(resolved),
+            Err(err) => {
+                problems.push(format!("{name} path cannot be used: {err:#}"));
+                None
+            }
+        };
+    };
+    problems.push(format!(
+        "{name} path {problem}: {}; set it with `dejaview config {command} PATH`",
+        path.display()
+    ));
+    None
+}
+
+/// Create and remove a file in `path`, to learn whether this user may write
+/// there.
+fn probe_directory_writable(path: &Path) -> std::io::Result<()> {
+    write_probe(&path.join(probe_name()))
+}
+
+/// A fresh name for the probe file: `.dejaview_validate_write.<pid>.<ns>`.
+/// Scans skip `.dejaview_` names, and `dejaview cache cleanup-temp` removes
+/// one a crash left behind.
+fn probe_name() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    format!(
+        ".dejaview_validate_write.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
+}
+
+/// Create `probe`, write a few bytes to it and remove it again. A full
+/// disk or a spent quota still takes an empty file, but not the bytes. No
+/// fsync: every run makes this check, and on a network drive each sync is a
+/// round trip. `create_new` never opens a file that is there, so a symlink
+/// at the name is refused, not followed.
+fn write_probe(probe: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(probe)?
+        .write_all(b"dejaview");
+    let removed = fs::remove_file(probe);
+    written.and(removed)
 }
 
 /// Downloads and media must be separate trees. If one sits inside the other, the
@@ -246,6 +323,7 @@ pub fn ensure_roots_disjoint(downloads: &Path, media: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_common::TempDir;
 
     #[test]
     fn exclude_defaults_until_set_and_refuses_a_path() {
@@ -257,23 +335,10 @@ mod tests {
         assert!(check_exclude_patterns(&["media/#recycle".into()]).is_err());
         assert!(check_exclude_patterns(&[String::new()]).is_err());
     }
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn unique_temp_dir(prefix: &str) -> PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time before epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "dejaview_config_{prefix}_{}_{}",
-            std::process::id(),
-            ts
-        ))
-    }
 
     #[test]
     fn load_save_roundtrip() {
-        let root = unique_temp_dir("roundtrip");
+        let root = TempDir::new("roundtrip");
         let path = root.join("config").join("config.json");
         let config = Config {
             downloads: Some(root.join("downloads")),
@@ -294,13 +359,11 @@ mod tests {
         assert_eq!(loaded.min_size, config.min_size);
         assert_eq!(loaded.threads, config.threads);
         assert_eq!(loaded.link_mode, config.link_mode);
-
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     #[test]
     fn load_invalid_json_fails() {
-        let root = unique_temp_dir("invalid_json");
+        let root = TempDir::new("invalid_json");
         let path = root.join("config").join("config.json");
         fs::create_dir_all(path.parent().expect("parent")).expect("create config dir");
         fs::write(&path, b"{not-valid-json").expect("write invalid config");
@@ -315,8 +378,6 @@ mod tests {
             message.contains("delete it"),
             "says how to recover: {message}"
         );
-
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     #[test]
@@ -337,8 +398,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_runtime_paths_accepts_existing_directories() {
-        let root = unique_temp_dir("validate_ok");
+    fn check_accepts_existing_directories() {
+        let root = TempDir::new("validate_ok");
         let downloads = root.join("downloads");
         let media = root.join("media");
         fs::create_dir_all(&downloads).expect("create downloads");
@@ -355,13 +416,12 @@ mod tests {
             link_mode: None,
         };
 
-        validate_runtime_paths(&config).expect("paths should validate");
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
+        check(&config).expect("paths should validate");
     }
 
     #[test]
-    fn validate_runtime_paths_rejects_missing_directory() {
-        let root = unique_temp_dir("validate_missing");
+    fn check_rejects_missing_directory() {
+        let root = TempDir::new("validate_missing");
         let downloads = root.join("downloads");
         fs::create_dir_all(&downloads).expect("create downloads");
 
@@ -376,9 +436,8 @@ mod tests {
             link_mode: None,
         };
 
-        let result = validate_runtime_paths(&config);
+        let result = check(&config);
         assert!(result.is_err());
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     fn config_for(downloads: &Path, media: &Path) -> Config {
@@ -395,7 +454,7 @@ mod tests {
     }
 
     fn assert_overlap_rejected(config: &Config, expected: &str) {
-        let err = validate_runtime_paths(config).expect_err("overlapping roots must be rejected");
+        let err = check(config).expect_err("overlapping roots must be rejected");
         assert!(
             err.to_string().contains(expected),
             "expected '{expected}' in '{err}'"
@@ -403,41 +462,38 @@ mod tests {
     }
 
     #[test]
-    fn validate_runtime_paths_rejects_media_inside_downloads() {
-        let root = unique_temp_dir("validate_media_nested");
+    fn check_rejects_media_inside_downloads() {
+        let root = TempDir::new("validate_media_nested");
         let downloads = root.join("downloads");
         let media = downloads.join("library");
         fs::create_dir_all(&media).expect("create nested media");
 
         assert_overlap_rejected(&config_for(&downloads, &media), "media path is inside");
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     #[test]
-    fn validate_runtime_paths_rejects_downloads_inside_media() {
-        let root = unique_temp_dir("validate_downloads_nested");
+    fn check_rejects_downloads_inside_media() {
+        let root = TempDir::new("validate_downloads_nested");
         let media = root.join("data");
         let downloads = media.join("torrents");
         fs::create_dir_all(&downloads).expect("create nested downloads");
 
         assert_overlap_rejected(&config_for(&downloads, &media), "downloads path is inside");
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     #[test]
-    fn validate_runtime_paths_rejects_same_directory() {
-        let root = unique_temp_dir("validate_same_dir");
+    fn check_rejects_same_directory() {
+        let root = TempDir::new("validate_same_dir");
         let shared = root.join("shared");
         fs::create_dir_all(&shared).expect("create shared dir");
 
         assert_overlap_rejected(&config_for(&shared, &shared), "the same directory");
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     #[cfg(unix)]
     #[test]
-    fn validate_runtime_paths_rejects_nesting_hidden_behind_symlink() {
-        let root = unique_temp_dir("validate_symlink_nested");
+    fn check_rejects_nesting_hidden_behind_symlink() {
+        let root = TempDir::new("validate_symlink_nested");
         let downloads = root.join("downloads");
         let real_media = downloads.join("library");
         let media_link = root.join("media");
@@ -445,12 +501,11 @@ mod tests {
         std::os::unix::fs::symlink(&real_media, &media_link).expect("create media symlink");
 
         assert_overlap_rejected(&config_for(&downloads, &media_link), "media path is inside");
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     #[test]
-    fn validate_runtime_paths_rejects_relative_directories() {
-        let root = unique_temp_dir("validate_relative");
+    fn check_rejects_relative_directories() {
+        let root = TempDir::new("validate_relative");
         let downloads = root.join("downloads");
         let media = root.join("media");
         fs::create_dir_all(&downloads).expect("create downloads");
@@ -467,8 +522,122 @@ mod tests {
             link_mode: None,
         };
 
-        let result = validate_runtime_paths(&config);
+        let result = check(&config);
         assert!(result.is_err());
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    /// The probe never opens a file that is there, so a symlink planted at
+    /// its exact name cannot make it write, or remove, anything else.
+    #[test]
+    fn the_probe_refuses_a_symlink_at_its_name_and_leaves_its_target_alone() {
+        let root = TempDir::new("probe_symlink");
+        let victim = root.join("victim");
+        fs::write(&victim, b"keep").expect("write victim");
+        let probe = root.join(probe_name());
+        std::os::unix::fs::symlink(&victim, &probe).expect("plant symlink");
+
+        let err = write_probe(&probe).expect_err("the name is taken");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&victim).expect("read victim"), b"keep");
+        assert!(
+            fs::symlink_metadata(&probe).is_ok(),
+            "the symlink is left as it was"
+        );
+        // The probe of the folder picks a fresh name each time and works.
+        probe_directory_writable(&root).expect("probe the folder");
+        let names: Vec<_> = fs::read_dir(&root)
+            .expect("read root")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names.len(), 2, "the probe removed its file: {names:?}");
+    }
+
+    /// A mount this process may make, gone again on drop; None where it may
+    /// not mount (not root, or no CAP_SYS_ADMIN), as on CI.
+    struct Mount(PathBuf);
+
+    impl Mount {
+        fn tmpfs(target: &Path, size: &str) -> Option<Self> {
+            std::process::Command::new("mount")
+                .args(["-t", "tmpfs", "-o", &format!("size={size}"), "tmpfs"])
+                .arg(target)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .ok()?
+                .success()
+                .then(|| Mount(target.to_path_buf()))
+        }
+    }
+
+    impl Drop for Mount {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("umount").arg(&self.0).status();
+        }
+    }
+
+    /// A downloads folder with no space left takes an empty file but no
+    /// bytes, and a run there would hash for hours and then fail to save its
+    /// cache: the check writes a few bytes, so it says so first. Runs where
+    /// the test may mount a small tmpfs.
+    #[test]
+    fn check_refuses_a_downloads_folder_with_no_space_left() {
+        let root = TempDir::new("check_full");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        fs::create_dir_all(&downloads).expect("create downloads");
+        fs::create_dir_all(&media).expect("create media");
+        let Some(_mount) = Mount::tmpfs(&downloads, "8k") else {
+            return;
+        };
+        // Fill it: the write stops when the space runs out.
+        let _ = fs::write(downloads.join("fill"), vec![0u8; 64 * 1024]);
+
+        let Problems(problems) =
+            check(&config_for(&downloads, &media)).expect_err("no space in downloads");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("downloads path is not writable")
+                && problems[0].contains("No space left"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn check_names_every_problem_at_once() {
+        let root = TempDir::new("check_all");
+        let config = config_for(&root.join("no-downloads"), &root.join("no-media"));
+        let Problems(problems) = check(&config).expect_err("both missing");
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].contains("downloads path does not exist"));
+        assert!(problems[1].contains("media path does not exist"));
+        let Problems(problems) = check(&Config::default()).expect_err("unset");
+        assert!(problems[0].contains("dejaview config set-downloads PATH"));
+        assert!(problems[1].contains("dejaview config set-media PATH"));
+    }
+
+    /// Every run writes its cache and lock in downloads, so a folder the user
+    /// cannot write to is refused before a walk, not after hours of hashing
+    /// when the cache cannot be saved. Root writes anywhere, so as root this
+    /// returns early; `just test` runs it again as nobody.
+    #[test]
+    fn check_refuses_a_downloads_folder_it_cannot_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TempDir::new("check_unwritable");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        fs::create_dir_all(&downloads).expect("create downloads");
+        fs::create_dir_all(&media).expect("create media");
+        fs::set_permissions(&downloads, fs::Permissions::from_mode(0o555)).expect("chmod");
+        if probe_directory_writable(&downloads).is_ok() {
+            return;
+        }
+        let Problems(problems) =
+            check(&config_for(&downloads, &media)).expect_err("unwritable downloads");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("downloads path is not writable")
+                && problems[0].contains(&downloads.display().to_string()),
+            "{problems:?}"
+        );
     }
 }

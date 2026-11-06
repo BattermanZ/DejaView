@@ -1,19 +1,9 @@
+mod common;
+use common::TempDir;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time before epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "dejaview_perf_{prefix}_{}_{}",
-        std::process::id(),
-        ts
-    ))
-}
+use std::time::{Duration, Instant};
 
 fn run_cmd(root: &Path, args: &[&str]) -> (std::process::Output, Duration) {
     let start = Instant::now();
@@ -101,7 +91,7 @@ fn build_dataset(root: &Path, profile: PerfProfile) -> (PathBuf, PathBuf) {
 }
 
 fn run_profile(profile: PerfProfile) {
-    let root = unique_temp_dir(profile.name);
+    let root = TempDir::new(profile.name);
     let (downloads, media) = build_dataset(&root, profile);
 
     run_ok(
@@ -174,8 +164,6 @@ fn run_profile(profile: PerfProfile) {
         warm_ms,
         warm_threshold
     );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]

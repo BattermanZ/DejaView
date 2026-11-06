@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, anyhow};
-use colored::*;
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use pathdiff::diff_paths;
 use std::collections::HashSet;
@@ -11,11 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::logger;
 use crate::protocol::TuiEvent;
 
-use crate::protocol::LinkReportEntry;
+use crate::protocol::{Counts, EntryStatus, LinkMethod, LinkReportEntry, Phase, WarningSummary};
 
 use super::cancel::CancelToken;
 use super::types::emit_tui_event;
-use super::types::{FileInfo, FileSnapshot, LinkAction, LinkMode, RunWarnings};
+use super::types::{FileInfo, FileSnapshot, LinkAction, LinkMode};
 
 /// The target guard by path alone, as the tests drive it.
 #[cfg(test)]
@@ -89,16 +88,6 @@ pub(super) fn ensure_source_outside_media_root(
     Ok(())
 }
 
-pub(super) fn snapshot_from_file_info(file: &FileInfo) -> FileSnapshot {
-    FileSnapshot {
-        size: file.size,
-        mtime_ns: file.mtime_ns,
-        ctime_ns: file.ctime_ns,
-        dev: file.dev,
-        inode: file.inode,
-    }
-}
-
 /// The file at `path` itself, not what a symlink there points to.
 fn lstat(path: &Path) -> Result<fs::Metadata> {
     fs::symlink_metadata(path).with_context(|| {
@@ -120,7 +109,7 @@ fn ensure_source_snapshot_matches(
     expected: &FileSnapshot,
     replaced_inodes: &HashSet<(u64, u64)>,
 ) -> Result<()> {
-    let current = FileSnapshot::of(meta);
+    let current = FileSnapshot::from_metadata(meta);
     if expected.matches_source(&current) {
         return Ok(());
     }
@@ -147,7 +136,7 @@ fn ensure_target_snapshot_matches(
     meta: &fs::Metadata,
     expected: &FileSnapshot,
 ) -> Result<()> {
-    if !expected.matches_target(&FileSnapshot::of(meta)) {
+    if !expected.matches_target(&FileSnapshot::from_metadata(meta)) {
         return Err(anyhow!(
             "target changed since planning; rerun scan before linking: {}",
             path.display()
@@ -304,8 +293,8 @@ pub(super) struct LinkRequest<'a> {
 /// What a replacement did.
 #[derive(Debug)]
 pub(super) struct Linked {
-    /// "hardlink" or "symlink": what the download is now.
-    pub(super) method: &'static str,
+    /// Hardlink or symlink: what the download is now.
+    pub(super) method: LinkMethod,
     pub(super) fallback_reason: Option<String>,
     /// The download already was the library file, so nothing changed.
     pub(super) already_linked: bool,
@@ -390,14 +379,6 @@ fn temp_name(kind: &str) -> String {
     )
 }
 
-fn mtime_ns(meta: &fs::Metadata) -> u128 {
-    meta.modified()
-        .unwrap_or(SystemTime::UNIX_EPOCH)
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-}
-
 /// What the hardlink step left at the temp name.
 #[derive(Debug, PartialEq, Eq)]
 enum TempLink {
@@ -415,10 +396,10 @@ enum TempLink {
 fn check_temp_link(tmp: &Path, req: &LinkRequest<'_>) -> Result<TempLink> {
     let meta = fs::symlink_metadata(tmp)
         .with_context(|| format!("metadata of temp link for {}", req.src.display()))?;
-    let expected = req.tgt_snapshot;
     if meta.file_type().is_file()
-        && meta.len() == expected.size
-        && mtime_ns(&meta) == expected.mtime_ns
+        && req
+            .tgt_snapshot
+            .matches_contents(&FileSnapshot::from_metadata(&meta))
     {
         return Ok(TempLink::Hardlink);
     }
@@ -446,12 +427,10 @@ fn ensure_pinned_source_unchanged(dir: &PinnedDir, req: &LinkRequest<'_>) -> Res
             req.src.display()
         )
     })?;
-    let expected = req.src_snapshot;
     let unchanged = meta.file_type().is_file()
-        && meta.dev() == expected.dev
-        && meta.ino() == expected.inode
-        && meta.len() == expected.size
-        && mtime_ns(&meta) == expected.mtime_ns;
+        && req
+            .src_snapshot
+            .matches_target(&FileSnapshot::from_metadata(&meta));
     if !unchanged {
         return Err(anyhow!(
             "the download {} changed while it was being linked; nothing was replaced, rerun scan",
@@ -597,12 +576,12 @@ where
         .map_err(|err| HardlinkError::Failed(with_note(err)))?;
     Ok(match made {
         TempLink::Hardlink => Linked {
-            method: "hardlink",
+            method: LinkMethod::Hardlink,
             fallback_reason: None,
             already_linked,
         },
         TempLink::FilesystemSymlink => Linked {
-            method: "symlink",
+            method: LinkMethod::Symlink,
             fallback_reason: Some(
                 "the filesystem made a symlink when asked for a hardlink (mergerfs link-exdev, the two files are on different disks)"
                     .to_string(),
@@ -634,7 +613,7 @@ where
         );
         replace_with_symlink(&dir, req, &rename_fn)?;
         return Ok(Linked {
-            method: "symlink",
+            method: LinkMethod::Symlink,
             fallback_reason: Some("symlink-only mode enabled".to_string()),
             already_linked: false,
         });
@@ -678,7 +657,7 @@ where
 
     replace_with_symlink(&dir, req, &rename_fn)?;
     Ok(Linked {
-        method: "symlink",
+        method: LinkMethod::Symlink,
         fallback_reason,
         already_linked: false,
     })
@@ -690,15 +669,6 @@ pub(super) fn replace_file_with_best_link(req: &LinkRequest<'_>) -> Result<Linke
         |from, to| fs::hard_link(from, to),
         |from, to| fs::rename(from, to),
     )
-}
-
-/// Whether `download` already is the library file `library`: one inode, or one
-/// file seen through two mounts. A bind mount or a mergerfs branch shows a
-/// library file on a second device, often under another inode number, but with
-/// the same size and timestamps; two real copies almost never share a ctime to
-/// the nanosecond.
-fn is_same_physical_file(download: &FileInfo, library: &FileInfo) -> bool {
-    snapshot_from_file_info(download).is_same_physical_file(&snapshot_from_file_info(library))
 }
 
 /// Plan one link per download in a group of identical files, all to the library
@@ -722,16 +692,16 @@ pub(super) fn plan_group_actions(group: &[&FileInfo]) -> Vec<LinkAction> {
     for src in downloads {
         if media
             .iter()
-            .any(|library| is_same_physical_file(src, library))
+            .any(|library| src.snapshot.is_same_physical_file(&library.snapshot))
         {
             continue;
         }
         actions.push(LinkAction {
             src: src.path.clone(),
             tgt: canonical.path.clone(),
-            size: src.size,
-            src_snapshot: snapshot_from_file_info(src),
-            tgt_snapshot: snapshot_from_file_info(canonical),
+            size: src.snapshot.size,
+            src_snapshot: src.snapshot,
+            tgt_snapshot: canonical.snapshot,
         });
     }
 
@@ -750,7 +720,8 @@ fn library_files_seen_through_second_mount(group: &[&FileInfo]) -> Vec<(PathBuf,
             media
                 .iter()
                 .find(|library| {
-                    library.dev != download.dev && is_same_physical_file(download, library)
+                    library.snapshot.dev != download.snapshot.dev
+                        && download.snapshot.is_same_physical_file(&library.snapshot)
                 })
                 .map(|library| (download.path.clone(), library.path.clone()))
         })
@@ -827,7 +798,7 @@ pub(super) fn action_table(actions: &[LinkAction], downloads: &Path, media: &Pat
         table.add_row(vec![
             below(&action.src, downloads),
             below(&action.tgt, media),
-            super::report::format_size(action.size),
+            crate::human::format_size(action.size),
         ]);
     }
     table
@@ -868,7 +839,7 @@ pub(super) fn apply_actions(
     actions: &[LinkAction],
     media: &Path,
     options: &ApplyOptions<'_>,
-    warnings: &mut RunWarnings,
+    warnings: &mut WarningSummary,
     report_entries: &mut [LinkReportEntry],
 ) -> ApplyOutcome {
     let ApplyOptions {
@@ -903,7 +874,7 @@ pub(super) fn apply_actions(
         }
         if tui_events {
             let _ = emit_tui_event(&TuiEvent::File {
-                phase: Some("applying".to_string()),
+                phase: Some(Phase::Applying),
                 path: action.src.display().to_string(),
             });
         }
@@ -941,7 +912,7 @@ pub(super) fn apply_actions(
                 read_access_refusal(&action.src, &src_meta, &action.tgt, &tgt_meta)
             {
                 let entry = &mut report_entries[index];
-                entry.status = "skipped".to_string();
+                entry.status = EntryStatus::Skipped;
                 entry.method = None;
                 entry.fallback_reason = None;
                 entry.error = Some(reason.clone());
@@ -956,14 +927,14 @@ pub(super) fn apply_actions(
                 roots,
                 link_mode,
             })?;
-            report_entries[index].method = Some(linked.method.to_string());
+            report_entries[index].method = Some(linked.method);
             if linked.already_linked {
-                report_entries[index].status = "already-linked".to_string();
+                report_entries[index].status = EntryStatus::AlreadyLinked;
                 report_entries[index].fallback_reason = Some(
                     "already this library file; nothing changed. The filesystem gives one file different inode numbers: on mergerfs, mount with inodecalc=hybrid-hash, or use_ino on older versions".to_string(),
                 );
             } else {
-                report_entries[index].status = "applied".to_string();
+                report_entries[index].status = EntryStatus::Applied;
                 report_entries[index].fallback_reason = linked.fallback_reason;
             }
             Ok(if linked.already_linked {
@@ -980,7 +951,7 @@ pub(super) fn apply_actions(
                 // and the OS error that says why is in its cause.
                 let err = format!("{err:#}");
                 let entry = &mut report_entries[index];
-                entry.status = "failed".to_string();
+                entry.status = EntryStatus::Failed;
                 // What the plan expected no longer applies to a pair that
                 // was not linked.
                 entry.method = None;
@@ -1011,12 +982,11 @@ pub(super) fn apply_actions(
                     ));
                     break;
                 } else {
-                    eprintln!(
-                        "{} Failed to apply {} -> {}: {err}",
-                        "⚠".yellow(),
+                    super::report::print_warning(format_args!(
+                        "Failed to apply {} -> {}: {err}",
                         action.src.display(),
                         action.tgt.display(),
-                    );
+                    ));
                     continue;
                 }
             }
@@ -1055,18 +1025,17 @@ pub(super) fn apply_actions(
                 "applied {} -> {} via {}",
                 action.src.display(),
                 action.tgt.display(),
-                report_entries[index].method.as_deref().unwrap_or("unknown")
+                report_entries[index]
+                    .method
+                    .map_or("an unknown method", LinkMethod::as_str)
             ),
         );
         if tui_events {
-            let _ = emit_tui_event(&TuiEvent::Count {
-                files_seen: None,
-                groups_found: None,
+            let _ = emit_tui_event(&TuiEvent::Count(Counts {
                 planned_actions: Some(actions.len()),
                 applied_actions: Some(applied_actions),
-                hash_progress_done: None,
-                hash_progress_total: None,
-            });
+                ..Counts::default()
+            }));
         }
     }
 

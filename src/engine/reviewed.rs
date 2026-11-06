@@ -117,6 +117,7 @@ impl LibraryIndex {
             .filter(|(key, _)| is_media_key(key))
             .map(|(_, entry)| entry)
         {
+            let entry = &entry.snapshot;
             index.inodes.insert((entry.dev, entry.inode));
             index
                 .times
@@ -194,11 +195,11 @@ fn vouch_for_file(
     if meta.modified().unwrap_or(SystemTime::UNIX_EPOCH) > filters.deadline {
         return not("is younger than the minimum age");
     }
-    let snapshot = FileSnapshot::of(&meta);
+    let snapshot = FileSnapshot::from_metadata(&meta);
     let Some(entry) = cache.get(&keys.key(path, in_downloads)) else {
         return not("has no cache entry");
     };
-    if entry.snapshot() != snapshot {
+    if !entry.snapshot.matches_source(&snapshot) {
         return not("changed since it was hashed");
     }
     match &entry.hash {
