@@ -77,12 +77,13 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     logger::info(
         "run",
         format!(
-            "starting mode={} downloads={} media={} dry_run={} strict={}",
+            "starting mode={} downloads={} media={} dry_run={} strict={} min_size={}",
             if options.dry_run { "scan" } else { "link" },
             downloads.display(),
             media.display(),
             options.dry_run,
-            options.strict
+            options.strict,
+            config.effective_min_size()
         ),
     );
 
@@ -101,6 +102,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         media,
         min_age,
         CollectOptions {
+            min_size: config.effective_min_size(),
             strict: options.strict,
             show_progress: options.show_progress,
             tui_events: options.tui_events,
@@ -270,7 +272,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     if !machine_output {
         print_run_summary(
             files_seen,
-            metrics.skipped_by_min_age,
+            &metrics,
             planned_actions,
             applied_actions,
             &warnings,

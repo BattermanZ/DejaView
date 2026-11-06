@@ -211,6 +211,11 @@ fn sidebar_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             Span::styled(format!("{}s", app.min_age_secs()), Theme::base()),
         ]),
         Line::from(vec![
+            Span::styled("Min size", Theme::dim()),
+            Span::raw("   "),
+            Span::styled(format_bytes(app.min_size_bytes()), Theme::base()),
+        ]),
+        Line::from(vec![
             Span::styled("Threads", Theme::dim()),
             Span::raw("    "),
             Span::styled(app.threads_label(), Theme::base()),
@@ -1032,6 +1037,7 @@ mod tests {
             applied_actions: 1,
             total_saved_bytes: 30,
             skipped_by_min_age: 0,
+            skipped_by_min_size: 0,
             warnings: crate::protocol::WarningSummary {
                 walk_errors: 0,
                 metadata_errors: 0,

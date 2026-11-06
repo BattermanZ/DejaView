@@ -32,6 +32,9 @@ enum Commands {
         /// Fail if any scan/hash/link errors occur
         #[arg(long)]
         strict: bool,
+        /// Skip files smaller than this many bytes for this run (default: the config's, else 1 MiB)
+        #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
+        min_size: Option<u64>,
         /// Force symlink creation and never attempt hardlinks
         #[arg(long)]
         symlink_only: bool,
@@ -46,6 +49,9 @@ enum Commands {
         /// Ask for confirmation before applying changes (interactive terminals only)
         #[arg(long)]
         confirm: bool,
+        /// Skip files smaller than this many bytes for this run (default: the config's, else 1 MiB)
+        #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
+        min_size: Option<u64>,
         /// Force symlink creation and never attempt hardlinks
         #[arg(long)]
         symlink_only: bool,
@@ -122,6 +128,11 @@ enum ConfigCommands {
     Show,
     /// Set the minimum file age in seconds before considering files
     SetMinAge { seconds: u64 },
+    /// Set the smallest file size in bytes to consider (default 1 MiB; empty files are always skipped)
+    SetMinSize {
+        #[arg(value_parser = clap::value_parser!(u64).range(1..))]
+        bytes: u64,
+    },
     /// Set worker thread count for hashing
     SetThreads { count: usize },
     /// Set link mode
@@ -182,10 +193,14 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Scan {
             strict,
+            min_size,
             symlink_only,
             output,
         } => {
             ensure_required_paths(&config)?;
+            if min_size.is_some() {
+                config.min_size = min_size;
+            }
             engine::run_scan_with_options(
                 &config,
                 engine::ScanRunOptions {
@@ -210,11 +225,15 @@ fn main() -> Result<()> {
         Commands::Link {
             strict,
             confirm,
+            min_size,
             symlink_only,
             only_sources,
             output,
         } => {
             ensure_required_paths(&config)?;
+            if min_size.is_some() {
+                config.min_size = min_size;
+            }
             engine::run_scan_with_options(
                 &config,
                 engine::ScanRunOptions {
@@ -254,6 +273,11 @@ fn main() -> Result<()> {
                 config.min_age = Some(seconds);
                 save_config(&config)?;
                 println!("{} min_age set to {} seconds.", "✔".green(), seconds);
+            }
+            ConfigCommands::SetMinSize { bytes } => {
+                config.min_size = Some(bytes);
+                save_config(&config)?;
+                println!("{} min_size set to {} bytes.", "✔".green(), bytes);
             }
             ConfigCommands::SetThreads { count } => {
                 if count == 0 {
@@ -450,10 +474,12 @@ mod tests {
         match cli.command {
             Commands::Scan {
                 strict,
+                min_size,
                 symlink_only,
                 output,
             } => {
                 assert!(strict);
+                assert_eq!(min_size, None);
                 assert!(!symlink_only);
                 assert!(!output.json);
                 assert_eq!(output.report, None);
@@ -480,11 +506,13 @@ mod tests {
             Commands::Link {
                 strict,
                 confirm,
+                min_size,
                 symlink_only,
                 only_sources,
                 output,
             } => {
                 assert!(!strict);
+                assert_eq!(min_size, None);
                 assert!(!confirm);
                 assert!(!symlink_only);
                 assert!(only_sources.is_empty());
@@ -528,6 +556,18 @@ mod tests {
                 command: ConfigCommands::SetMinAge { seconds },
             }) => assert_eq!(seconds, 120),
             _ => panic!("expected config set-min-age command"),
+        }
+    }
+
+    #[test]
+    fn min_size_of_zero_is_refused() {
+        assert!(Cli::try_parse_from(["dejaview", "scan", "--min-size", "0"]).is_err());
+        assert!(Cli::try_parse_from(["dejaview", "config", "set-min-size", "0"]).is_err());
+        let cli = Cli::try_parse_from(["dejaview", "link", "--min-size", "4096"])
+            .expect("parse link --min-size");
+        match cli.command {
+            Commands::Link { min_size, .. } => assert_eq!(min_size, Some(4096)),
+            _ => panic!("expected link command"),
         }
     }
 

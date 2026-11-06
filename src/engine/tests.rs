@@ -30,6 +30,8 @@ fn make_config(downloads: &Path, media: &Path, min_age: u64) -> Config {
         downloads: Some(downloads.to_path_buf()),
         media: Some(media.to_path_buf()),
         min_age: Some(min_age),
+        // Test files are a few bytes; only the empty-file rule applies.
+        min_size: Some(1),
         threads: None,
         link_mode: Some(LinkMode::Best),
     }
@@ -341,6 +343,7 @@ fn collect_files_strict_fails_on_walk_error() {
         true,
         Duration::from_secs(0),
         &CollectOptions {
+            min_size: 1,
             strict: true,
             show_progress: false,
             tui_events: false,
@@ -374,6 +377,7 @@ fn partially_linked_groups_still_plan_remaining_download_duplicates() {
         &media,
         Duration::from_secs(0),
         CollectOptions {
+            min_size: 1,
             strict: false,
             show_progress: false,
             tui_events: false,
@@ -1147,6 +1151,7 @@ fn collect_files_skips_dejaview_own_files() {
         true,
         Duration::from_secs(0),
         &CollectOptions {
+            min_size: 1,
             strict: false,
             show_progress: false,
             tui_events: false,
@@ -1321,5 +1326,32 @@ fn full_digest_stops_when_cancelled() {
     let err = super::hashing::full_digest(&path, &cancel).expect_err("cancelled digest");
 
     assert!(err.is::<Cancelled>());
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn link_run_leaves_empty_files_alone() {
+    let root = unique_temp_dir("empty_files");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let keep = downloads.join("Show.S01").join(".keep");
+    let plexignore = media.join(".plexignore");
+    write_file(&keep, b"");
+    write_file(&plexignore, b"");
+    let config = make_config(&downloads, &media, 0);
+
+    run_scan(&config, false, false, None);
+
+    let keep_meta = fs::symlink_metadata(&keep).expect("keep metadata");
+    let plexignore_meta = fs::metadata(&plexignore).expect("plexignore metadata");
+    assert!(
+        keep_meta.file_type().is_file(),
+        "empty download stays a file"
+    );
+    assert_ne!(
+        keep_meta.ino(),
+        plexignore_meta.ino(),
+        "an empty download must not share the library file's inode"
+    );
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

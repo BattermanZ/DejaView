@@ -21,13 +21,22 @@ fn format_size(bytes: u64) -> String {
 
 pub(super) fn print_run_summary(
     files_seen: usize,
-    skipped_by_min_age: u64,
+    metrics: &RunMetrics,
     planned_actions: usize,
     applied_actions: usize,
     warnings: &RunWarnings,
 ) {
     println!("{} Files considered: {}", "ℹ".cyan(), files_seen);
-    println!("{} Skipped by min-age: {}", "ℹ".cyan(), skipped_by_min_age);
+    println!(
+        "{} Skipped by min-size: {}",
+        "ℹ".cyan(),
+        metrics.skipped_by_min_size
+    );
+    println!(
+        "{} Skipped by min-age: {}",
+        "ℹ".cyan(),
+        metrics.skipped_by_min_age
+    );
     println!("{} Planned actions: {}", "ℹ".cyan(), planned_actions);
     if applied_actions > 0 {
         println!("{} Applied actions: {}", "ℹ".cyan(), applied_actions);
@@ -174,6 +183,7 @@ pub(super) fn build_run_report(options: &ScanRunOptions<'_>, input: RunReportInp
         applied_actions: input.applied_actions,
         total_saved_bytes: input.total_saved_space,
         skipped_by_min_age: input.metrics.skipped_by_min_age,
+        skipped_by_min_size: input.metrics.skipped_by_min_size,
         warnings: WarningSummary {
             walk_errors: input.warnings.walk_errors,
             metadata_errors: input.warnings.metadata_errors,

@@ -31,6 +31,10 @@ pub struct RunReport {
     pub applied_actions: usize,
     pub total_saved_bytes: u64,
     pub skipped_by_min_age: u64,
+    /// Files under the size floor, empty files included. Missing in reports
+    /// written before the floor existed.
+    #[serde(default)]
+    pub skipped_by_min_size: u64,
     pub warnings: WarningSummary,
     pub entries: Vec<LinkReportEntry>,
 }

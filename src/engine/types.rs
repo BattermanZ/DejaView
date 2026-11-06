@@ -72,6 +72,7 @@ pub(super) struct RunWarnings {
 #[derive(Default, Clone)]
 pub(super) struct RunMetrics {
     pub(super) skipped_by_min_age: u64,
+    pub(super) skipped_by_min_size: u64,
 }
 
 #[derive(Clone)]

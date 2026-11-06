@@ -40,6 +40,8 @@ fn set_min_age_zero(root: &Path) {
     let raw = fs::read_to_string(&config_path).expect("read config");
     let mut config: serde_json::Value = serde_json::from_str(&raw).expect("parse config json");
     config["min_age"] = serde_json::json!(0);
+    // Test files are small; only the empty-file rule applies.
+    config["min_size"] = serde_json::json!(1);
     fs::write(
         &config_path,
         serde_json::to_string_pretty(&config).expect("encode config"),
@@ -727,6 +729,68 @@ fn broken_config_file_error_names_the_file_and_the_fix() {
         b"{\"downloads\": \"/srv\",, }",
         "a broken config is left for the user to fix"
     );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+/// Config with downloads and media set and min_age 0, leaving min_size at its
+/// default.
+fn configure_default_floor(root: &Path, downloads: &Path, media: &Path) {
+    run_ok(
+        root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+    run_ok(root, &["config", "set-min-age", "0"]);
+}
+
+#[test]
+fn files_under_one_mib_are_left_alone_by_default() {
+    let root = unique_temp_dir("min_size_default");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    // A subtitle-sized pair below the floor, and a video-sized pair above it.
+    write_seeded(&downloads.join("Show.S01").join("e01.srt"), 9_000, 3);
+    write_seeded(&media.join("Show").join("e01.srt"), 9_000, 3);
+    write_seeded(&downloads.join("Show.S01").join("e01.mkv"), 1_200_000, 4);
+    write_seeded(&media.join("Show").join("e01.mkv"), 1_200_000, 4);
+    configure_default_floor(&root, &downloads, &media);
+
+    let out = run_cmd(&root, &["link", "--json", "--no-progress"]);
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse link json");
+    assert_eq!(report["applied_actions"], 1, "only the video is linked");
+    assert_eq!(
+        report["skipped_by_min_size"], 2,
+        "both subtitles are skipped"
+    );
+
+    let srt = fs::metadata(downloads.join("Show.S01").join("e01.srt")).expect("srt metadata");
+    let lib_srt = fs::metadata(media.join("Show").join("e01.srt")).expect("library srt");
+    assert_ne!(srt.ino(), lib_srt.ino(), "the subtitle stays its own file");
+    let mkv = fs::metadata(downloads.join("Show.S01").join("e01.mkv")).expect("mkv metadata");
+    let lib_mkv = fs::metadata(media.join("Show").join("e01.mkv")).expect("library mkv");
+    assert_eq!(mkv.ino(), lib_mkv.ino(), "the video is hardlinked");
+
+    // The floor can be lowered, but not to zero.
+    let out = run_cmd(&root, &["config", "set-min-size", "0"]);
+    assert!(!out.status.success(), "a floor of 0 is refused");
+    run_ok(&root, &["config", "set-min-size", "1"]);
+    let out = run_cmd(&root, &["link", "--json", "--no-progress"]);
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse link json");
+    assert_eq!(report["applied_actions"], 1, "the subtitle is linked now");
+    assert_eq!(report["skipped_by_min_size"], 0);
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

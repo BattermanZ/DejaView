@@ -14,6 +14,8 @@ use crate::protocol::TuiEvent;
 
 #[derive(Copy, Clone)]
 pub(super) struct CollectOptions<'a> {
+    /// Files smaller than this are skipped; at least 1, so empty files always are.
+    pub min_size: u64,
     pub strict: bool,
     pub show_progress: bool,
     pub tui_events: bool,
@@ -75,6 +77,10 @@ pub(super) fn collect_files(
                 continue;
             }
         };
+        if meta.len() < options.min_size.max(1) {
+            metrics.skipped_by_min_size += 1;
+            continue;
+        }
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         let mtime_ns = mtime
             .duration_since(SystemTime::UNIX_EPOCH)

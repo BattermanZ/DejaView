@@ -16,6 +16,7 @@ $ dejaview scan
 ╰──────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────╯
 💾 Potential space saved: 6.10 MB
 ℹ Files considered: 6
+ℹ Skipped by min-size: 0
 ℹ Skipped by min-age: 0
 ℹ Planned actions: 2
 ℹ Dry-run; no changes.
@@ -97,6 +98,7 @@ dejaview link --confirm
 | `dejaview config set-downloads PATH` | Set the downloads folder. The path is stored resolved and absolute. |
 | `dejaview config set-media PATH` | Set the media folder. |
 | `dejaview config set-min-age SECONDS` | Skip files modified more recently than this. |
+| `dejaview config set-min-size BYTES` | Skip files smaller than this. At least 1: empty files are always skipped. |
 | `dejaview config set-threads N` | Set the number of hashing threads. |
 | `dejaview config set-link-mode best\|symlink-only` | Choose hardlink with symlink fallback, or symlinks only. |
 | `dejaview cache info` | Show where the cache is and how many entries it holds. |
@@ -114,6 +116,7 @@ dejaview link --confirm
 | `--no-progress` | Same as `--progress off`. |
 | `--strict` | Exit with an error if any file could not be read, hashed or linked. |
 | `--symlink-only` | Use symlinks for this run, never hardlinks. |
+| `--min-size BYTES` | Skip files smaller than this for this run, in place of the configured floor. |
 | `--confirm` | `link` only. Ask before changing anything. Needs a terminal and cannot be combined with `--json`. |
 
 For a cron job:
@@ -158,6 +161,7 @@ The configuration lives in `~/.config/dejaview/config.json` (under `$XDG_CONFIG_
 | `downloads` | unset | Folder whose duplicates get replaced. Must be writable. |
 | `media` | unset | The library. Read, never written. |
 | `min_age` | `0` | Seconds. Files modified more recently are skipped, which keeps DejaView away from files a client is still writing. |
+| `min_size` | `1048576` (1 MiB) | Bytes. Smaller files are skipped: `.nfo` files, text subtitles and artwork save almost nothing and cost a read on every run. Empty files are always skipped, because a torrent client creates a file empty before writing into it. |
 | `threads` | number of CPUs | Hashing threads. Lower it if parallel reads thrash spinning disks. |
 | `link_mode` | `best` | `best` hardlinks and falls back to relative symlinks. `symlink-only` always uses relative symlinks. |
 
@@ -195,7 +199,7 @@ Files whose name starts with `.dejaview_` are never treated as duplicates.
 
 ## How it works
 
-1. Walk both folders without following symlinks. Skip files younger than `min_age` and DejaView's own files.
+1. Walk both folders without following symlinks. Skip files smaller than `min_size` (and every empty file), files younger than `min_age`, and DejaView's own files.
 2. Group files by size. Paths that are already the same file count once, and a group that is all one file is skipped.
 3. Quick hash (BLAKE3 of the first and last MiB) of each remaining file, unless every file in the group is already cached.
 4. Full BLAKE3 hash of the files whose quick hashes collide.

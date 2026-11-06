@@ -80,6 +80,7 @@ pub struct App {
     downloads: Option<PathBuf>,
     media: Option<PathBuf>,
     min_age: Option<u64>,
+    min_size: u64,
     threads: Option<usize>,
     link_mode: LinkMode,
     expand_paths: bool,
@@ -113,6 +114,7 @@ impl App {
             downloads: config.downloads.clone(),
             media: config.media.clone(),
             min_age: config.min_age,
+            min_size: config.effective_min_size(),
             threads: config.threads,
             link_mode: config.link_mode.unwrap_or(LinkMode::Best),
             expand_paths: false,
@@ -284,6 +286,10 @@ impl App {
 
     pub fn min_age_secs(&self) -> u64 {
         self.min_age.unwrap_or(0)
+    }
+
+    pub fn min_size_bytes(&self) -> u64 {
+        self.min_size
     }
 
     pub fn threads_label(&self) -> String {
@@ -734,6 +740,7 @@ impl App {
 
         self.downloads = config.downloads.clone();
         self.media = config.media.clone();
+        self.min_size = config.effective_min_size();
         self.link_mode = config.link_mode.unwrap_or(LinkMode::Best);
         self.overlay = Overlay::None;
         self.push_log("Saved TUI path configuration.".to_string());
@@ -1227,6 +1234,7 @@ mod tests {
             applied_actions: 0,
             total_saved_bytes: 1024,
             skipped_by_min_age: 0,
+            skipped_by_min_size: 0,
             warnings: WarningSummary {
                 walk_errors: 0,
                 metadata_errors: 0,
@@ -1254,6 +1262,7 @@ mod tests {
             applied_actions: 1,
             total_saved_bytes: 30,
             skipped_by_min_age: 0,
+            skipped_by_min_size: 0,
             warnings: WarningSummary {
                 walk_errors: 0,
                 metadata_errors: 0,
@@ -1728,6 +1737,7 @@ mod tests {
             applied_actions: 0,
             total_saved_bytes: 30,
             skipped_by_min_age: 0,
+            skipped_by_min_size: 0,
             warnings: WarningSummary {
                 walk_errors: 0,
                 metadata_errors: 0,
@@ -1777,6 +1787,7 @@ mod tests {
                 applied_actions: 1,
                 total_saved_bytes: 10,
                 skipped_by_min_age: 0,
+                skipped_by_min_size: 0,
                 warnings: WarningSummary {
                     walk_errors: 0,
                     metadata_errors: 0,
@@ -1894,6 +1905,7 @@ mod tests {
                     downloads: Some(PathBuf::from("/stale/downloads")),
                     media: Some(PathBuf::from("/stale/media")),
                     min_age: Some(900),
+                    min_size: None,
                     threads: Some(8),
                     link_mode: Some(LinkMode::Best),
                 })
@@ -1903,6 +1915,7 @@ mod tests {
                     downloads: config.downloads.clone(),
                     media: config.media.clone(),
                     min_age: config.min_age,
+                    min_size: config.min_size,
                     threads: config.threads,
                     link_mode: config.link_mode,
                 });
