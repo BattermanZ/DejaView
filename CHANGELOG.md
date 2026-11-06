@@ -9,10 +9,12 @@
 - A pair that mergerfs's `link-exdev` option turned into a symlink is reported with `method` `symlink`, where it used to say `hardlink`. [#3]
 - Building DejaView needs Rust 1.89 or newer. [#3]
 - Files under 1 MiB are now skipped by default, so `.nfo` files, text subtitles and artwork are no longer linked. Set `dejaview config set-min-size 1` to link small files again. [#3]
+- `threads` now sets how many files are walked and quick-hashed at once, 16 when unset, where it was every hash's thread count and the number of CPUs when unset. Full reads have their own `full_threads`, 2 when unset; set it to 1 for a single spinning disk.
 - Walks now leave out the folders a NAS or an OS keeps for itself: `@eaDir`, `#recycle`, `#snapshot`, `@Recycle`, `.@__thumb`, `.recycle`, `.snapshots`, `.Trash-*`, `$RECYCLE.BIN` and `lost+found`. A file in one of them is no longer linked, nor used as the library file a download links to. `dejaview config set-exclude` changes the list, and with no pattern leaves nothing out.
 
 ### Added
 
+- `dejaview config set-full-threads N` sets how many files are read in full at once.
 - `dejaview config set-exclude [PATTERN]...` sets the file and folder names every walk leaves out, as globs, with everything under them.
 - `DEJAVIEW_CONFIG` sets the config file's path and `DEJAVIEW_LOG` the log's, or `-` for stderr, for containers and services run as a user with no home folder. [#3]
 - `dejaview config validate` tries one real hardlink from the library into downloads and says whether link runs will make hardlinks, and if not, why: different filesystems or mounts, or ownership and `fs.protected_hardlinks`. [#3]
@@ -22,6 +24,7 @@
 
 ### Changed
 
+- Downloads and media are walked at once, many folders in parallel, so a run on a network drive no longer waits on one `stat` after another before hashing starts.
 - A repeat scan reads only files that are new or changed: the cache now keeps each file's quick hash too, so a file whose quick hash matched no other is not read again, and a file of 1 MiB or less is read once, since its quick hash covers it whole. Before, every file sharing its size with a new or changed one was read again on every run.
 - Files of a size that no download shares with a library file are no longer read, nor are those where every download already is a library file: no link can come of them.
 

@@ -135,6 +135,14 @@ where
     )
 }
 
+/// A small pool for walks a test runs directly.
+fn test_pool() -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .expect("build test pool")
+}
+
 fn running_as_root() -> bool {
     let output = Command::new("id").arg("-u").output();
     match output {
@@ -540,6 +548,7 @@ fn partially_linked_groups_still_plan_remaining_download_duplicates() {
             tui_events: false,
             cancel: &CancelToken::default(),
         },
+        &test_pool(),
         &mut warnings,
         &mut metrics,
     )
@@ -2111,6 +2120,7 @@ fn excluded_folders_are_never_walked() {
             tui_events: false,
             cancel: &CancelToken::default(),
         },
+        &test_pool(),
         &mut warnings,
         &mut metrics,
     )
@@ -2121,6 +2131,95 @@ fn excluded_folders_are_never_walked() {
         paths,
         vec![downloads.join("movie.mkv"), media.join("Movies/movie.mkv")]
     );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn the_parallel_walk_finds_every_file_in_a_wide_tree() {
+    let root = unique_temp_dir("wide_walk");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    for show in 0..12 {
+        for season in 0..3 {
+            for episode in 0..4 {
+                let rel = format!("Show {show}/Season {season}/e{episode}.mkv");
+                write_file(&downloads.join(&rel), b"download");
+                write_file(&media.join(&rel), b"library!");
+            }
+            write_file(
+                &media.join(format!("Show {show}/Season {season}/tiny.nfo")),
+                b"x",
+            );
+        }
+    }
+    let config = make_config(&downloads, &media, 0);
+    let exclude = Exclude::new(config.effective_exclude());
+    let mut warnings = RunWarnings::default();
+    let mut metrics = RunMetrics::default();
+
+    let files = collect_run_files(
+        &downloads,
+        &media,
+        Duration::ZERO,
+        CollectOptions {
+            min_size: 2,
+            exclude: &exclude,
+            strict: true,
+            show_progress: false,
+            tui_events: false,
+            cancel: &CancelToken::default(),
+        },
+        &test_pool(),
+        &mut warnings,
+        &mut metrics,
+    )
+    .expect("collect");
+
+    assert_eq!(files.iter().filter(|file| file.in_downloads).count(), 144);
+    assert_eq!(files.iter().filter(|file| !file.in_downloads).count(), 144);
+    assert_eq!(metrics.skipped_by_min_size, 36);
+    let downloads_sorted = files
+        .iter()
+        .filter(|file| file.in_downloads)
+        .map(|file| &file.path)
+        .is_sorted();
+    assert!(
+        downloads_sorted,
+        "each root's files come back sorted by path"
+    );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_cancelled_walk_stops_with_cancelled() {
+    let root = unique_temp_dir("cancelled_walk");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_file(&downloads.join("a/b.mkv"), b"x");
+    write_file(&media.join("a/b.mkv"), b"x");
+    let cancel = CancelToken::default();
+    cancel.cancel();
+    let exclude = Exclude::default();
+
+    let result = collect_run_files(
+        &downloads,
+        &media,
+        Duration::ZERO,
+        CollectOptions {
+            min_size: 1,
+            exclude: &exclude,
+            strict: false,
+            show_progress: false,
+            tui_events: false,
+            cancel: &cancel,
+        },
+        &test_pool(),
+        &mut RunWarnings::default(),
+        &mut RunMetrics::default(),
+    );
+    assert!(result.expect_err("cancelled").is::<Cancelled>());
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

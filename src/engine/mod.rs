@@ -175,6 +175,8 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     // Held until the run returns, cache save and report included.
     let _lock = lock::acquire(downloads)?;
     let exclude = collect::Exclude::new(config.effective_exclude());
+    let quick_pool = build_pool("quick", config.effective_threads())?;
+    let full_pool = build_pool("full", config.effective_full_threads())?;
     let mut warnings = RunWarnings::default();
     let mut metrics = RunMetrics::default();
     if options.tui_events {
@@ -197,6 +199,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
             tui_events: options.tui_events,
             cancel: &options.cancel,
         },
+        &quick_pool,
         &mut warnings,
         &mut metrics,
     )?;
@@ -252,19 +255,22 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
                 .any(|file| file.in_downloads && options.only_sources.contains(&file.path))
         });
     }
-    let hash_result = hash_groups_and_update_cache(
-        &mut groups,
-        &mut cache,
-        &HashOptions {
-            strict: options.strict,
-            show_progress: options.show_progress,
-            tui_events: options.tui_events,
-            link_mode: options.link_mode,
-            selection: &options,
-            cancel: &options.cancel,
-        },
-        &mut warnings,
-    );
+    let hash_result = quick_pool.install(|| {
+        hash_groups_and_update_cache(
+            &mut groups,
+            &mut cache,
+            &HashOptions {
+                strict: options.strict,
+                show_progress: options.show_progress,
+                tui_events: options.tui_events,
+                link_mode: options.link_mode,
+                selection: &options,
+                cancel: &options.cancel,
+                full_pool: &full_pool,
+            },
+            &mut warnings,
+        )
+    });
     if hash_result.is_ok() && warnings.walk_errors == 0 && warnings.metadata_errors == 0 {
         let pruned = prune_cache(&mut cache, &seen_paths);
         if pruned > 0 {
@@ -467,6 +473,19 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         ),
     );
     Ok(())
+}
+
+/// A pool of `threads` workers for one kind of I/O: `quick` walks and
+/// quick-hashes, `full` reads files whole.
+fn build_pool(kind: &str, threads: usize) -> Result<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name({
+            let kind = kind.to_string();
+            move |index| format!("dejaview-{kind}-{index}")
+        })
+        .build()
+        .map_err(|err| anyhow!("cannot start {threads} {kind} worker thread(s): {err}"))
 }
 
 /// A download that is a library file seen through a second mount means the

@@ -137,6 +137,10 @@ pub(super) struct HashOptions<'a> {
     /// The run's options, for which planned actions it was asked to take.
     pub(super) selection: &'a super::types::ScanRunOptions<'a>,
     pub(super) cancel: &'a CancelToken,
+    /// Full reads run here; quick hashes run on the pool the caller installs.
+    /// Full reads are limited by the drive's bandwidth and quick ones by its
+    /// latency, so each kind gets its own number of workers.
+    pub(super) full_pool: &'a rayon::ThreadPool,
 }
 
 /// One physical file in a size group: every path of it, and what is known of
@@ -534,63 +538,65 @@ pub(super) fn hash_groups_and_update_cache(
     // Phase 2: the full hash of each physical file whose quick hash collides
     // with another's, again split per file. A group's rows go to the TUI as
     // soon as its own files are done.
-    groups
-        .par_iter_mut()
-        .zip(works.par_iter_mut())
-        .zip(full_candidates.into_par_iter())
-        .zip(reading.into_par_iter())
-        .for_each(|(((group, work), candidates), reading)| {
-            let Some(work) = work.as_mut().filter(|_| reading) else {
-                return;
-            };
-            let hashed: Vec<(usize, String)> = candidates
-                .par_iter()
-                .filter_map(|&idx| {
-                    if !stop.may_continue(options.cancel) {
-                        return None;
-                    }
-                    let worker = worker_id();
-                    let path = &group[work.files[idx].members[0]].path;
-                    emit_worker_activity(
-                        "hashing_full",
-                        worker,
-                        Some(path.display().to_string()),
-                        tui_events,
-                    );
-                    let digest_result = full_digest(path, options.cancel);
-                    let done = full_done.fetch_add(1, Ordering::Relaxed) + 1;
-                    emit_hash_progress(done as usize, total_full_files, tui_events);
-                    if let Some(progress_bar) = &bar {
-                        progress_bar.inc(1);
-                    }
-                    emit_worker_activity("hashing_full", worker, None, tui_events);
-                    match digest_result {
-                        Ok(hash) => Some((idx, hash)),
-                        Err(err) if err.is::<Cancelled>() => {
-                            stop.set(err);
-                            None
+    options.full_pool.install(|| {
+        groups
+            .par_iter_mut()
+            .zip(works.par_iter_mut())
+            .zip(full_candidates.into_par_iter())
+            .zip(reading.into_par_iter())
+            .for_each(|(((group, work), candidates), reading)| {
+                let Some(work) = work.as_mut().filter(|_| reading) else {
+                    return;
+                };
+                let hashed: Vec<(usize, String)> = candidates
+                    .par_iter()
+                    .filter_map(|&idx| {
+                        if !stop.may_continue(options.cancel) {
+                            return None;
                         }
-                        Err(err) => {
-                            full_hash_errors.fetch_add(1, Ordering::Relaxed);
-                            if strict {
-                                stop.set(anyhow!(
-                                    "full hash error for {}: {err:#}",
-                                    path.display()
-                                ));
+                        let worker = worker_id();
+                        let path = &group[work.files[idx].members[0]].path;
+                        emit_worker_activity(
+                            "hashing_full",
+                            worker,
+                            Some(path.display().to_string()),
+                            tui_events,
+                        );
+                        let digest_result = full_digest(path, options.cancel);
+                        let done = full_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        emit_hash_progress(done as usize, total_full_files, tui_events);
+                        if let Some(progress_bar) = &bar {
+                            progress_bar.inc(1);
+                        }
+                        emit_worker_activity("hashing_full", worker, None, tui_events);
+                        match digest_result {
+                            Ok(hash) => Some((idx, hash)),
+                            Err(err) if err.is::<Cancelled>() => {
+                                stop.set(err);
+                                None
                             }
-                            None
+                            Err(err) => {
+                                full_hash_errors.fetch_add(1, Ordering::Relaxed);
+                                if strict {
+                                    stop.set(anyhow!(
+                                        "full hash error for {}: {err:#}",
+                                        path.display()
+                                    ));
+                                }
+                                None
+                            }
                         }
-                    }
-                })
-                .collect();
-            for (idx, hash) in hashed {
-                work.files[idx].full = Some(hash);
-            }
-            work.assign(group);
-            if !stop.is_set() {
-                emit_planned_entries(group, options);
-            }
-        });
+                    })
+                    .collect();
+                for (idx, hash) in hashed {
+                    work.files[idx].full = Some(hash);
+                }
+                work.assign(group);
+                if !stop.is_set() {
+                    emit_planned_entries(group, options);
+                }
+            });
+    });
 
     // Hashes finished before a cancel or a strict failure are still valid.
     sync_cache(cache, groups);

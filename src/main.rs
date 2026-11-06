@@ -142,8 +142,10 @@ enum ConfigCommands {
         #[arg(value_parser = clap::value_parser!(u64).range(1..))]
         bytes: u64,
     },
-    /// Set worker thread count for hashing
+    /// Set how many files are walked and quick-hashed at once (default 16)
     SetThreads { count: usize },
+    /// Set how many files are read in full at once (default 2)
+    SetFullThreads { count: usize },
     /// Set the file and folder names every walk leaves out, as globs (* for any run of characters, ? for one). With no PATTERN, nothing is left out
     #[command(
         after_help = "The default list leaves out the folders a NAS or an OS keeps for itself: @eaDir, #recycle, #snapshot, @Recycle, .@__thumb, .recycle, .snapshots, .Trash-*, $RECYCLE.BIN and lost+found."
@@ -219,12 +221,6 @@ fn run_cli() -> Result<()> {
         Err(warning) => eprintln!("{} {warning}", "⚠".yellow()),
     }
     let mut config = load_config()?;
-
-    if let Some(threads) = config.threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build_global()?;
-    }
 
     match cli.command {
         Commands::Scan {
@@ -334,6 +330,14 @@ fn run_cli() -> Result<()> {
                 config.threads = Some(count);
                 save_config(&config)?;
                 println!("{} threads set to {}.", "✔".green(), count);
+            }
+            ConfigCommands::SetFullThreads { count } => {
+                if count == 0 {
+                    return Err(anyhow::anyhow!("full threads must be greater than 0"));
+                }
+                config.full_threads = Some(count);
+                save_config(&config)?;
+                println!("{} full_threads set to {}.", "✔".green(), count);
             }
             ConfigCommands::SetExclude { patterns, default } => {
                 if default {

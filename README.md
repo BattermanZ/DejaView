@@ -101,7 +101,8 @@ dejaview link --confirm
 | `dejaview config set-media PATH` | Set the media folder. |
 | `dejaview config set-min-age SECONDS` | Skip files modified more recently than this. |
 | `dejaview config set-min-size BYTES` | Skip files smaller than this. At least 1: empty files are always skipped. |
-| `dejaview config set-threads N` | Set the number of hashing threads. |
+| `dejaview config set-threads N` | Set how many files are walked and quick-hashed at once. |
+| `dejaview config set-full-threads N` | Set how many files are read in full at once. |
 | `dejaview config set-exclude [PATTERN]...` | Set the file and folder names every walk leaves out, as globs (`*` for any run of characters, `?` for one). With no pattern nothing is left out; `--default` goes back to the default list. |
 | `dejaview config set-link-mode best\|symlink-only` | Choose hardlink with symlink fallback, or symlinks only. |
 | `dejaview cache info` | Show where the cache is and how many entries it holds. |
@@ -179,7 +180,8 @@ If the log cannot be written, DejaView warns once, naming the path, and runs wit
 | `media` | unset | The library. Read, never written. |
 | `min_age` | `0` | Seconds. Files modified more recently are skipped, which keeps DejaView away from files a client is still writing. |
 | `min_size` | `1048576` (1 MiB) | Bytes. Smaller files are skipped: `.nfo` files, text subtitles and artwork save almost nothing and cost a read on every run. Empty files are always skipped, because a torrent client creates a file empty before writing into it. |
-| `threads` | number of CPUs | Hashing threads. Lower it if parallel reads thrash spinning disks. |
+| `threads` | `16` | Files walked and quick-hashed at once. Both wait on the drive, mostly on its answer to each `stat` or short read, so a network drive keeps many busy whatever the CPU count. |
+| `full_threads` | `2` | Files read in full at once. Full reads are limited by the drive's bandwidth, and more of them at once make a spinning disk seek; set it to `1` for a single spinning disk. |
 | `exclude` | the folders a NAS or an OS keeps for itself | Names of files and folders every walk leaves out, with everything under them, each matched against one name. The default list is `@eaDir`, `#recycle`, `#snapshot`, `@Recycle`, `.@__thumb`, `.recycle`, `.snapshots`, `.Trash-*`, `$RECYCLE.BIN` and `lost+found`: walking them costs time, and a recycle-bin copy could otherwise become a link target. |
 | `link_mode` | `best` | `best` hardlinks and falls back to relative symlinks. `symlink-only` always uses relative symlinks. |
 

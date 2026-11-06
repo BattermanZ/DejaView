@@ -39,6 +39,8 @@ flowchart TD
     CFG --> SMA[set-min-age]
     CFG --> SMS[set-min-size]
     CFG --> ST[set-threads]
+    CFG --> SFT[set-full-threads]
+    CFG --> SEX[set-exclude]
     CFG --> SLM[set-link-mode]
     CFG --> CV[validate]
     CFG --> CS[show]
