@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 
 use crate::fsutil::safe_write_bytes;
 use crate::logger;
-use crate::protocol::{LinkReportEntry, RunReport, WarningSummary};
+use crate::protocol::{LinkReportEntry, Outcome, RunReport, WarningSummary};
 
-use super::types::{LinkAction, LinkMode, RunMetrics, RunWarnings, ScanRunOptions};
+use super::linking::Applied;
+use super::types::{Audience, LinkAction, LinkMode, RunMetrics, RunWarnings, ScanRunOptions};
 
 /// A size for a person, in binary units: `8.0 MiB`.
 pub(super) fn format_size(bytes: u64) -> String {
@@ -51,9 +52,9 @@ pub(super) fn print_run_summary(
     metrics: &RunMetrics,
     symlinked: usize,
     warnings: &RunWarnings,
-    quiet: bool,
+    audience: Audience,
 ) {
-    if !quiet {
+    if audience.is_chatty() {
         let mut left_out = Vec::new();
         if metrics.skipped_by_min_size > 0 {
             left_out.push(format!(
@@ -114,13 +115,10 @@ pub(super) fn print_run_summary(
 /// How a link run ended, in the one line a person or a cron mail reads.
 pub(super) struct Verdict<'a> {
     pub(super) planned: usize,
-    pub(super) applied: usize,
-    pub(super) already_linked: usize,
-    pub(super) skipped: usize,
+    pub(super) applied: Applied,
     pub(super) failed: u64,
     /// Downloads that became symlinks: a quiet run says so too.
     pub(super) symlinked: usize,
-    pub(super) freed_bytes: u64,
     pub(super) cancelled: bool,
     pub(super) report: Option<&'a Path>,
 }
@@ -128,20 +126,21 @@ pub(super) struct Verdict<'a> {
 impl Verdict<'_> {
     /// `Linked 7 of 8, 8.0 MiB freed, 1 failed: see <report>`.
     pub(super) fn line(&self) -> String {
+        let applied = &self.applied;
         let mut parts = vec![format!(
             "Linked {} of {}, {} freed",
-            self.applied,
+            applied.applied,
             self.planned,
-            format_size(self.freed_bytes)
+            format_size(applied.freed_bytes)
         )];
         if self.symlinked > 0 {
             parts.push(format!("{} as symlinks", self.symlinked));
         }
-        if self.already_linked > 0 {
-            parts.push(format!("{} already linked", self.already_linked));
+        if applied.already_linked > 0 {
+            parts.push(format!("{} already linked", applied.already_linked));
         }
-        if self.skipped > 0 {
-            parts.push(format!("{} left alone", self.skipped));
+        if applied.skipped > 0 {
+            parts.push(format!("{} left alone", applied.skipped));
         }
         if self.failed > 0 {
             parts.push(format!("{} failed", self.failed));
@@ -150,7 +149,7 @@ impl Verdict<'_> {
         if self.cancelled {
             line.push_str("; stopped on request, the rest stay planned");
         }
-        if (self.failed > 0 || self.skipped > 0 || self.symlinked > 0)
+        if (self.failed > 0 || applied.skipped > 0 || self.symlinked > 0)
             && let Some(report) = self.report
         {
             line.push_str(&format!(": see {}", report.display()));
@@ -159,8 +158,9 @@ impl Verdict<'_> {
     }
 
     /// Print the line, unless a quiet run linked nothing and nothing failed.
-    pub(super) fn print(&self, quiet: bool) {
-        if self.planned == 0 || (quiet && self.applied == 0 && self.failed == 0) {
+    pub(super) fn print(&self, audience: Audience) {
+        let quiet = audience == Audience::Quiet;
+        if self.planned == 0 || (quiet && self.applied.applied == 0 && self.failed == 0) {
             return;
         }
         let mark = if self.failed > 0 || self.cancelled {
@@ -353,31 +353,27 @@ pub(super) fn build_run_report(options: &ScanRunOptions<'_>, input: RunReportInp
         } else {
             "link".to_string()
         },
-        outcome: input.outcome.as_str().to_string(),
+        outcome: input.outcome,
         version: env!("CARGO_PKG_VERSION").to_string(),
         started_at: rfc3339_utc(input.started_at),
         finished_at: rfc3339_utc(std::time::SystemTime::now()),
         downloads: input.downloads.display().to_string(),
         media: input.media.display().to_string(),
-        link_mode: match options.link_mode {
-            LinkMode::Best => "best",
-            LinkMode::SymlinkOnly => "symlink-only",
-        }
-        .to_string(),
+        link_mode: options.link_mode,
         dry_run: options.dry_run,
         strict: options.strict,
         files_considered: input.files_seen,
         planned_actions: input.planned_actions,
-        applied_actions: input.applied_actions,
+        applied_actions: input.applied.applied,
         symlinked: symlinked_count(&input.entries),
-        already_linked: input.already_linked,
-        already_linked_bytes: input.already_linked_bytes,
+        already_linked: input.applied.already_linked,
+        already_linked_bytes: input.applied.already_linked_bytes,
         planned_bytes: input.planned_bytes,
-        freed_bytes: input.freed_bytes,
+        freed_bytes: input.applied.freed_bytes,
         total_saved_bytes: if options.dry_run {
             input.planned_bytes
         } else {
-            input.freed_bytes
+            input.applied.freed_bytes
         },
         skipped_by_min_age: input.metrics.skipped_by_min_age,
         skipped_by_min_size: input.metrics.skipped_by_min_size,
@@ -400,27 +396,6 @@ pub(super) fn build_run_report(options: &ScanRunOptions<'_>, input: RunReportInp
     }
 }
 
-/// How a run that built its report ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Outcome {
-    /// It reached its end, whatever failed on the way.
-    Complete,
-    /// Stopped on request between pairs.
-    Cancelled,
-    /// `--strict` stopped it on a failure.
-    Failed,
-}
-
-impl Outcome {
-    pub(super) fn as_str(self) -> &'static str {
-        match self {
-            Outcome::Complete => "complete",
-            Outcome::Cancelled => "cancelled",
-            Outcome::Failed => "failed",
-        }
-    }
-}
-
 pub(super) struct RunReportInput<'a> {
     pub(super) outcome: Outcome,
     pub(super) started_at: std::time::SystemTime,
@@ -428,11 +403,8 @@ pub(super) struct RunReportInput<'a> {
     pub(super) media: &'a Path,
     pub(super) files_seen: usize,
     pub(super) planned_actions: usize,
-    pub(super) applied_actions: usize,
-    pub(super) already_linked: usize,
-    pub(super) already_linked_bytes: u64,
     pub(super) planned_bytes: u64,
-    pub(super) freed_bytes: u64,
+    pub(super) applied: Applied,
     pub(super) metrics: RunMetrics,
     pub(super) warnings: RunWarnings,
     pub(super) entries: Vec<LinkReportEntry>,

@@ -92,6 +92,31 @@ impl PlannedPair {
 }
 
 impl LinkReportEntry {
+    /// Still to do: the plan's row, not yet linked.
+    pub fn is_planned(&self) -> bool {
+        self.status.eq_ignore_ascii_case("planned")
+    }
+
+    /// Linked by a run.
+    pub fn is_applied(&self) -> bool {
+        self.status.eq_ignore_ascii_case("applied")
+    }
+
+    /// A link that failed; `error` says why.
+    pub fn is_failed(&self) -> bool {
+        self.status.eq_ignore_ascii_case("failed")
+    }
+
+    /// Left alone on purpose; `error` says why.
+    pub fn is_skipped(&self) -> bool {
+        self.status.eq_ignore_ascii_case("skipped")
+    }
+
+    /// Found at link time to be one file already.
+    pub fn is_already_linked(&self) -> bool {
+        self.status.eq_ignore_ascii_case("already-linked")
+    }
+
     /// Where the row sorts: by download path, then library path, compared
     /// as paths, as the engine orders every plan.
     pub fn row_order(&self) -> (PathBuf, PathBuf) {
@@ -116,8 +141,32 @@ impl LinkReportEntry {
     /// This run turned the download into a symlink, which breaks if its
     /// library file is upgraded, renamed or deleted (ADR 0001).
     pub fn is_applied_symlink(&self) -> bool {
-        self.status == "applied" && self.method.as_deref() == Some("symlink")
+        self.is_applied() && self.method.as_deref() == Some("symlink")
     }
+}
+
+/// How links are made: `best` hardlinks and falls back to a symlink,
+/// `symlink-only` always symlinks. The config and the report both say it.
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinkMode {
+    #[default]
+    Best,
+    SymlinkOnly,
+}
+
+/// How a run that built its report ended.
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Outcome {
+    /// It reached its end, whatever failed on the way, which `warnings`
+    /// counts.
+    #[default]
+    Complete,
+    /// Stopped on request; pairs not reached stay `planned`.
+    Cancelled,
+    /// `--strict` stopped it on a failure.
+    Failed,
 }
 
 /// How a run ended. Fields added after the first release default when a
@@ -125,11 +174,9 @@ impl LinkReportEntry {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RunReport {
     pub mode: String,
-    /// `complete` (the run reached its end, whatever failed on the way, which
-    /// `warnings` counts), `cancelled` (stopped on request; pairs not reached
-    /// stay `planned`) or `failed` (stopped by `--strict` on a failure).
+    /// `complete`, `cancelled` or `failed`; see [`Outcome`].
     #[serde(default)]
-    pub outcome: String,
+    pub outcome: Outcome,
     /// The DejaView version that wrote the report.
     #[serde(default)]
     pub version: String,
@@ -146,7 +193,7 @@ pub struct RunReport {
     pub media: String,
     /// `best` (hardlink, else symlink) or `symlink-only`.
     #[serde(default)]
-    pub link_mode: String,
+    pub link_mode: LinkMode,
     pub dry_run: bool,
     pub strict: bool,
     pub files_considered: usize,

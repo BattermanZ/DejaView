@@ -9,13 +9,9 @@ use super::cancel::CancelToken;
 use crate::protocol::TuiEvent;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum LinkMode {
-    #[default]
-    Best,
-    SymlinkOnly,
-}
+/// It lives with the report, which names it; the engine and the config use
+/// it from here.
+pub use crate::protocol::LinkMode;
 
 #[derive(Debug, Clone)]
 pub(super) struct FileInfo {
@@ -177,7 +173,47 @@ pub struct ScanRunOptions<'a> {
     pub cancel: CancelToken,
 }
 
+/// Who reads what a run prints, which decides what it prints. Worked out
+/// once from the options, so no print site combines the flags itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Audience {
+    /// A person at a terminal: the plan, a summary, warnings and a verdict.
+    Person,
+    /// `--quiet`: a person or a cron job, told only of links made and
+    /// failures.
+    Quiet,
+    /// `--json`: a script reading one report on stdout.
+    Script,
+    /// `--tui-events`: the dashboard, reading events on stdout.
+    Dashboard,
+}
+
+impl Audience {
+    /// A person reads the terminal, quiet or not.
+    pub(super) fn is_person(self) -> bool {
+        matches!(self, Audience::Person | Audience::Quiet)
+    }
+
+    /// Everything a person may want is printed: the plan, the summary and
+    /// warnings that come back every run.
+    pub(super) fn is_chatty(self) -> bool {
+        self == Audience::Person
+    }
+}
+
 impl ScanRunOptions<'_> {
+    pub(super) fn audience(&self) -> Audience {
+        if self.tui_events {
+            Audience::Dashboard
+        } else if self.json_output {
+            Audience::Script
+        } else if self.quiet {
+            Audience::Quiet
+        } else {
+            Audience::Person
+        }
+    }
+
     /// Whether a planned action is one this run was asked to take.
     pub(super) fn selects(&self, action: &LinkAction) -> bool {
         (self.only_sources.is_empty() || self.only_sources.contains(&action.src))

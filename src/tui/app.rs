@@ -215,10 +215,7 @@ impl App {
             .or_else(|| {
                 self.report.as_ref().map(|r| {
                     if r.mode == "link" {
-                        r.entries
-                            .iter()
-                            .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
-                            .count()
+                        r.entries.iter().filter(|entry| entry.is_planned()).count()
                     } else {
                         r.planned_actions
                     }
@@ -232,10 +229,7 @@ impl App {
             .or_else(|| {
                 self.report.as_ref().map(|r| {
                     if r.mode == "link" {
-                        r.entries
-                            .iter()
-                            .filter(|entry| entry.status.eq_ignore_ascii_case("applied"))
-                            .count()
+                        r.entries.iter().filter(|entry| entry.is_applied()).count()
                     } else {
                         r.applied_actions
                     }
@@ -264,7 +258,7 @@ impl App {
                     report
                         .entries
                         .iter()
-                        .filter(|entry| !entry.status.eq_ignore_ascii_case("applied"))
+                        .filter(|entry| !entry.is_applied())
                         .map(|entry| entry.size)
                         .sum()
                 } else {
@@ -334,7 +328,7 @@ impl App {
         self.report
             .iter()
             .flat_map(|report| &report.entries)
-            .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
+            .filter(|entry| entry.is_planned())
             .map(PlannedPair::of)
             .collect()
     }
@@ -611,7 +605,7 @@ impl App {
             KeyCode::Char('l') => {
                 if self
                     .selected_entry()
-                    .is_some_and(|entry| entry.status.eq_ignore_ascii_case("planned"))
+                    .is_some_and(|entry| entry.is_planned())
                 {
                     self.overlay = Overlay::ConfirmLink(ConfirmLinkMode::Selected);
                 } else {
@@ -780,7 +774,7 @@ impl App {
 
         let Some(pair) = self
             .selected_entry()
-            .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
+            .filter(|entry| entry.is_planned())
             .map(PlannedPair::of)
         else {
             self.push_log("Select a planned row before running a single-item link.".to_string());
@@ -1231,7 +1225,7 @@ impl App {
                 let applied = report.applied_actions;
                 let link_failures = report.warnings.link_errors;
                 let unreadable = report.warning_total() - link_failures;
-                let cancelled = report.outcome == "cancelled";
+                let cancelled = report.outcome == crate::protocol::Outcome::Cancelled;
                 let symlinked = report
                     .entries
                     .iter()
@@ -1292,7 +1286,7 @@ impl App {
             .iter()
             .position(|row| row.source == source)
             .unwrap_or(self.selected_row);
-        let planned = |row: &&LinkReportEntry| row.status.eq_ignore_ascii_case("planned");
+        let planned = |row: &&LinkReportEntry| row.is_planned();
         rows.iter()
             .enumerate()
             .skip(linked + 1)
@@ -1393,12 +1387,12 @@ impl App {
                     existing.applied_actions = existing
                         .entries
                         .iter()
-                        .filter(|entry| entry.status.eq_ignore_ascii_case("applied"))
+                        .filter(|entry| entry.is_applied())
                         .count();
                     existing.planned_actions = existing
                         .entries
                         .iter()
-                        .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
+                        .filter(|entry| entry.is_planned())
                         .count();
                     existing.freed_bytes = freed_before + report.freed_bytes;
                     existing.total_saved_bytes = existing.freed_bytes;
@@ -1410,7 +1404,7 @@ impl App {
                     existing.warnings.link_errors = existing
                         .entries
                         .iter()
-                        .filter(|entry| entry.status.eq_ignore_ascii_case("failed"))
+                        .filter(|entry| entry.is_failed())
                         .count() as u64;
                     self.live_files_seen = Some(existing.files_considered);
                     self.live_planned_actions = Some(existing.planned_actions);
@@ -1892,7 +1886,7 @@ mod tests {
         app.report_before_link = Some(scanned);
         let mut partial = sample_report();
         partial.mode = "link".to_string();
-        partial.outcome = "failed".to_string();
+        partial.outcome = crate::protocol::Outcome::Failed;
         partial.entries = vec![row("/dl/a.mkv", "applied"), row("/dl/b.mkv", "failed")];
 
         assert!(app.apply_tui_event(

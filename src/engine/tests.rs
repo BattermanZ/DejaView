@@ -12,7 +12,7 @@ use super::collect::{
     CollectOptions, Exclude, RootId, collect_files, collect_run_files, group_files_by_size,
 };
 use super::linking::{
-    ApplyOptions, ApplyOutcome, CanonicalRoots, LinkRequest, Linked, apply_actions,
+    Applied, ApplyOptions, ApplyOutcome, CanonicalRoots, LinkRequest, Linked, apply_actions,
     ensure_target_within_media_root, plan_group_actions, replace_file_with_best_link_with,
 };
 use super::types::{Cache, CacheEntry, FileInfo, LinkMode, RunMetrics, RunWarnings};
@@ -704,7 +704,7 @@ fn apply_actions_rejects_source_metadata_change_after_planning() {
     let mut warnings = RunWarnings::default();
     let mut report_entries = vec![planned_entry_for(&action)];
     let ApplyOutcome {
-        applied,
+        counts: Applied { applied, .. },
         strict_error,
         ..
     } = apply_actions(
@@ -784,7 +784,7 @@ fn apply_actions_rejects_target_metadata_change_after_planning() {
     let mut warnings = RunWarnings::default();
     let mut report_entries = vec![planned_entry_for(&action)];
     let ApplyOutcome {
-        applied,
+        counts: Applied { applied, .. },
         strict_error,
         ..
     } = apply_actions(
@@ -889,7 +889,7 @@ fn apply_actions_allow_multiple_sources_for_same_target_in_one_run() {
     let mut warnings = RunWarnings::default();
     let mut report_entries = actions.iter().map(planned_entry_for).collect::<Vec<_>>();
     let ApplyOutcome {
-        applied,
+        counts: Applied { applied, .. },
         strict_error,
         ..
     } = apply_actions(
@@ -1278,7 +1278,10 @@ fn apply_actions_refuses_to_replace_a_file_inside_the_media_root() {
     };
     let mut warnings = RunWarnings::default();
     let mut report_entries = vec![planned_entry_for(&action)];
-    let ApplyOutcome { applied, .. } = apply_actions(
+    let ApplyOutcome {
+        counts: Applied { applied, .. },
+        ..
+    } = apply_actions(
         &[action],
         &media,
         &ApplyOptions {
@@ -1641,7 +1644,7 @@ fn apply_actions_stops_before_the_next_file_when_cancelled() {
     );
 
     assert!(outcome.cancelled);
-    assert_eq!(outcome.applied, 0);
+    assert_eq!(outcome.counts.applied, 0);
     assert_eq!(report_entries[0].status, "planned");
     assert_eq!(fs::metadata(&src).expect("meta").ino(), src_inode);
     fs::remove_dir_all(&root).expect("cleanup temp dir");
@@ -1844,8 +1847,8 @@ fn a_download_found_to_be_the_library_file_at_link_time_is_already_linked() {
     );
 
     assert!(outcome.strict_error.is_none());
-    assert_eq!(outcome.applied, 0, "nothing was linked");
-    assert_eq!(outcome.already_linked, 1);
+    assert_eq!(outcome.counts.applied, 0, "nothing was linked");
+    assert_eq!(outcome.counts.already_linked, 1);
     assert_eq!(report_entries[0].status, "already-linked");
     assert_eq!(warnings.link_errors, 0);
     let leftovers = fs::read_dir(&downloads)

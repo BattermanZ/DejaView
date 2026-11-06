@@ -85,10 +85,10 @@ fn trim_to_width(input: &str, width: u16) -> String {
 }
 
 fn status_chip_style(row: &LinkReportEntry, _is_selected: bool) -> Style {
-    if row.status.eq_ignore_ascii_case("failed") {
+    if row.is_failed() {
         return Theme::chip_danger();
     }
-    if row.status.eq_ignore_ascii_case("planned") || row.status.eq_ignore_ascii_case("skipped") {
+    if row.is_planned() || row.is_skipped() {
         return Theme::chip_pending();
     }
     if row
@@ -102,14 +102,14 @@ fn status_chip_style(row: &LinkReportEntry, _is_selected: bool) -> Style {
 }
 
 fn row_style(row: &LinkReportEntry, is_selected: bool) -> Style {
-    if row.status.eq_ignore_ascii_case("failed") {
+    if row.is_failed() {
         return if is_selected {
             Theme::result_row_selected().fg(Theme::danger().fg.unwrap_or(Color::Reset))
         } else {
             Theme::danger()
         };
     }
-    if row.status.eq_ignore_ascii_case("planned") || row.status.eq_ignore_ascii_case("skipped") {
+    if row.is_planned() || row.is_skipped() {
         return if is_selected {
             Theme::result_row_selected().fg(Theme::muted().fg.unwrap_or(Color::Reset))
         } else {
@@ -301,14 +301,14 @@ fn empty_results_lines() -> Vec<Line<'static>> {
 /// A row's status in the STATE column, at most seven letters so the column
 /// stays narrow; OUTCOME and the Inspector say "ALREADY LINKED" in full.
 fn state_label(row: &LinkReportEntry) -> String {
-    if row.status.eq_ignore_ascii_case("already-linked") {
+    if row.is_already_linked() {
         return "ALREADY".to_string();
     }
     row.status.to_uppercase()
 }
 
 fn outcome_label(row: &LinkReportEntry) -> String {
-    if row.status.eq_ignore_ascii_case("already-linked") {
+    if row.is_already_linked() {
         return "ALREADY LINKED".to_string();
     }
     match row.method.as_deref() {

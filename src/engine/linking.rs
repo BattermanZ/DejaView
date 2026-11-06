@@ -842,8 +842,10 @@ pub(super) struct ApplyOptions<'a> {
     pub(super) cancel: &'a CancelToken,
 }
 
-#[derive(Default)]
-pub(super) struct ApplyOutcome {
+/// What the apply loop did, counted: the report and the verdict line both
+/// take these.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Applied {
     pub(super) applied: usize,
     /// Pairs found at link time to be one file already; nothing changed.
     pub(super) already_linked: usize,
@@ -852,6 +854,11 @@ pub(super) struct ApplyOutcome {
     pub(super) freed_bytes: u64,
     /// Pairs left alone on purpose, such as for access; not failures.
     pub(super) skipped: usize,
+}
+
+#[derive(Default)]
+pub(super) struct ApplyOutcome {
+    pub(super) counts: Applied,
     pub(super) strict_error: Option<anyhow::Error>,
     /// Stopped between actions on request; actions not reached stay planned.
     pub(super) cancelled: bool,
@@ -1064,11 +1071,13 @@ pub(super) fn apply_actions(
     }
 
     ApplyOutcome {
-        applied: applied_actions,
-        already_linked,
-        already_linked_bytes,
-        freed_bytes,
-        skipped,
+        counts: Applied {
+            applied: applied_actions,
+            already_linked,
+            already_linked_bytes,
+            freed_bytes,
+            skipped,
+        },
         strict_error: strict_link_error,
         cancelled,
     }

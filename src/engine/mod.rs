@@ -17,16 +17,17 @@ pub use lock::LockHeld;
 pub use types::LinkMode;
 pub use types::ScanRunOptions;
 
+use crate::protocol::Outcome;
 use crate::protocol::TuiEvent;
 use cache::{CacheKeys, load_cache, prune_cache, save_cache};
 use collect::{CollectOptions, collect_run_files, group_files_by_size};
 use hashing::{CHECKPOINT_EVERY, Checkpoint, HashOptions, Hashed, hash_groups_and_update_cache};
 use linking::{ApplyOptions, ApplyOutcome, apply_actions, plan_actions};
 use report::{
-    Outcome, RunReportInput, build_report_entries, build_run_report, maybe_confirm_apply,
-    planned_bytes, print_run_summary, resolve_report_path, strict_failure, try_write_run_report,
+    RunReportInput, build_report_entries, build_run_report, maybe_confirm_apply, planned_bytes,
+    print_run_summary, resolve_report_path, strict_failure, try_write_run_report,
 };
-use types::{Cache, LinkAction, RunMetrics, RunWarnings};
+use types::{Audience, Cache, LinkAction, RunMetrics, RunWarnings};
 
 use crate::config::{Config, cache_path};
 use crate::logger;
@@ -185,6 +186,19 @@ pub fn close_tui_stream_on(err: &anyhow::Error) {
     let _ = types::emit_tui_event(&event);
 }
 
+impl RunEnd {
+    /// The exit of a run that returned, from how it ended and whether
+    /// anything failed on the way. A run `--strict` stopped returns an
+    /// error instead, so `Failed` only reaches here with failures.
+    fn of(outcome: Outcome, failures: bool) -> Self {
+        match outcome {
+            Outcome::Cancelled => RunEnd::Cancelled,
+            Outcome::Complete | Outcome::Failed if failures => RunEnd::WithFailures,
+            Outcome::Complete | Outcome::Failed => RunEnd::Clean,
+        }
+    }
+}
+
 pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
     let result = run(config, options);
     if let Err(err) = &result
@@ -210,10 +224,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         .as_ref()
         .ok_or_else(|| anyhow!("Media path not set"))?;
     let min_age = std::time::Duration::from_secs(config.min_age.unwrap_or(0));
-    let machine_output = options.json_output || options.tui_events;
-    // What a person reads on a terminal; a quiet run prints only links made
-    // and failures.
-    let human = !machine_output && !options.quiet;
+    let audience = options.audience();
     logger::info(
         "run",
         format!(
@@ -292,7 +303,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         logger::warn("run", &message);
         if options.tui_events {
             let _ = types::emit_tui_event(&TuiEvent::Log { message });
-        } else if human {
+        } else if audience.is_chatty() {
             eprintln!("{} {message}", "⚠".yellow());
         }
     }
@@ -322,18 +333,14 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         });
     }
 
-    if human {
+    if audience.is_chatty() {
         report::print_plan(&actions, downloads, media, bytes_to_free);
     }
     let out_path = resolve_report_path(downloads, &options, planned_actions);
     let mut report_entries = build_report_entries(&actions, options.link_mode);
 
     let ApplyOutcome {
-        applied: applied_actions,
-        already_linked,
-        already_linked_bytes,
-        freed_bytes,
-        skipped,
+        counts: applied,
         strict_error: strict_link_error,
         cancelled: apply_cancelled,
     } = if options.dry_run {
@@ -354,7 +361,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         }
         maybe_confirm_apply(options.require_confirm, planned_actions)?;
         logger::info("run", "starting apply phase");
-        if human && planned_actions > 0 {
+        if audience.is_chatty() && planned_actions > 0 {
             println!("{} Linking…", "▶".cyan());
         }
         apply_actions(
@@ -373,43 +380,45 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
     };
     if apply_cancelled {
         let message = format!(
-            "Link cancelled after {applied_actions} of {planned_actions} action(s); the rest stay planned."
+            "Link cancelled after {} of {planned_actions} action(s); the rest stay planned.",
+            applied.applied
         );
         logger::info("run", &message);
         if options.tui_events {
             let _ = types::emit_tui_event(&TuiEvent::Log {
                 message: message.clone(),
             });
-        } else if !options.json_output {
+        } else if audience.is_person() {
             eprintln!("{} {message}", "⚠".yellow());
         }
     }
 
-    if human {
+    if audience.is_chatty() {
         // Each pair left alone on purpose, with why: the run decided it, so a
         // person should see it, though nothing failed.
         for reason in report_entries
             .iter()
-            .filter(|entry| entry.status == "skipped")
+            .filter(|entry| entry.is_skipped())
             .filter_map(|entry| entry.error.as_deref())
         {
             eprintln!("{} {reason}", "⚠".yellow());
         }
-        if already_linked > 0 {
+        if applied.already_linked > 0 {
             println!(
-                "{} {already_linked} pair(s) already were one file; nothing changed. The filesystem gives one file different inode numbers: on mergerfs, mount with inodecalc=hybrid-hash, or use_ino on older versions.",
-                "ℹ".cyan()
+                "{} {} pair(s) already were one file; nothing changed. The filesystem gives one file different inode numbers: on mergerfs, mount with inodecalc=hybrid-hash, or use_ino on older versions.",
+                "ℹ".cyan(),
+                applied.already_linked
             );
         }
         report::print_dangling_symlinks(&metrics.dangling_symlinks);
     }
-    if !machine_output {
+    if audience.is_person() {
         print_run_summary(
             files_seen,
             &metrics,
             report::symlinked_count(&report_entries),
             &warnings,
-            options.quiet,
+            audience,
         );
     }
 
@@ -430,11 +439,8 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
             media,
             files_seen,
             planned_actions,
-            applied_actions,
-            already_linked,
-            already_linked_bytes,
             planned_bytes: bytes_to_free,
-            freed_bytes,
+            applied,
             metrics: metrics.clone(),
             warnings: warnings.clone(),
             entries: report_entries,
@@ -444,32 +450,29 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         logger::info("run", format!("writing report to {}", path.display()));
         try_write_run_report(path, &report);
     }
-    // A script reading --json gets the report of a run --strict stopped too.
-    if options.json_output {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else if !machine_output && !options.dry_run {
-        report::Verdict {
+    match audience {
+        // A script reading --json gets the report of a run --strict
+        // stopped too.
+        Audience::Script => println!("{}", serde_json::to_string_pretty(&report)?),
+        Audience::Person | Audience::Quiet if !options.dry_run => report::Verdict {
             planned: planned_actions,
-            applied: applied_actions,
-            already_linked,
-            skipped,
+            applied,
             failed: warnings.link_errors,
-            freed_bytes,
-            cancelled: apply_cancelled,
             symlinked: report.symlinked,
+            cancelled: apply_cancelled,
             report: out_path.as_deref(),
         }
-        .print(options.quiet);
-    } else if human && planned_actions > 0 {
-        println!(
+        .print(audience),
+        Audience::Person if planned_actions > 0 => println!(
             "{} Scan only: nothing was changed. `dejaview link` links them.",
             "ℹ".cyan()
-        );
+        ),
+        _ => {}
     }
     logger::info(
         "run",
         format!(
-            "finished mode={} outcome={} planned={} applied={} warnings={}",
+            "finished mode={} outcome={:?} planned={} applied={} warnings={}",
             report.mode,
             report.outcome,
             report.planned_actions,
@@ -485,19 +488,13 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         }));
     }
 
-    let failures = report.warning_total() > 0;
+    let end = RunEnd::of(outcome, report.warning_total() > 0);
     if options.tui_events {
         let _ = types::emit_tui_event(&TuiEvent::Done {
             report: Box::new(report),
         });
     }
-    Ok(if apply_cancelled {
-        RunEnd::Cancelled
-    } else if failures {
-        RunEnd::WithFailures
-    } else {
-        RunEnd::Clean
-    })
+    Ok(end)
 }
 
 /// A run `--strict` stopped while walking or hashing still answers a script
@@ -525,11 +522,8 @@ fn stopped_before_planning(
             media,
             files_seen: metrics.files_seen,
             planned_actions: 0,
-            applied_actions: 0,
-            already_linked: 0,
-            already_linked_bytes: 0,
             planned_bytes: 0,
-            freed_bytes: 0,
+            applied: Default::default(),
             metrics,
             warnings,
             entries: Vec::new(),
@@ -538,7 +532,7 @@ fn stopped_before_planning(
     if let Some(path) = resolve_report_path(downloads, options, 0) {
         try_write_run_report(&path, &report);
     }
-    if options.json_output
+    if options.audience() == Audience::Script
         && let Ok(json) = serde_json::to_string_pretty(&report)
     {
         println!("{json}");
@@ -842,10 +836,12 @@ fn report_second_mount_skips(
         skipped.len(),
         skipped[0].0.display()
     );
-    if options.tui_events {
-        let _ = types::emit_tui_event(&TuiEvent::Log { message });
-    } else if !options.json_output && !options.quiet {
-        eprintln!("{} {message}", "⚠".yellow());
+    match options.audience() {
+        Audience::Dashboard => {
+            let _ = types::emit_tui_event(&TuiEvent::Log { message });
+        }
+        Audience::Person => eprintln!("{} {message}", "⚠".yellow()),
+        Audience::Quiet | Audience::Script => {}
     }
 }
 
