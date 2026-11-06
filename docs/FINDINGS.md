@@ -204,6 +204,7 @@ All reproduced by rendering the TUI in a pty with pyte at 60x20, 80x24, 100x30, 
 - Where: `src/tui/view/mod.rs:474` (a Paragraph over up to 64 log lines with no scroll: it shows the oldest lines); `app.rs:977`, `app.rs:853` (Cancelled and `fail_running_job` don't update `latest_activity_message`).
 - After the first scan the Run Log is stuck on "TUI started... Running scan... Phase: COLLECTING FILES". "Scan finished", "Saved report to...", "Link run had 1 failure(s)", "Scan cancelled" never show. Progress lines logged every 10 files fill the ring. After cancelling: "IDLE READY TO SCAN ... 0 planned ... Verifying duplicate files: 2 / 8", which reads as "no duplicates". First run with no config: S gives "Scan failed: scan failed: Error: downloads path not set" (doubled prefix, no hint to press e).
 - Fix (small): render the last N lines; set the activity line on Done, Cancelled and Error; keep per-file progress out of the log ring; open the path editor when paths are unset. Add 3-4 TestBackend render tests (view coverage is 49%, layout 0%).
+- Partly done with the safety group, whose lock and `L` messages went unseen without it: the Run Log renders its newest lines (one row each, cut with an ellipsis), the activity line is set on Done, Cancelled and Error, the doubled "Link failed: link failed: Error:" prefix is gone, and two TestBackend render tests cover it. Still open: per-file progress in the log ring, the path editor when paths are unset, the stale "Working on" line during a run.
 
 **U2. High. Result rows can't be told apart.**
 - Where: `view/mod.rs:639` (`trim_to_width(&row.source...)` ignores `expand_paths`).
@@ -214,6 +215,7 @@ All reproduced by rendering the TUI in a pty with pyte at 60x20, 80x24, 100x30, 
 - Where: `src/tui/layout.rs:16-19` (fixed rows 9 + min 10 + 6 + 2 = 27 > 24), dialogs sized by percentage (`centered_rect`).
 - LINK ALL / LINK SELECTED lose "Press y to continue or n/q to cancel."; Help stops at "R save report"; Run Log is 1 line; footer loses "? help"; metric titles truncate to "PLANN"/"APPL". At 60x20 the wordmark is cut and footer and log vanish.
 - Fix (medium): collapse the wordmark below about 30 rows, hide the sidebar below about 100 columns, size dialogs to content, put "y link / n cancel" in the dialog border title.
+- Partly done with the safety group: both link confirmations carry "y link" and "n cancel" on their bottom border, tested at 80x24. Still open: the wordmark, the sidebar, dialogs sized to content, Help and the footer.
 
 **U4. Medium. Selection and navigation.**
 - Where: `app.rs:1005` (`selected_row = 0` on Done), `app.rs:477` (only j/k/arrows), `app.rs:436` (j closes the JSON preview), `view/mod.rs:691` (JSON overlay has no scroll).

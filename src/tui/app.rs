@@ -921,7 +921,9 @@ impl App {
             JobKind::Scan => "Scan",
             JobKind::LinkAll | JobKind::LinkSelected(_) => "Link",
         };
-        self.push_log(format!("{label} failed: {message}"));
+        let line = format!("{label} failed: {message}");
+        self.latest_activity_message = Some(line.clone());
+        self.push_log(line);
         self.restore_reviewed_rows();
     }
 
@@ -1042,12 +1044,14 @@ impl App {
                 self.live_planned_actions = None;
                 self.live_applied_actions = None;
                 self.finish_live_run();
-                self.push_log(match kind {
+                let line = match kind {
                     JobKind::Scan => "Scan cancelled. Finished hashes are cached.".to_string(),
                     JobKind::LinkAll | JobKind::LinkSelected(_) => {
                         "Link cancelled before any file was changed.".to_string()
                     }
-                });
+                };
+                self.latest_activity_message = Some(line.clone());
+                self.push_log(line);
                 self.restore_reviewed_rows();
                 true
             }
@@ -1058,7 +1062,9 @@ impl App {
                     JobKind::Scan => "Scan",
                     JobKind::LinkAll | JobKind::LinkSelected(_) => "Link",
                 };
-                self.push_log(format!("{label} failed: {message}"));
+                let line = format!("{label} failed: {message}");
+                self.latest_activity_message = Some(line.clone());
+                self.push_log(line);
                 self.restore_reviewed_rows();
                 true
             }
@@ -1081,17 +1087,15 @@ impl App {
                 self.live_entries.clear();
                 self.running_job = None;
                 self.finish_live_run();
-                match kind {
-                    JobKind::Scan => {
-                        self.push_log(format!("Scan finished. Planned actions: {planned}"))
+                let line = match kind {
+                    JobKind::Scan => format!("Scan finished. Planned actions: {planned}"),
+                    JobKind::LinkAll => format!("Link finished. Applied actions: {applied}"),
+                    JobKind::LinkSelected(_) => {
+                        format!("Selected link finished. Applied actions: {applied}")
                     }
-                    JobKind::LinkAll => {
-                        self.push_log(format!("Link finished. Applied actions: {applied}"))
-                    }
-                    JobKind::LinkSelected(_) => self.push_log(format!(
-                        "Selected link finished. Applied actions: {applied}"
-                    )),
-                }
+                };
+                self.latest_activity_message = Some(line.clone());
+                self.push_log(line);
                 if matches!(kind, JobKind::LinkAll | JobKind::LinkSelected(_)) && symlinked > 0 {
                     self.push_log(format!(
                         "{symlinked} of them as symlinks: each breaks if its library file is upgraded, renamed or deleted. See fallback_reason."
@@ -1557,6 +1561,60 @@ mod tests {
             app.overlay,
             Overlay::ConfirmLink(ConfirmLinkMode::All)
         ));
+    }
+
+    fn rendered_text(app: &App, cols: u16, rows: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(cols, rows);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| crate::tui::view::render(frame, app))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..rows)
+            .map(|y| {
+                (0..cols)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_run_log_shows_its_newest_lines() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        for n in 1..=30 {
+            app.push_log(format!("log line number {n}"));
+        }
+
+        let text = rendered_text(&app, 120, 36);
+
+        assert!(text.contains("log line number 30"), "{text}");
+        assert!(
+            !text.contains("TUI started"),
+            "the oldest line has scrolled off"
+        );
+    }
+
+    #[test]
+    fn a_failed_link_says_why_on_the_activity_line() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        let (tx, rx) = mpsc::channel();
+        app.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, mpsc::channel().0));
+        app.latest_activity_message = Some("Preparing link run".to_string());
+        tx.send(Err(anyhow!(
+            "another DejaView run holds the lock /downloads/.dejaview_lock"
+        )))
+        .expect("send error");
+
+        app.poll_running_job();
+
+        assert_eq!(
+            app.activity_message(),
+            "Link failed: another DejaView run holds the lock /downloads/.dejaview_lock"
+        );
     }
 
     #[test]

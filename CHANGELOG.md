@@ -20,6 +20,7 @@
 
 ### Fixed
 
+- The dashboard's Run Log shows its newest lines, and the activity line says how the last run ended. Before, the log stayed on its first few lines, so "Scan finished", a failed link and the reason for it (such as another run holding the lock) showed nowhere. The link confirmations show `y link` and `n cancel` on their border, so a small terminal no longer cuts the prompt off.
 - Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder. Before, two link runs failed each other's pairs, the later one overwrote the other's report and cache, and `cache cleanup-temp` could delete a link another run was about to rename into place.
 - A download that already is its library file is reported as `already-linked` and counted apart from applied pairs. On mergerfs without `use_ino` or `inodecalc=hybrid-hash`, which gives one file two inode numbers, such pairs were reported as applied on every run.
 - In the dashboard, `L` links only the planned rows the last scan showed, each to the library file it showed, and does nothing before a scan has finished; `l` likewise links its row only to the library file shown. Before, `L` ran a fresh link over everything, including duplicates that appeared after the scan and, before any scan, all of them. The confirmation counts rows with errors only.

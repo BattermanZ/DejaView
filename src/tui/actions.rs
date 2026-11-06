@@ -25,6 +25,22 @@ fn forward_cancel<W: Write>(cancel_rx: Receiver<()>, mut stdin: W) {
     }
 }
 
+/// What to show when the child exits with an error and no error event: its
+/// own `Error:` line, which already says what failed. The TUI adds which run
+/// it was, so this adds no prefix of its own; the log keeps the rest.
+fn child_failure_message(subcommand: &str, status: &str, stderr: &str) -> String {
+    let error_line = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("Error: "))
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    match error_line {
+        Some(line) => line.to_string(),
+        None if !stderr.trim().is_empty() => stderr.trim().to_string(),
+        None => format!("{subcommand} exited with {status}"),
+    }
+}
+
 fn stream_subcommand_events(
     subcommand: &str,
     strict: bool,
@@ -104,12 +120,7 @@ fn stream_subcommand_events(
         .map_err(|_| anyhow!("stderr reader thread panicked"))??;
 
     if !status.success() {
-        let stderr = stderr.trim().to_string();
-        let message = if stderr.is_empty() {
-            format!("{subcommand} failed with status {status}")
-        } else {
-            format!("{subcommand} failed: {stderr}")
-        };
+        let message = child_failure_message(subcommand, &status.to_string(), &stderr);
         if should_forward_terminal_error(status.success(), saw_error_event) {
             let _ = tx.send(Err(anyhow!(message.clone())));
         }
@@ -267,6 +278,19 @@ mod tests {
         let mut written = Vec::new();
         forward_cancel(rx, &mut written);
         assert!(written.is_empty());
+    }
+
+    #[test]
+    fn a_failed_child_is_reported_by_its_own_error_line() {
+        let stderr = "Error: another DejaView run holds the lock /d/.dejaview_lock, so this run did nothing\n";
+        assert_eq!(
+            child_failure_message("link", "exit status: 3", stderr),
+            "another DejaView run holds the lock /d/.dejaview_lock, so this run did nothing"
+        );
+        assert_eq!(
+            child_failure_message("scan", "exit status: 1", "  \n"),
+            "scan exited with exit status: 1"
+        );
     }
 
     #[test]
