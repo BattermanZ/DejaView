@@ -221,6 +221,11 @@ fn sidebar_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             Span::styled(app.threads_label(), Theme::base()),
         ]),
         Line::from(vec![
+            Span::styled("Full reads", Theme::dim()),
+            Span::raw(" "),
+            Span::styled(app.full_threads_label(), Theme::base()),
+        ]),
+        Line::from(vec![
             Span::styled("Link mode", Theme::dim()),
             Span::raw("  "),
             Span::styled(app.link_mode_label(), Theme::base()),
@@ -998,6 +1003,32 @@ mod tests {
         assert!(combined.contains("PATHS"));
         assert!(combined.contains("SETTINGS"));
         assert!(combined.contains("ACTIONS"));
+    }
+
+    #[test]
+    fn the_sidebar_shows_both_thread_counts_without_wrapping() {
+        let app = App::new(&crate::config::Config::default(), false);
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| render(frame, &app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let row_of = |text: &str| rows.iter().position(|row| row.contains(text));
+        let threads = row_of("Threads    16").expect("threads row");
+        let full = row_of("Full reads 2").expect("full reads row");
+        assert_eq!(full, threads + 1, "{}", rows.join("\n"));
+        assert_eq!(
+            row_of("Link mode"),
+            Some(full + 1),
+            "nothing wraps between them: {}",
+            rows.join("\n")
+        );
     }
 
     #[test]

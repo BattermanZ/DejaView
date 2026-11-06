@@ -312,8 +312,14 @@ impl App {
         self.min_size
     }
 
+    /// Files walked and quick-hashed at once.
     pub fn threads_label(&self) -> String {
-        format!("{} quick / {} full", self.threads, self.full_threads)
+        self.threads.to_string()
+    }
+
+    /// Files read in full at once.
+    pub fn full_threads_label(&self) -> String {
+        self.full_threads.to_string()
     }
 
     pub fn link_mode_label(&self) -> &'static str {
@@ -1082,8 +1088,8 @@ impl App {
                 self.active_workers.clear();
                 self.hash_progress_done = None;
                 self.hash_progress_total = None;
-                self.report_before_link = None;
                 self.merge_report(kind.clone(), report);
+                self.report_before_link = None;
                 self.live_entries.clear();
                 self.running_job = None;
                 self.finish_live_run();
@@ -1218,6 +1224,18 @@ impl App {
                 }
             }
             JobKind::Scan | JobKind::LinkAll => {
+                let mut report = report;
+                // A link of reviewed rows the cache vouches for walks
+                // nothing and considers only the rows' files; keep the count
+                // the scan showed, as a single-row link does.
+                // A link run sets the scan's report aside while it runs.
+                if matches!(kind, JobKind::LinkAll)
+                    && let Some(previous) =
+                        self.report.as_ref().or(self.report_before_link.as_ref())
+                {
+                    report.files_considered =
+                        report.files_considered.max(previous.files_considered);
+                }
                 self.live_files_seen = Some(report.files_considered);
                 self.live_planned_actions = Some(report.planned_actions);
                 self.live_applied_actions = Some(report.applied_actions);
@@ -1867,6 +1885,23 @@ mod tests {
         app.handle_main_key(KeyCode::Char('L'))
             .expect("key handling should not fail");
         assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn link_all_keeps_the_file_count_the_scan_showed() {
+        let mut app = App::new(&Config::default(), false);
+        let mut scanned = sample_report();
+        scanned.files_considered = 7;
+        // As starting a link run leaves it: the scan's report set aside.
+        app.report_before_link = Some(scanned);
+        let mut linked = sample_report();
+        linked.files_considered = 3;
+
+        assert!(app.apply_tui_event(JobKind::LinkAll, TuiEvent::Done { report: linked }));
+
+        assert_eq!(app.live_files_seen, Some(7));
+        assert_eq!(app.report.as_ref().map(|r| r.files_considered), Some(7));
+        assert!(app.report_before_link.is_none());
     }
 
     #[test]
