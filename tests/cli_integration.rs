@@ -1148,3 +1148,63 @@ fn dejaview_config_and_dejaview_log_choose_the_files() {
     );
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+#[test]
+fn link_with_a_plan_links_only_the_reviewed_pairs() {
+    let root = unique_temp_dir("plan_file");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("reviewed.mkv"), 5000, 1);
+    write_seeded(&media.join("reviewed.mkv"), 5000, 1);
+    // Appeared after the scan the person reviewed.
+    write_seeded(&downloads.join("new.mkv"), 6000, 2);
+    write_seeded(&media.join("new.mkv"), 6000, 2);
+    // Reviewed with one target; the library now plans it to another.
+    write_seeded(&downloads.join("moved.mkv"), 7000, 3);
+    write_seeded(&media.join("moved.mkv"), 7000, 3);
+    configure_small_files(&root, &downloads, &media);
+    let plan = root.join("plan.json");
+    fs::write(
+        &plan,
+        serde_json::to_vec(&serde_json::json!([
+            {"source": downloads.join("reviewed.mkv"), "target": media.join("reviewed.mkv")},
+            {"source": downloads.join("moved.mkv"), "target": media.join("old-name.mkv")},
+        ]))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+
+    let out = run_cmd(
+        &root,
+        &["link", "--json", "--plan", plan.to_str().expect("plan str")],
+    );
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ino = |path: PathBuf| fs::metadata(path).expect("metadata").ino();
+    assert_eq!(
+        ino(downloads.join("reviewed.mkv")),
+        ino(media.join("reviewed.mkv"))
+    );
+    assert_ne!(
+        ino(downloads.join("new.mkv")),
+        ino(media.join("new.mkv")),
+        "a pair nobody reviewed is left alone"
+    );
+    assert_ne!(
+        ino(downloads.join("moved.mkv")),
+        ino(media.join("moved.mkv")),
+        "a pair whose target changed is left alone"
+    );
+
+    fs::write(&plan, b"[]").expect("empty plan");
+    let out = run_cmd(&root, &["link", "--plan", plan.to_str().expect("plan str")]);
+    assert!(
+        !out.status.success(),
+        "an empty plan links nothing, not everything"
+    );
+    assert_ne!(ino(downloads.join("new.mkv")), ino(media.join("new.mkv")));
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}

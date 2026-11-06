@@ -21,6 +21,14 @@ pub struct LinkReportEntry {
     pub error: Option<String>,
 }
 
+/// One row a person reviewed: link this download to this library file and
+/// nothing else. The TUI hands a list of them to `link --plan`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PlannedPair {
+    pub source: String,
+    pub target: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RunReport {
     pub mode: String,

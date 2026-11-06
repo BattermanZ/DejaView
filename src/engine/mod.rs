@@ -249,7 +249,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
             show_progress: options.show_progress,
             tui_events: options.tui_events,
             link_mode: options.link_mode,
-            only_sources: options.only_sources,
+            selection: &options,
             cancel: &options.cancel,
         },
         &mut warnings,
@@ -278,14 +278,23 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         seen_through_second_mount,
     } = plan_actions_and_table(&groups);
     report_second_mount_skips(&seen_through_second_mount, &options, &mut metrics);
-    let actions = if options.only_sources.is_empty() {
-        actions
-    } else {
-        actions
-            .into_iter()
-            .filter(|action| options.only_sources.iter().any(|path| path == &action.src))
-            .collect::<Vec<_>>()
-    };
+    let actions = actions
+        .into_iter()
+        .filter(|action| options.selects(action))
+        .collect::<Vec<_>>();
+    if actions.len() < options.only_pairs.len() {
+        let message = format!(
+            "{} of the {} reviewed row(s) are no longer planned as shown, because a file changed since the scan; they are left alone. Scan again to review them.",
+            options.only_pairs.len() - actions.len(),
+            options.only_pairs.len()
+        );
+        logger::warn("run", &message);
+        if options.tui_events {
+            let _ = types::emit_tui_event(&TuiEvent::Log { message });
+        } else if !options.json_output {
+            eprintln!("{} {message}", "⚠".yellow());
+        }
+    }
     let total_saved_space = actions.iter().map(|action| action.size).sum();
     let planned_actions = actions.len();
     logger::info(

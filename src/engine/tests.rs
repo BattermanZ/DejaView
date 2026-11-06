@@ -71,6 +71,7 @@ fn run_scan(config: &Config, dry_run: bool, strict: bool, report_path: Option<&P
             tui_events: false,
             link_mode: LinkMode::Best,
             only_sources: &[],
+            only_pairs: &[],
             cancel: CancelToken::default(),
         },
     )
@@ -1020,6 +1021,7 @@ fn run_scan_strict_fails_on_sample_hash_error() {
             tui_events: false,
             link_mode: LinkMode::Best,
             only_sources: &[],
+            only_pairs: &[],
             cancel: CancelToken::default(),
         },
     );
@@ -1036,6 +1038,7 @@ fn run_scan_strict_fails_on_sample_hash_error() {
             tui_events: false,
             link_mode: LinkMode::Best,
             only_sources: &[],
+            only_pairs: &[],
             cancel: CancelToken::default(),
         },
     );
@@ -1079,6 +1082,7 @@ fn run_scan_non_strict_link_failure_continues() {
             tui_events: false,
             link_mode: LinkMode::Best,
             only_sources: &[],
+            only_pairs: &[],
             cancel: CancelToken::default(),
         },
     );
@@ -1126,6 +1130,7 @@ fn run_scan_strict_link_failure_returns_error() {
             tui_events: false,
             link_mode: LinkMode::Best,
             only_sources: &[],
+            only_pairs: &[],
             cancel: CancelToken::default(),
         },
     );
@@ -1453,6 +1458,7 @@ fn cancelled_link_run_returns_cancelled_and_changes_nothing() {
             tui_events: false,
             link_mode: LinkMode::Best,
             only_sources: &[],
+            only_pairs: &[],
             cancel,
         },
     )
@@ -1582,6 +1588,7 @@ fn cross_seeded_downloads_sharing_an_inode_are_all_linked() {
             tui_events: false,
             link_mode: LinkMode::Best,
             only_sources: &[],
+            only_pairs: &[],
             cancel: CancelToken::default(),
         },
     )

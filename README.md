@@ -142,8 +142,8 @@ Add `--strict` to run the dashboard's scans and links in strict mode.
 |---|---|
 | `S` | Scan |
 | `X` | Clear the cache, then scan |
-| `l` | Link the selected row (asks first) |
-| `L` | Link every planned row (asks first) |
+| `l` | Link the selected row to the library file it shows (asks first) |
+| `L` | Link every planned row the last scan showed (asks first) |
 | `c` | Cancel the running scan or link |
 | `j` / `k` or arrows | Move the selection |
 | `e` | Edit the downloads and media paths |
@@ -155,7 +155,7 @@ Add `--strict` to run the dashboard's scans and links in strict mode.
 
 Cancelling a scan stops it almost at once, even partway through a large file, and keeps every hash already finished in the cache, so the next scan picks up where it stopped. Cancelling a link stops before the next file: files already linked stay linked and the rest stay planned. Quitting is blocked while a run is active, so cancel first.
 
-Linking a single row lists both folders again to re-check that row, but only hashes files of the same size as it.
+`l` and `L` link only rows you have seen: each row's download, to the library file the row shows. A duplicate that appeared since the scan is left for the next one, and so is a row whose files changed in between. `L` stays off until a scan has finished with planned rows. Linking lists both folders again to re-check the rows, but only hashes files of the same size as them.
 
 ## Configuration
 

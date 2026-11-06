@@ -10,6 +10,7 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use crate::config::{Config, load_config, save_config, validate_runtime_paths};
 use crate::engine::LinkMode;
 use crate::fsutil::normalize_runtime_dir;
+use crate::protocol::PlannedPair;
 
 use super::actions;
 use super::events::{self, Event};
@@ -288,6 +289,19 @@ impl App {
         self.min_age.unwrap_or(0)
     }
 
+    /// The planned rows of the last finished run, as shown: what `L` links.
+    pub fn reviewed_planned_pairs(&self) -> Vec<PlannedPair> {
+        self.report
+            .iter()
+            .flat_map(|report| &report.entries)
+            .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
+            .map(|entry| PlannedPair {
+                source: entry.source.clone(),
+                target: entry.target.clone(),
+            })
+            .collect()
+    }
+
     pub fn min_size_bytes(&self) -> u64 {
         self.min_size
     }
@@ -491,7 +505,16 @@ impl App {
                     self.push_log(format!("Rescan failed: {err}"));
                 }
             }
-            KeyCode::Char('L') => self.overlay = Overlay::ConfirmLink(ConfirmLinkMode::All),
+            KeyCode::Char('L') => {
+                if self.reviewed_planned_pairs().is_empty() {
+                    self.push_log(
+                        "Run a scan first: L links the planned rows a finished scan shows, and nothing else."
+                            .to_string(),
+                    );
+                } else {
+                    self.overlay = Overlay::ConfirmLink(ConfirmLinkMode::All);
+                }
+            }
             KeyCode::Char('l') => {
                 if self
                     .selected_entry()
@@ -587,6 +610,11 @@ impl App {
             self.push_log("A run is already in progress.".to_string());
             return;
         }
+        let pairs = self.reviewed_planned_pairs();
+        let Some(downloads) = self.downloads.clone().filter(|_| !pairs.is_empty()) else {
+            self.push_log("Run a scan first: nothing reviewed is planned.".to_string());
+            return;
+        };
         self.reset_live_run_state();
         self.report = None;
         self.live_entries.clear();
@@ -596,7 +624,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let (cancel_tx, cancel_rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = actions::run_link(strict, tx, cancel_rx);
+            let _ = actions::run_link_pairs(strict, &downloads, &pairs, tx, cancel_rx);
         });
         self.job_started_at = Some(Instant::now());
         self.current_phase = Some("planning".to_string());
@@ -610,14 +638,22 @@ impl App {
             return Ok(());
         }
 
-        let Some(source) = self
+        let Some(pair) = self
             .selected_entry()
             .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
-            .map(|entry| entry.source.clone())
+            .map(|entry| PlannedPair {
+                source: entry.source.clone(),
+                target: entry.target.clone(),
+            })
         else {
             self.push_log("Select a planned row before running a single-item link.".to_string());
             return Ok(());
         };
+        let Some(downloads) = self.downloads.clone() else {
+            self.push_log("Set the downloads path before linking.".to_string());
+            return Ok(());
+        };
+        let source = pair.source.clone();
 
         self.live_entries.clear();
         self.live_planned_actions = None;
@@ -633,11 +669,10 @@ impl App {
         self.push_log(format!("Running selected link for {source}"));
 
         let strict = self.strict;
-        let source_for_job = source.clone();
         let (tx, rx) = mpsc::channel();
         let (cancel_tx, cancel_rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = actions::run_link_selected(strict, &source_for_job, tx, cancel_rx);
+            let _ = actions::run_link_pairs(strict, &downloads, &[pair], tx, cancel_rx);
         });
         self.running_job = Some(RunningJob::new(
             JobKind::LinkSelected(source),
@@ -1699,9 +1734,73 @@ mod tests {
     }
 
     #[test]
+    fn uppercase_l_needs_a_finished_scan_with_planned_rows() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+
+        app.handle_main_key(KeyCode::Char('L'))
+            .expect("key handling should not fail");
+
+        assert!(matches!(app.overlay, Overlay::None), "nothing reviewed yet");
+        assert!(app.running_job.is_none());
+        assert!(app.logs.iter().any(|line| line.contains("scan")));
+
+        // A finished scan with nothing planned is no better.
+        app.report = Some(sample_report());
+        app.handle_main_key(KeyCode::Char('L'))
+            .expect("key handling should not fail");
+        assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn link_all_takes_the_planned_rows_the_scan_showed() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        let mut report = sample_report();
+        let row = |source: &str, status: &str| LinkReportEntry {
+            source: source.to_string(),
+            target: format!("/media{source}"),
+            size: 10,
+            status: status.to_string(),
+            method: None,
+            fallback_reason: None,
+            error: None,
+        };
+        report.entries = vec![
+            row("/downloads/a.mkv", "planned"),
+            row("/downloads/b.mkv", "applied"),
+            row("/downloads/c.mkv", "planned"),
+        ];
+        app.report = Some(report);
+
+        let pairs = app.reviewed_planned_pairs();
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|pair| (pair.source.as_str(), pair.target.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("/downloads/a.mkv", "/media/downloads/a.mkv"),
+                ("/downloads/c.mkv", "/media/downloads/c.mkv"),
+            ]
+        );
+    }
+
+    #[test]
     fn uppercase_l_opens_confirmation_overlay() {
         let config = Config::default();
         let mut app = App::new(&config, false);
+        let mut report = sample_report();
+        report.entries = vec![LinkReportEntry {
+            source: "/downloads/a.mkv".to_string(),
+            target: "/media/a.mkv".to_string(),
+            size: 10,
+            status: "planned".to_string(),
+            method: Some("try-hardlink".to_string()),
+            fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
+            error: None,
+        }];
+        app.report = Some(report);
 
         app.handle_main_key(KeyCode::Char('L'))
             .expect("key handling should not fail");

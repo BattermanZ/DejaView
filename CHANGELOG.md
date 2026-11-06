@@ -22,6 +22,7 @@
 
 ### Fixed
 
+- In the dashboard, `L` links only the planned rows the last scan showed, each to the library file it showed, and does nothing before a scan has finished; `l` likewise links its row only to the library file shown. Before, `L` ran a fresh link over everything, including duplicates that appeared after the scan and, before any scan, all of them. The confirmation counts rows with errors only.
 - A log that cannot be written no longer stops every command: DejaView warns once, naming the path, and runs without it. Before, an unwritable state folder failed even `config show`, with an error that named no path.
 - A run whose downloads folder reaches the library through a bind mount, or the reverse, stops before changing anything, and `config validate` reports it. Before, only paths were compared, so a library mounted inside downloads was walked as downloads and its files were rewritten.
 - A download already hardlinked to one library copy is left alone when the library holds a second identical copy. Before, it was relinked to the copy whose path sorted first, which broke the hardlink Sonarr or Radarr made and freed nothing.

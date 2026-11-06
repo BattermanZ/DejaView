@@ -59,6 +59,14 @@ enum Commands {
         /// Internal filter for linking only specific source paths
         #[arg(long = "only-source", hide = true)]
         only_sources: Vec<PathBuf>,
+        /// Internal: a JSON list of reviewed {source, target} rows; link only those
+        #[arg(
+            long,
+            hide = true,
+            value_name = "FILE",
+            conflicts_with = "only_sources"
+        )]
+        plan: Option<PathBuf>,
         #[command(flatten)]
         output: RunOutputArgs,
     },
@@ -235,6 +243,7 @@ fn run_cli() -> Result<()> {
                     tui_events: output.tui_events,
                     link_mode: effective_link_mode(&config, symlink_only),
                     only_sources: &[],
+                    only_pairs: &[],
                     cancel: run_cancel_token(output.tui_events),
                 },
             )?
@@ -245,9 +254,19 @@ fn run_cli() -> Result<()> {
             min_size,
             symlink_only,
             only_sources,
+            plan,
             output,
         } => {
             ensure_required_paths(&config)?;
+            let only_pairs = match &plan {
+                Some(path) => read_plan(path)?,
+                None => Vec::new(),
+            };
+            let only_sources: Vec<PathBuf> = if only_pairs.is_empty() {
+                only_sources
+            } else {
+                only_pairs.iter().map(|(src, _)| src.clone()).collect()
+            };
             if min_size.is_some() {
                 config.min_size = min_size;
             }
@@ -268,6 +287,7 @@ fn run_cli() -> Result<()> {
                     tui_events: output.tui_events,
                     link_mode: effective_link_mode(&config, symlink_only),
                     only_sources: &only_sources,
+                    only_pairs: &only_pairs,
                     cancel: run_cancel_token(output.tui_events),
                 },
             )?
@@ -365,6 +385,25 @@ fn run_cancel_token(tui_events: bool) -> engine::CancelToken {
         token.watch(std::io::stdin());
     }
     token
+}
+
+/// The rows a person reviewed, as written by the TUI. An empty plan is an
+/// error: an empty filter would mean "link everything".
+fn read_plan(path: &std::path::Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let bytes = fs::read(path)
+        .map_err(|err| anyhow::anyhow!("cannot read the plan {}: {err}", path.display()))?;
+    let pairs: Vec<protocol::PlannedPair> = serde_json::from_slice(&bytes)
+        .map_err(|err| anyhow::anyhow!("the plan {} is not valid: {err}", path.display()))?;
+    if pairs.is_empty() {
+        return Err(anyhow::anyhow!(
+            "the plan {} holds no rows, so there is nothing to link",
+            path.display()
+        ));
+    }
+    Ok(pairs
+        .into_iter()
+        .map(|pair| (PathBuf::from(pair.source), PathBuf::from(pair.target)))
+        .collect())
 }
 
 fn effective_link_mode(config: &config::Config, symlink_only: bool) -> LinkMode {
@@ -553,9 +592,11 @@ mod tests {
                 min_size,
                 symlink_only,
                 only_sources,
+                plan,
                 output,
             } => {
                 assert!(!strict);
+                assert_eq!(plan, None);
                 assert_eq!(min_size, None);
                 assert!(!confirm);
                 assert!(!symlink_only);

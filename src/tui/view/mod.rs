@@ -804,13 +804,9 @@ fn render_confirm_link_overlay(frame: &mut Frame, app: &App, mode: ConfirmLinkMo
         ConfirmLinkMode::All => (
             " LINK ALL CONFIRMATION ",
             format!(
-                "Confirm link-all run\n\nThis will execute filesystem changes for all currently planned rows.\n\nEstimated planned actions: {}\nCurrent mode: {}\nRows with warnings or errors: {}\n\nPress y to continue or n/q to cancel.",
-                app.planned_actions(),
-                app.mode_label(),
-                app.rows()
-                    .iter()
-                    .filter(|row| row.error.is_some() || row.fallback_reason.is_some())
-                    .count()
+                "Confirm link-all run\n\nThis links the planned rows the last scan showed, each to the library file shown. Files found since that scan are left alone, and so is a row whose files changed.\n\nRows to link: {}\nRows with errors: {}\n\nPress y to continue or n/q to cancel.",
+                app.reviewed_planned_pairs().len(),
+                app.rows().iter().filter(|row| row.error.is_some()).count()
             ),
         ),
         ConfirmLinkMode::Selected => (
@@ -1074,6 +1070,56 @@ mod tests {
 
         assert_eq!(format_bytes(app.saved_bytes()), "10.00 B");
         assert_eq!(format_bytes(app.potential_saved_bytes()), "20.00 B");
+    }
+
+    #[test]
+    fn link_all_dialog_counts_only_rows_with_errors() {
+        let mut app = App::new(&crate::config::Config::default(), false);
+        let planned = |source: &str| LinkReportEntry {
+            source: source.to_string(),
+            target: "/media/x.mkv".to_string(),
+            size: 10,
+            status: "planned".to_string(),
+            method: Some("try-hardlink".to_string()),
+            fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
+            error: None,
+        };
+        app.set_report_for_test(crate::protocol::RunReport {
+            mode: "scan".to_string(),
+            dry_run: true,
+            strict: false,
+            files_considered: 4,
+            planned_actions: 2,
+            applied_actions: 0,
+            total_saved_bytes: 20,
+            skipped_by_min_age: 0,
+            skipped_by_min_size: 0,
+            skipped_as_library_file: 0,
+            dangling_symlinks: Vec::new(),
+            warnings: crate::protocol::WarningSummary {
+                walk_errors: 0,
+                metadata_errors: 0,
+                sample_hash_errors: 0,
+                full_hash_errors: 0,
+                link_errors: 0,
+            },
+            entries: vec![planned("/downloads/a.mkv"), planned("/downloads/b.mkv")],
+        });
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_confirm_link_overlay(frame, &app, ConfirmLinkMode::All))
+            .expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(text.contains("Rows with errors: 0"), "{text}");
+        assert!(!text.contains("Current mode"), "{text}");
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::engine;
 use crate::fsutil::safe_write_bytes;
 
 use super::model::{RunReport, TuiEvent};
+use crate::protocol::PlannedPair;
 
 fn should_forward_terminal_error(status_success: bool, saw_error_event: bool) -> bool {
     !status_success && !saw_error_event
@@ -128,23 +129,42 @@ pub fn run_scan(strict: bool, tx: Sender<Result<TuiEvent>>, cancel_rx: Receiver<
     stream_subcommand_events("scan", strict, &[], tx, cancel_rx)
 }
 
-pub fn run_link(strict: bool, tx: Sender<Result<TuiEvent>>, cancel_rx: Receiver<()>) -> Result<()> {
-    stream_subcommand_events("link", strict, &[], tx, cancel_rx)
-}
-
-pub fn run_link_selected(
+/// Link exactly the rows a person reviewed: write them to a plan file in the
+/// downloads folder, run `link --plan` on it, and remove the file afterwards.
+/// The child links only these (download, library file) pairs, so files found
+/// since the scan, or a library file that changed, are left alone.
+pub fn run_link_pairs(
     strict: bool,
-    source: &str,
+    downloads: &Path,
+    pairs: &[PlannedPair],
     tx: Sender<Result<TuiEvent>>,
     cancel_rx: Receiver<()>,
 ) -> Result<()> {
-    stream_subcommand_events(
+    let plan = downloads.join(format!(
+        ".dejaview_tui_plan.{}.{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let written = serde_json::to_vec(pairs)
+        .map_err(anyhow::Error::from)
+        .and_then(|json| safe_write_bytes(&plan, &json))
+        .with_context(|| format!("write the link plan {}", plan.display()));
+    if let Err(err) = written {
+        let _ = tx.send(Err(anyhow!("{err:#}")));
+        return Err(err);
+    }
+    let result = stream_subcommand_events(
         "link",
         strict,
-        &[String::from("--only-source"), source.to_string()],
+        &[String::from("--plan"), plan.display().to_string()],
         tx,
         cancel_rx,
-    )
+    );
+    let _ = std::fs::remove_file(&plan);
+    result
 }
 
 pub fn clear_cache() -> Result<()> {
