@@ -296,6 +296,15 @@ fn empty_results_lines() -> Vec<Line<'static>> {
     ]
 }
 
+/// A row's status in the STATE column, at most seven letters so the column
+/// stays narrow; OUTCOME and the Inspector say "ALREADY LINKED" in full.
+fn state_label(row: &LinkReportEntry) -> String {
+    if row.status.eq_ignore_ascii_case("already-linked") {
+        return "ALREADY".to_string();
+    }
+    row.status.to_uppercase()
+}
+
 fn outcome_label(row: &LinkReportEntry) -> String {
     if row.status.eq_ignore_ascii_case("already-linked") {
         return "ALREADY LINKED".to_string();
@@ -425,35 +434,59 @@ fn header_activity_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn footer_line() -> Line<'static> {
-    Line::from(vec![
-        Span::styled(" q ", Theme::badge()),
-        Span::styled("quit", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" e ", Theme::badge_accent()),
-        Span::styled("paths", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" S ", Theme::badge()),
-        Span::styled("scan", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" l ", Theme::badge()),
-        Span::styled("link one", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" L ", Theme::badge()),
-        Span::styled("link all", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" c ", Theme::badge()),
-        Span::styled("cancel", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" p ", Theme::badge()),
-        Span::styled("paths", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" j/k ", Theme::badge()),
-        Span::styled("rows", Theme::muted()),
-        Span::raw("  "),
-        Span::styled(" ? ", Theme::badge()),
-        Span::styled("help", Theme::muted()),
-    ])
+/// The footer's keys, in the order shown, each with how much it matters
+/// when the terminal is too narrow for all: `q` and `?` always stay, since
+/// Help lists the rest.
+const FOOTER_KEYS: [(&str, &str, u8); 9] = [
+    ("q", "quit", 0),
+    ("e", "paths", 3),
+    ("S", "scan", 1),
+    ("l", "link one", 2),
+    ("L", "link all", 2),
+    ("c", "cancel", 1),
+    ("p", "paths", 5),
+    ("j/k", "rows", 4),
+    ("?", "help", 0),
+];
+
+/// As many of the footer's keys as fit in `width`, dropping the least
+/// needed first.
+fn footer_line(width: u16) -> Line<'static> {
+    let cost = |(key, label, _): &(&str, &str, u8)| key.chars().count() + label.chars().count() + 4;
+    let mut shown: Vec<bool> = vec![true; FOOTER_KEYS.len()];
+    let total = |shown: &[bool]| -> usize {
+        FOOTER_KEYS
+            .iter()
+            .zip(shown)
+            .filter(|(_, shown)| **shown)
+            .map(|(key, _)| cost(key))
+            .sum()
+    };
+    for level in (1..=5).rev() {
+        if total(&shown) <= usize::from(width) {
+            break;
+        }
+        for (index, (_, _, priority)) in FOOTER_KEYS.iter().enumerate() {
+            if *priority == level {
+                shown[index] = false;
+            }
+        }
+    }
+    let mut spans = Vec::new();
+    for ((key, label, _), _) in FOOTER_KEYS.iter().zip(&shown).filter(|(_, shown)| **shown) {
+        spans.push(Span::styled(
+            format!(" {key} "),
+            if *key == "e" {
+                Theme::badge_accent()
+            } else {
+                Theme::badge()
+            },
+        ));
+        spans.push(Span::styled(label.to_string(), Theme::muted()));
+        spans.push(Span::raw("  "));
+    }
+    spans.pop();
+    Line::from(spans)
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -525,23 +558,31 @@ pub fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(Block::default().style(Theme::canvas()), area);
     let l = layout::dashboard(area);
 
-    render_header(frame, l.top, app);
+    if l.compact_header {
+        render_compact_header(frame, l.top, app);
+    } else {
+        render_header(frame, l.top, app);
+    }
 
-    let left_block = pane_block("Workspace", false);
-    let left_inner = left_block.inner(l.center_left);
-    let left = Paragraph::new(sidebar_lines(app, left_inner.width))
-        .block(left_block)
-        .style(Theme::panel())
-        .wrap(Wrap { trim: true });
-    frame.render_widget(left, l.center_left);
+    if let Some(sidebar) = l.center_left {
+        let left_block = pane_block("Workspace", false);
+        let left_inner = left_block.inner(sidebar);
+        let left = Paragraph::new(sidebar_lines(app, left_inner.width))
+            .block(left_block)
+            .style(Theme::panel())
+            .wrap(Wrap { trim: true });
+        frame.render_widget(left, sidebar);
+    }
 
     render_results(frame, l.center_main, app);
 
-    let details = Paragraph::new(inspector_lines(app))
-        .block(pane_block("Inspector", false))
-        .style(Theme::panel())
-        .wrap(Wrap { trim: true });
-    frame.render_widget(details, l.center_right);
+    if let Some(inspector) = l.center_right {
+        let details = Paragraph::new(inspector_lines(app))
+            .block(pane_block("Inspector", false))
+            .style(Theme::panel())
+            .wrap(Wrap { trim: true });
+        frame.render_widget(details, inspector);
+    }
 
     let log_block = pane_block("Run Log", false);
     let log_inner = log_block.inner(l.bottom_log);
@@ -554,13 +595,16 @@ pub fn render(frame: &mut Frame, app: &App) {
     .style(Theme::panel());
     frame.render_widget(log, l.bottom_log);
 
-    let footer = Paragraph::new(footer_line())
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Theme::line())
-                .style(Theme::canvas()),
-        )
+    let footer_block = Block::default()
+        .borders(if l.footer_border {
+            Borders::TOP
+        } else {
+            Borders::NONE
+        })
+        .border_style(Theme::line())
+        .style(Theme::canvas());
+    let footer = Paragraph::new(footer_line(l.footer.width))
+        .block(footer_block)
         .style(Theme::canvas());
     frame.render_widget(footer, l.footer);
 
@@ -574,11 +618,56 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
 }
 
+/// The counts the header's cards show, as one line for a short terminal.
+fn metrics_line(app: &App) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (label, value) in [
+        ("FILES", app.files_considered().to_string()),
+        ("PLANNED", app.planned_actions().to_string()),
+        ("APPLIED", app.applied_actions().to_string()),
+        ("SAVED", format_bytes(app.saved_bytes())),
+        ("TO SAVE", format_bytes(app.potential_saved_bytes())),
+    ] {
+        spans.push(Span::styled(format!("{label} "), Theme::dim()));
+        spans.push(Span::styled(value, Theme::metric_number()));
+        spans.push(Span::raw("   "));
+    }
+    spans.pop();
+    Line::from(spans)
+}
+
+/// The header of a short or narrow terminal: one block, no wordmark, the
+/// counts on one line above the activity.
+fn render_compact_header(frame: &mut Frame, area: Rect, app: &App) {
+    let block = card_block("DejaView", true);
+    let inner = block.inner(area);
+    let mut lines = vec![metrics_line(app)];
+    lines.extend(header_activity_lines(app, area.width));
+    lines.truncate(usize::from(inner.height));
+    frame.render_widget(
+        Paragraph::new(lines).block(block).style(Theme::card()),
+        area,
+    );
+}
+
+/// The widths of the five metric cards in `width` columns: each at least
+/// wide enough for its title, the rest shared out.
+fn metric_widths(width: u16) -> [u16; 5] {
+    let mut widths = [11u16, 11, 11, 13, 13];
+    let spare = width.saturating_sub(widths.iter().sum());
+    for (index, slot) in widths.iter_mut().enumerate() {
+        *slot += spare / 5 + u16::from(index < usize::from(spare % 5));
+    }
+    widths
+}
+
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-    let brand_width = area.width.saturating_sub(52).clamp(28, 60);
+    // The cards need 59 columns for their titles; the wordmark takes what
+    // is left, within reason.
+    let brand_width = area.width.saturating_sub(62).clamp(24, 60);
     let split = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(brand_width), Constraint::Min(52)])
+        .constraints([Constraint::Length(brand_width), Constraint::Min(59)])
         .split(area);
 
     let brand_block = Block::default()
@@ -611,13 +700,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 
     let metrics = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(16),
-            Constraint::Percentage(14),
-            Constraint::Percentage(14),
-            Constraint::Percentage(28),
-            Constraint::Percentage(28),
-        ])
+        .constraints(metric_widths(right[0].width).map(Constraint::Length))
         .split(right[0]);
 
     frame.render_widget(
@@ -683,23 +766,26 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let state_width = 12u16;
-    let size_width = 10u16;
+    let state_width = 10u16;
+    let size_width = 9u16;
     let max_outcome_len = app
         .rows()
         .iter()
         .map(|row| outcome_label(row).chars().count())
         .max()
         .unwrap_or_else(|| "OUTCOME".chars().count());
-    let outcome_width = (max_outcome_len as u16 + 2).clamp(12, 18);
-    let spacing = 2u16;
-    // A wide table shows the library file too; a narrow one keeps the room
-    // for the download, which is what tells rows apart.
+    let outcome_width = (max_outcome_len as u16 + 1).clamp(8, 16);
+    let spacing = 1u16;
+    // The download is what tells rows apart, so it keeps its room: a narrow
+    // table leaves the outcome to the Inspector, and only a wide one shows
+    // the library file too.
+    let show_outcome = content[1].width >= 66;
     let show_target = content[1].width >= 110;
-    let columns = if show_target { 5 } else { 4 };
+    let columns = 3 + u16::from(show_outcome) + u16::from(show_target);
+    let fixed = state_width + size_width + if show_outcome { outcome_width } else { 0 };
     let flexible = content[1]
         .width
-        .saturating_sub(state_width + size_width + outcome_width + spacing * (columns - 1));
+        .saturating_sub(fixed + spacing * (columns - 1));
     let (source_width, target_width) = if show_target {
         let source = flexible * 11 / 20;
         (source, flexible - source)
@@ -721,7 +807,7 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
             let style = row_style(row, is_selected);
             let mut cells = vec![
                 Cell::from(Span::styled(
-                    format!(" {} ", row.status.to_uppercase()),
+                    format!(" {} ", state_label(row)),
                     status_chip_style(row, is_selected),
                 )),
                 Cell::from(Span::styled(
@@ -732,8 +818,10 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
                     style,
                 )),
                 Cell::from(Span::styled(format_bytes(row.size), style)),
-                Cell::from(Span::styled(outcome_label(row), style)),
             ];
+            if show_outcome {
+                cells.push(Cell::from(Span::styled(outcome_label(row), style)));
+            }
             if show_target {
                 cells.push(Cell::from(Span::styled(
                     trim_keep_name(
@@ -755,14 +843,16 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(state_width),
         Constraint::Length(source_width),
         Constraint::Length(size_width),
-        Constraint::Length(outcome_width),
     ];
     let mut header = vec![
         Cell::from(Span::styled("STATE", Theme::title(false))),
         Cell::from(Span::styled("SOURCE", Theme::title(false))),
         Cell::from(Span::styled("SIZE", Theme::title(false))),
-        Cell::from(Span::styled("OUTCOME", Theme::title(false))),
     ];
+    if show_outcome {
+        widths.push(Constraint::Length(outcome_width));
+        header.push(Cell::from(Span::styled("OUTCOME", Theme::title(false))));
+    }
     if show_target {
         widths.push(Constraint::Length(target_width));
         header.push(Cell::from(Span::styled("TARGET", Theme::title(false))));
@@ -774,21 +864,20 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(table, content[1]);
 }
 
+const HELP_TEXT: &str = "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\np toggle compact/full paths\nj/k move rows\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nX clear cache and rescan\nl confirm and link selected row\nL confirm and run link-all job\nc cancel the running scan or link\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels";
+
 fn render_help_overlay(frame: &mut Frame) {
-    let area = centered_rect(78, 72, frame.area());
+    let (area, lines) = dialog_for(frame.area(), 60, HELP_TEXT, 0);
     frame.render_widget(Clear, area);
-    let help = Paragraph::new(
-        "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\np toggle compact/full paths\nj/k move rows\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nX clear cache and rescan\nl confirm and link selected row\nL confirm and run link-all job\nc cancel the running scan or link\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels",
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(Line::from(vec![Span::styled(" HELP ", Theme::title(true))]))
-            .style(Theme::popup())
-            .border_style(Theme::accent()),
-    )
-    .style(Theme::popup())
-    .wrap(Wrap { trim: true });
+    let help = Paragraph::new(lines.join("\n"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Line::from(vec![Span::styled(" HELP ", Theme::title(true))]))
+                .style(Theme::popup())
+                .border_style(Theme::accent()),
+        )
+        .style(Theme::popup());
     frame.render_widget(help, area);
 }
 
@@ -811,8 +900,33 @@ fn render_json_overlay(frame: &mut Frame, json: &str) {
     frame.render_widget(body, area);
 }
 
+const CONFIG_EDITOR_TIP: &str = "Use absolute paths to existing directories. The editor validates before saving to the repo config file.";
+
 fn render_config_overlay(frame: &mut Frame, editor: &ConfigEditor) {
-    let area = centered_rect(80, 55, frame.area());
+    let screen = frame.area();
+    let width = 90u16
+        .min(screen.width.saturating_sub(4))
+        .max(screen.width.min(20));
+    // Inside the dialog's border and its one-column margin.
+    let inner_width = usize::from(width.saturating_sub(4));
+    let status = editor
+        .error
+        .clone()
+        .unwrap_or_else(|| "Enter saves on the second field. Esc cancels.".to_string());
+    // The status box grows with its text, so a long error is read whole.
+    let status_lines = wrap_text(&status, inner_width.saturating_sub(2));
+    let tips = wrap_text(CONFIG_EDITOR_TIP, inner_width);
+    let status_height = u16::try_from(status_lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let tips_height = u16::try_from(tips.len()).unwrap_or(u16::MAX);
+    let height = (4 + 3 + 3 + status_height + tips_height).min(screen.height);
+    let area = Rect {
+        x: screen.x + (screen.width - width) / 2,
+        y: screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    };
     frame.render_widget(Clear, area);
 
     let sections = Layout::default()
@@ -820,8 +934,8 @@ fn render_config_overlay(frame: &mut Frame, editor: &ConfigEditor) {
         .constraints([
             Constraint::Length(3),
             Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(4),
+            Constraint::Length(status_height),
+            Constraint::Min(0),
         ])
         .margin(1)
         .split(area);
@@ -836,66 +950,56 @@ fn render_config_overlay(frame: &mut Frame, editor: &ConfigEditor) {
         .border_style(Theme::accent());
     frame.render_widget(shell, area);
 
-    let downloads = Paragraph::new(editor.downloads.as_str())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Downloads")
-                .border_style(if editor.active_field == ConfigField::Downloads {
-                    Theme::accent()
-                } else {
-                    Theme::line()
-                }),
-        )
-        .style(Theme::input(editor.active_field == ConfigField::Downloads))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(downloads, sections[0]);
-
-    let media = Paragraph::new(editor.media.as_str())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Media")
-                .border_style(if editor.active_field == ConfigField::Media {
-                    Theme::accent()
-                } else {
-                    Theme::line()
-                }),
-        )
-        .style(Theme::input(editor.active_field == ConfigField::Media))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(media, sections[1]);
-
-    let status = Paragraph::new(
-        editor
-            .error
-            .clone()
-            .unwrap_or_else(|| "Enter saves on the second field. Esc cancels.".to_string()),
-    )
-    .style(if editor.error.is_some() {
-        Theme::danger()
-    } else {
-        Theme::muted()
-    })
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Status")
-            .border_style(Theme::line()),
+    let field = |title: &'static str, value: &str, active: bool| {
+        Paragraph::new(value.to_string())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(if active {
+                        Theme::accent()
+                    } else {
+                        Theme::line()
+                    }),
+            )
+            .style(Theme::input(active))
+    };
+    frame.render_widget(
+        field(
+            "Downloads",
+            &editor.downloads,
+            editor.active_field == ConfigField::Downloads,
+        ),
+        sections[0],
     );
+    frame.render_widget(
+        field(
+            "Media",
+            &editor.media,
+            editor.active_field == ConfigField::Media,
+        ),
+        sections[1],
+    );
+
+    let status = Paragraph::new(status_lines.join("\n"))
+        .style(if editor.error.is_some() {
+            Theme::danger()
+        } else {
+            Theme::muted()
+        })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Status")
+                .border_style(Theme::line()),
+        );
     frame.render_widget(status, sections[2]);
 
-    let tips = Paragraph::new(
-        "Use absolute paths to existing directories. The editor validates before saving to the repo config file.",
-    )
-    .style(Theme::muted())
-    .wrap(Wrap { trim: true });
+    let tips = Paragraph::new(tips.join("\n")).style(Theme::muted());
     frame.render_widget(tips, sections[3]);
 }
 
 fn render_confirm_link_overlay(frame: &mut Frame, app: &App, mode: ConfirmLinkMode) {
-    let area = centered_rect(70, 45, frame.area());
-    frame.render_widget(Clear, area);
     let (title, body) = match mode {
         ConfirmLinkMode::All => (
             " LINK ALL CONFIRMATION ",
@@ -927,7 +1031,9 @@ fn render_confirm_link_overlay(frame: &mut Frame, app: &App, mode: ConfirmLinkMo
         Span::styled(" n cancel ", Theme::title(false)),
     ])
     .right_aligned();
-    let body = Paragraph::new(body)
+    let (area, lines) = dialog_for(frame.area(), 76, &body, 0);
+    frame.render_widget(Clear, area);
+    let body = Paragraph::new(lines.join("\n"))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -936,15 +1042,15 @@ fn render_confirm_link_overlay(frame: &mut Frame, app: &App, mode: ConfirmLinkMo
                 .style(Theme::popup())
                 .border_style(Theme::accent()),
         )
-        .style(Theme::popup())
-        .wrap(Wrap { trim: true });
+        .style(Theme::popup());
     frame.render_widget(body, area);
 }
 
 fn render_blocking_notice_overlay(frame: &mut Frame, message: &str) {
-    let area = centered_rect(70, 35, frame.area());
+    let text = format!("{message}\n\nPress q, Esc, or Enter to dismiss.");
+    let (area, lines) = dialog_for(frame.area(), 70, &text, 0);
     frame.render_widget(Clear, area);
-    let body = Paragraph::new(format!("{message}\n\nPress q, Esc, or Enter to dismiss."))
+    let body = Paragraph::new(lines.join("\n"))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -955,9 +1061,64 @@ fn render_blocking_notice_overlay(frame: &mut Frame, message: &str) {
                 .style(Theme::popup())
                 .border_style(Theme::accent()),
         )
-        .style(Theme::popup())
-        .wrap(Wrap { trim: true });
+        .style(Theme::popup());
     frame.render_widget(body, area);
+}
+
+/// `text` wrapped to `width` columns at spaces; a word longer than a line is
+/// cut across lines, and each line of `text` starts a new one.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut line = String::new();
+        for word in paragraph.split(' ') {
+            let mut word: Vec<char> = word.chars().collect();
+            let used = line.chars().count();
+            if used > 0 && used + 1 + word.len() > width {
+                lines.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            loop {
+                let room = width.saturating_sub(line.chars().count());
+                if word.len() <= room {
+                    break;
+                }
+                if room == 0 {
+                    lines.push(std::mem::take(&mut line));
+                    continue;
+                }
+                line.extend(word.drain(..room));
+                lines.push(std::mem::take(&mut line));
+            }
+            line.extend(word);
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+/// The area of a dialog for `text`: at most `max_width` columns wide and as
+/// tall as the wrapped text needs plus `extra_rows`, within the screen and
+/// centred on it. Returns the area and the wrapped lines.
+fn dialog_for(screen: Rect, max_width: u16, text: &str, extra_rows: u16) -> (Rect, Vec<String>) {
+    let width = max_width
+        .min(screen.width.saturating_sub(4))
+        .max(screen.width.min(20));
+    let lines = wrap_text(text, usize::from(width.saturating_sub(2)));
+    let wanted = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2 + extra_rows);
+    let height = wanted.min(screen.height);
+    let area = Rect {
+        x: screen.x + (screen.width - width) / 2,
+        y: screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    };
+    (area, lines)
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -1512,5 +1673,88 @@ mod row_tests {
             "{text}"
         );
         assert!(rows[1].contains("/downloads/Show.Name.S01.1080p"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::row_tests::{app_with_episodes, screen};
+    use super::*;
+
+    #[test]
+    fn a_short_terminal_keeps_counts_log_and_help_and_drops_the_wordmark() {
+        let app = app_with_episodes(12);
+        for (cols, rows) in [(60, 20), (80, 24)] {
+            let text = screen(&app, cols, rows);
+            assert!(!text.contains('█'), "{cols}x{rows}: no wordmark\n{text}");
+            assert!(text.contains("PLANNED 12"), "{cols}x{rows}: counts\n{text}");
+            assert!(text.contains("Run Log"), "{cols}x{rows}: log\n{text}");
+            assert!(text.contains("? help"), "{cols}x{rows}: footer\n{text}");
+            for n in 1..=3 {
+                assert!(
+                    text.contains(&format!("S01E0{n}")),
+                    "{cols}x{rows}: rows told apart\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_sidebar_and_inspector_give_way_on_a_narrow_terminal() {
+        let app = app_with_episodes(3);
+        let wide = screen(&app, 120, 40);
+        assert!(wide.contains("Workspace") && wide.contains("Inspector"));
+        let medium = screen(&app, 80, 24);
+        assert!(!medium.contains("Workspace") && medium.contains("Inspector"));
+        let narrow = screen(&app, 60, 20);
+        assert!(!narrow.contains("Workspace") && !narrow.contains("Inspector"));
+    }
+
+    #[test]
+    fn metric_titles_are_never_cut() {
+        let app = app_with_episodes(3);
+        for (cols, rows) in [(100, 30), (120, 40), (200, 50)] {
+            let text = screen(&app, cols, rows);
+            for title in [" FILES ", " PLANNED ", " APPLIED ", " SAVED ", " TO SAVE "] {
+                assert!(text.contains(title), "{cols}x{rows}: {title}\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_dialog_is_as_tall_as_its_text() {
+        let screen_area = Rect::new(0, 0, 120, 40);
+        let (area, lines) = dialog_for(screen_area, 70, "One short line.", 0);
+        assert_eq!(lines, ["One short line."]);
+        assert_eq!((area.width, area.height), (70, 3));
+        // Never past the screen.
+        let (area, _) = dialog_for(Rect::new(0, 0, 30, 5), 70, &"word ".repeat(80), 0);
+        assert!(area.width <= 30 && area.height <= 5, "{area:?}");
+    }
+
+    #[test]
+    fn text_wraps_at_spaces_and_cuts_a_word_too_long_for_a_line() {
+        assert_eq!(wrap_text("one two three", 7), ["one two", "three"]);
+        assert_eq!(wrap_text("a\n\nb", 10), ["a", "", "b"]);
+        assert_eq!(wrap_text("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        for line in wrap_text("media path is inside /a/very/long/path/that/goes/on", 12) {
+            assert!(line.chars().count() <= 12, "{line}");
+        }
+    }
+
+    #[test]
+    fn the_footer_keeps_quit_and_help_however_narrow() {
+        for width in [20u16, 40, 60, 80, 120] {
+            let line = footer_line(width).to_string();
+            assert!(
+                line.contains("q quit") && line.contains("? help"),
+                "{width}: {line}"
+            );
+            assert!(
+                line.chars().count() <= usize::from(width).max(17),
+                "{width}: {line}"
+            );
+        }
+        assert!(footer_line(120).to_string().contains("j/k rows"));
     }
 }
