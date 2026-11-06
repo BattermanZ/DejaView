@@ -1218,23 +1218,6 @@ fn link_with_a_plan_links_only_the_reviewed_pairs() {
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
-/// Point the config at `downloads` and `media` with no age or size floor.
-fn configure(root: &Path, downloads: &Path, media: &Path) {
-    run_ok(
-        root,
-        &[
-            "config",
-            "set-downloads",
-            downloads.to_str().expect("downloads str"),
-        ],
-    );
-    run_ok(
-        root,
-        &["config", "set-media", media.to_str().expect("media str")],
-    );
-    set_min_age_zero(root);
-}
-
 #[test]
 fn a_signal_stops_a_scan_and_keeps_the_hashes_it_finished() {
     use std::io::{BufRead, BufReader};
@@ -1252,7 +1235,7 @@ fn a_signal_stops_a_scan_and_keeps_the_hashes_it_finished() {
         let file = fs::File::create(&path).expect("create sparse file");
         file.set_len(4 << 30).expect("size sparse file");
     }
-    configure(&root, &downloads, &media);
+    configure_small_files(&root, &downloads, &media);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_dejaview"))
         .args(["scan", "--tui-events", "--no-progress"])
@@ -1293,6 +1276,83 @@ fn a_signal_stops_a_scan_and_keeps_the_hashes_it_finished() {
         cache.get("downloads/small.mkv").is_some() && cache.get("media/small.mkv").is_some(),
         "the hashes finished before the signal are kept: {cache}"
     );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+/// The events of a `--tui-events` run, which must succeed.
+fn events_of(root: &Path, args: &[&str]) -> Vec<serde_json::Value> {
+    let mut args = args.to_vec();
+    args.extend(["--tui-events", "--no-progress"]);
+    let out = run_cmd(root, &args);
+    assert!(
+        out.status.success(),
+        "args={args:?} stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse event"))
+        .collect()
+}
+
+fn walked(events: &[serde_json::Value]) -> bool {
+    events
+        .iter()
+        .any(|event| event["type"] == "phase" && event["phase"] == "collecting")
+}
+
+fn logged(events: &[serde_json::Value], text: &str) -> bool {
+    events.iter().any(|event| {
+        event["type"] == "log" && event["message"].as_str().is_some_and(|m| m.contains(text))
+    })
+}
+
+#[test]
+fn reviewed_rows_the_cache_vouches_for_are_linked_without_a_walk() {
+    let root = unique_temp_dir("plan_from_cache");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("Movie/movie.mkv"), 5000, 1);
+    write_seeded(&media.join("Movies/movie.mkv"), 5000, 1);
+    write_seeded(&downloads.join("Show/ep.mkv"), 6000, 2);
+    write_seeded(&media.join("TV/ep.mkv"), 6000, 2);
+    configure_small_files(&root, &downloads, &media);
+    let scan = events_of(&root, &["scan"]);
+    assert!(walked(&scan));
+
+    let plan = root.join("plan.json");
+    let write_plan = |pairs: serde_json::Value| {
+        fs::write(&plan, serde_json::to_vec(&pairs).expect("encode plan")).expect("write plan");
+    };
+    write_plan(serde_json::json!([
+        {"source": downloads.join("Movie/movie.mkv"), "target": media.join("Movies/movie.mkv")},
+    ]));
+    let link = events_of(&root, &["link", "--plan", plan.to_str().expect("plan str")]);
+    assert!(!walked(&link), "the cache vouched, so no walk: {link:?}");
+    assert!(
+        logged(&link, "The cache vouches for all 1 reviewed row(s)"),
+        "{link:?}"
+    );
+    let ino = |path: PathBuf| fs::metadata(path).expect("metadata").ino();
+    assert_eq!(
+        ino(downloads.join("Movie/movie.mkv")),
+        ino(media.join("Movies/movie.mkv"))
+    );
+
+    // A download changed since the scan: the run walks and checks it again.
+    let episode = downloads.join("Show/ep.mkv");
+    write_seeded(&episode, 6000, 2);
+    write_plan(serde_json::json!([
+        {"source": episode, "target": media.join("TV/ep.mkv")},
+    ]));
+    let link = events_of(&root, &["link", "--plan", plan.to_str().expect("plan str")]);
+    assert!(walked(&link), "{link:?}");
+    assert!(
+        logged(&link, "changed since it was hashed"),
+        "the log says why the cache could not vouch: {link:?}"
+    );
+    assert_eq!(ino(episode), ino(media.join("TV/ep.mkv")));
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

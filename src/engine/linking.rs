@@ -74,7 +74,7 @@ pub(super) fn ensure_source_outside_media_root(media_root: &Path, source: &Path)
     Ok(())
 }
 
-fn snapshot_from_file_info(file: &FileInfo) -> FileSnapshot {
+pub(super) fn snapshot_from_file_info(file: &FileInfo) -> FileSnapshot {
     FileSnapshot {
         size: file.size,
         mtime_ns: file.mtime_ns,
@@ -86,19 +86,7 @@ fn snapshot_from_file_info(file: &FileInfo) -> FileSnapshot {
 
 fn snapshot_path(path: &Path) -> Result<FileSnapshot> {
     let meta = fs::metadata(path).with_context(|| format!("metadata {}", path.display()))?;
-    let mtime_ns = meta
-        .modified()
-        .unwrap_or(SystemTime::UNIX_EPOCH)
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    Ok(FileSnapshot {
-        size: meta.len(),
-        mtime_ns,
-        ctime_ns: (meta.ctime() as i128 * 1_000_000_000) + meta.ctime_nsec() as i128,
-        dev: meta.dev(),
-        inode: meta.ino(),
-    })
+    Ok(FileSnapshot::of(&meta))
 }
 
 /// The source must be the file the plan saw. One exception: when this run has
@@ -678,13 +666,7 @@ pub(super) fn replace_file_with_best_link(req: &LinkRequest<'_>) -> Result<Linke
 /// the same size and timestamps; two real copies almost never share a ctime to
 /// the nanosecond.
 fn is_same_physical_file(download: &FileInfo, library: &FileInfo) -> bool {
-    if download.dev == library.dev {
-        download.inode == library.inode
-    } else {
-        download.size == library.size
-            && download.mtime_ns == library.mtime_ns
-            && download.ctime_ns == library.ctime_ns
-    }
+    snapshot_from_file_info(download).is_same_physical_file(&snapshot_from_file_info(library))
 }
 
 /// Plan one link per download in a group of identical files, all to the library
@@ -762,41 +744,42 @@ pub(super) fn plan_hashed_group_actions(group: &[FileInfo]) -> Vec<LinkAction> {
 }
 
 pub(super) struct Plan {
-    pub(super) table: Table,
     pub(super) actions: Vec<LinkAction>,
     /// Downloads left alone because they are a library file seen through a
     /// second mount, with the library path each matched.
     pub(super) seen_through_second_mount: Vec<(PathBuf, PathBuf)>,
 }
 
-pub(super) fn plan_actions_and_table(groups: &[Vec<FileInfo>]) -> Plan {
-    let mut table = Table::new();
-    table
-        .load_style(UTF8_FULL.with_rounded_corners())
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["Download".yellow(), "Media".yellow()]);
-
+pub(super) fn plan_actions(groups: &[Vec<FileInfo>]) -> Plan {
     let mut actions = Vec::new();
     let mut seen_through_second_mount = Vec::new();
     for group in groups {
         for hashed_group in hash_buckets(group) {
             seen_through_second_mount
                 .extend(library_files_seen_through_second_mount(&hashed_group));
-            for action in plan_group_actions(&hashed_group) {
-                table.add_row(vec![
-                    action.src.to_string_lossy().to_string(),
-                    action.tgt.to_string_lossy().to_string(),
-                ]);
-                actions.push(action);
-            }
+            actions.extend(plan_group_actions(&hashed_group));
         }
     }
-
     Plan {
-        table,
         actions,
         seen_through_second_mount,
     }
+}
+
+/// The table a person reads: one row per planned action.
+pub(super) fn action_table(actions: &[LinkAction]) -> Table {
+    let mut table = Table::new();
+    table
+        .load_style(UTF8_FULL.with_rounded_corners())
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["Download".yellow(), "Media".yellow()]);
+    for action in actions {
+        table.add_row(vec![
+            action.src.to_string_lossy().to_string(),
+            action.tgt.to_string_lossy().to_string(),
+        ]);
+    }
+    table
 }
 
 pub(super) struct ApplyOptions<'a> {

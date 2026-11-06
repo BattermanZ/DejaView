@@ -25,6 +25,7 @@
 
 ### Changed
 
+- In the dashboard, `l` and `L` link the reviewed rows without walking both folders again when neither file of any row has changed since the scan hashed it; a row that changed sends the run back to the walk, which checks every row as before. Before, every link from the dashboard walked both folders first, which takes minutes on a network drive.
 - The same share mounted at two paths, such as in a Docker cron job and on the host the dashboard runs on, now uses one set of cache entries. Before, each run pruned the other's entries as gone and the next one hashed them again.
 - A run that learns nothing new leaves the cache file as it is. Before, every run rewrote and flushed it, tens of megabytes on a large library.
 - Downloads and media are walked at once, many folders in parallel, so a run on a network drive no longer waits on one `stat` after another before hashing starts.

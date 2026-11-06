@@ -9,6 +9,7 @@ mod hashing;
 mod linking;
 mod lock;
 mod report;
+mod reviewed;
 mod types;
 
 pub use cancel::{CancelToken, Cancelled};
@@ -20,13 +21,13 @@ use crate::protocol::TuiEvent;
 use cache::{CacheKeys, load_cache, prune_cache, save_cache};
 use collect::{CollectOptions, collect_run_files, group_files_by_size};
 use hashing::{CHECKPOINT_EVERY, Checkpoint, HashOptions, Hashed, hash_groups_and_update_cache};
-use linking::{ApplyOptions, ApplyOutcome, apply_actions, plan_actions_and_table};
+use linking::{ApplyOptions, ApplyOutcome, apply_actions, plan_actions};
 use report::{
     RunReportInput, build_report_entries, build_run_report, maybe_confirm_apply,
     maybe_return_strict_errors, print_run_summary, print_space_summary, resolve_report_path,
     try_write_run_report,
 };
-use types::{RunMetrics, RunWarnings};
+use types::{LinkAction, RunMetrics, RunWarnings};
 
 use crate::config::{Config, cache_path};
 use crate::logger;
@@ -179,152 +180,42 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     let full_pool = build_pool("full", config.effective_full_threads())?;
     let mut warnings = RunWarnings::default();
     let mut metrics = RunMetrics::default();
-    if options.tui_events {
-        let _ = types::emit_tui_event(&TuiEvent::Phase {
-            phase: "collecting".to_string(),
-        });
-        let _ = types::emit_tui_event(&TuiEvent::Log {
-            message: "Collecting candidate files".to_string(),
-        });
-    }
-    let files = collect_run_files(
-        downloads,
-        media,
-        min_age,
-        CollectOptions {
-            min_size: config.effective_min_size(),
-            exclude: &exclude,
-            strict: options.strict,
-            show_progress: options.show_progress,
-            tui_events: options.tui_events,
-            cancel: &options.cancel,
-        },
-        &quick_pool,
-        &mut warnings,
-        &mut metrics,
-    )?;
-    let files_seen = files.len();
-    logger::info("run", format!("collected {} candidate files", files_seen));
-    for path in &metrics.dangling_symlinks {
-        logger::warn(
-            "scan",
-            format!(
-                "{} points into the library and no longer resolves",
-                path.display()
-            ),
-        );
-    }
-    if options.tui_events && !metrics.dangling_symlinks.is_empty() {
-        let _ = types::emit_tui_event(&TuiEvent::Log {
-            message: format!(
-                "{} symlink(s) in downloads point into the library and no longer resolve, such as {}. The report lists them.",
-                metrics.dangling_symlinks.len(),
-                metrics.dangling_symlinks[0].display()
-            ),
-        });
-    }
-    if options.tui_events {
-        let _ = types::emit_tui_event(&TuiEvent::Count {
-            files_seen: Some(files_seen),
-            groups_found: None,
-            planned_actions: None,
-            applied_actions: None,
-            hash_progress_done: None,
-            hash_progress_total: None,
-        });
-        let _ = types::emit_tui_event(&TuiEvent::Phase {
-            phase: "hashing_sample".to_string(),
-        });
-        let _ = types::emit_tui_event(&TuiEvent::Log {
-            message: "Hashing files to identify duplicate candidates".to_string(),
-        });
-    }
-
     let cache_path = cache_path(config)?;
     logger::info("run", format!("using cache path {}", cache_path.display()));
-    let mut cache = load_cache(&cache_path);
-    let keys = CacheKeys::new(downloads, media);
-    let migrated = keys.migrate(&mut cache);
-    if migrated > 0 {
-        logger::info(
-            "cache",
-            format!("renamed {migrated} entries to keys relative to their folder"),
-        );
-    }
-
-    let seen_paths: HashSet<String> = files
-        .iter()
-        .map(|file| keys.key(&file.path, file.in_downloads))
-        .collect();
-    let mut groups = group_files_by_size(files);
-    if !options.only_sources.is_empty() {
-        // Linking selected rows: only the size groups holding those sources can
-        // produce their actions, so leave every other group unread.
-        groups.retain(|group| {
-            group
-                .iter()
-                .any(|file| file.in_downloads && options.only_sources.contains(&file.path))
-        });
-    }
-    let Hashed {
-        cache_writes,
-        result: hash_result,
-    } = quick_pool.install(|| {
-        hash_groups_and_update_cache(
-            &mut groups,
-            &mut cache,
-            &HashOptions {
-                strict: options.strict,
-                show_progress: options.show_progress,
-                tui_events: options.tui_events,
-                link_mode: options.link_mode,
-                selection: &options,
-                cancel: &options.cancel,
-                full_pool: &full_pool,
-                keys: &keys,
-                checkpoint: Checkpoint {
-                    path: &cache_path,
-                    every: CHECKPOINT_EVERY,
-                },
+    let roots = Roots {
+        downloads: collect::RootId::of("downloads", downloads)?,
+        media: collect::RootId::of("media", media)?,
+    };
+    let filters = reviewed::Filters {
+        min_size: config.effective_min_size(),
+        deadline: std::time::SystemTime::now() - min_age,
+        exclude: &exclude,
+    };
+    let from_cache = if options.only_pairs.is_empty() {
+        None
+    } else {
+        plan_reviewed_rows(&options, &roots, &cache_path, &filters)?
+    };
+    let Planned {
+        files_seen,
+        groups_found,
+        actions,
+    } = match from_cache {
+        Some(planned) => planned,
+        None => plan_by_walking(
+            config,
+            &options,
+            &roots,
+            &cache_path,
+            &filters,
+            Pools {
+                quick: &quick_pool,
+                full: &full_pool,
             },
             &mut warnings,
-        )
-    });
-    let mut pruned = 0;
-    if hash_result.is_ok() && warnings.walk_errors == 0 && warnings.metadata_errors == 0 {
-        pruned = prune_cache(&mut cache, &seen_paths);
-        if pruned > 0 {
-            logger::info(
-                "cache",
-                format!("pruned {pruned} entries for paths no longer present"),
-            );
-        }
-    } else {
-        logger::info(
-            "cache",
-            "walk was incomplete; keeping entries for paths not seen this run",
-        );
-    }
-    // Hashes finished before a cancel or a strict failure are valid: keep
-    // them. An unchanged cache is not written again: on a large library that
-    // is tens of megabytes and an fsync every run.
-    if migrated + cache_writes + pruned > 0 {
-        save_cache(&cache_path, &cache)?;
-    } else {
-        logger::info("cache", "cache unchanged; not saved");
-    }
-    hash_result?;
-
-    let linking::Plan {
-        table,
-        actions,
-        seen_through_second_mount,
-    } = plan_actions_and_table(&groups);
-    report_second_mount_skips(&seen_through_second_mount, &options, &mut metrics);
-    let actions = actions
-        .into_iter()
-        .filter(|action| options.selects(action))
-        .collect::<Vec<_>>();
+            &mut metrics,
+        )?,
+    };
     if actions.len() < options.only_pairs.len() {
         let message = format!(
             "{} of the {} reviewed row(s) are no longer planned as shown, because a file changed since the scan; they are left alone. Scan again to review them.",
@@ -353,7 +244,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         });
         let _ = types::emit_tui_event(&TuiEvent::Count {
             files_seen: Some(files_seen),
-            groups_found: Some(groups.len()),
+            groups_found: Some(groups_found),
             planned_actions: Some(planned_actions),
             applied_actions: Some(0),
             hash_progress_done: None,
@@ -366,7 +257,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
 
     if !machine_output {
         println!("\n{} Found duplicates:", "▶".cyan());
-        println!("{}", table);
+        println!("{}", linking::action_table(&actions));
         print_space_summary(actions.is_empty(), total_saved_space);
     }
     let out_path = resolve_report_path(downloads, &options);
@@ -499,6 +390,239 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         ),
     );
     Ok(())
+}
+
+/// The two roots of a run, as the filesystem knows them.
+struct Roots {
+    downloads: collect::RootId,
+    media: collect::RootId,
+}
+
+/// The run's two worker pools.
+#[derive(Clone, Copy)]
+struct Pools<'a> {
+    quick: &'a rayon::ThreadPool,
+    full: &'a rayon::ThreadPool,
+}
+
+/// What planning found, however it got there.
+struct Planned {
+    files_seen: usize,
+    groups_found: usize,
+    actions: Vec<LinkAction>,
+}
+
+/// Plan a dashboard link of reviewed rows from the cache, without a walk,
+/// when the cache vouches for every row; None sends the run to the walk.
+fn plan_reviewed_rows(
+    options: &ScanRunOptions<'_>,
+    roots: &Roots,
+    cache_path: &std::path::Path,
+    filters: &reviewed::Filters<'_>,
+) -> Result<Option<Planned>> {
+    let mut cache = load_cache(cache_path);
+    let keys = CacheKeys::new(&roots.downloads.path, &roots.media.path);
+    keys.migrate(&mut cache);
+    let checked = reviewed::plan_from_cache(
+        options.only_pairs,
+        &roots.downloads,
+        &roots.media,
+        &cache,
+        &keys,
+        filters,
+    )?;
+    let actions = match checked {
+        Ok(actions) => actions,
+        Err(why) => {
+            let message =
+                format!("Checking the reviewed rows by walking both folders, because {why}.");
+            logger::info("run", &message);
+            if options.tui_events {
+                let _ = types::emit_tui_event(&TuiEvent::Log { message });
+            }
+            return Ok(None);
+        }
+    };
+    let message = format!(
+        "The cache vouches for all {} reviewed row(s): both files of each are unchanged since the scan hashed them, so neither folder is walked again.",
+        actions.len()
+    );
+    logger::info("run", &message);
+    if options.tui_events {
+        let _ = types::emit_tui_event(&TuiEvent::Log { message });
+    }
+    let files_seen = actions
+        .iter()
+        .flat_map(|action| [&action.src, &action.tgt])
+        .collect::<HashSet<_>>()
+        .len();
+    Ok(Some(Planned {
+        files_seen,
+        groups_found: actions.len(),
+        actions,
+    }))
+}
+
+/// Walk both roots, hash what the cache does not know, and plan.
+#[allow(clippy::too_many_arguments)]
+fn plan_by_walking(
+    config: &Config,
+    options: &ScanRunOptions<'_>,
+    roots: &Roots,
+    cache_path: &std::path::Path,
+    filters: &reviewed::Filters<'_>,
+    pools: Pools<'_>,
+    warnings: &mut RunWarnings,
+    metrics: &mut RunMetrics,
+) -> Result<Planned> {
+    if options.tui_events {
+        let _ = types::emit_tui_event(&TuiEvent::Phase {
+            phase: "collecting".to_string(),
+        });
+        let _ = types::emit_tui_event(&TuiEvent::Log {
+            message: "Collecting candidate files".to_string(),
+        });
+    }
+    let files = collect_run_files(
+        &roots.downloads.path,
+        &roots.media.path,
+        std::time::Duration::from_secs(config.min_age.unwrap_or(0)),
+        CollectOptions {
+            min_size: filters.min_size,
+            exclude: filters.exclude,
+            strict: options.strict,
+            show_progress: options.show_progress,
+            tui_events: options.tui_events,
+            cancel: &options.cancel,
+        },
+        pools.quick,
+        warnings,
+        metrics,
+    )?;
+    let files_seen = files.len();
+    logger::info("run", format!("collected {} candidate files", files_seen));
+    for path in &metrics.dangling_symlinks {
+        logger::warn(
+            "scan",
+            format!(
+                "{} points into the library and no longer resolves",
+                path.display()
+            ),
+        );
+    }
+    if options.tui_events && !metrics.dangling_symlinks.is_empty() {
+        let _ = types::emit_tui_event(&TuiEvent::Log {
+            message: format!(
+                "{} symlink(s) in downloads point into the library and no longer resolve, such as {}. The report lists them.",
+                metrics.dangling_symlinks.len(),
+                metrics.dangling_symlinks[0].display()
+            ),
+        });
+    }
+    if options.tui_events {
+        let _ = types::emit_tui_event(&TuiEvent::Count {
+            files_seen: Some(files_seen),
+            groups_found: None,
+            planned_actions: None,
+            applied_actions: None,
+            hash_progress_done: None,
+            hash_progress_total: None,
+        });
+        let _ = types::emit_tui_event(&TuiEvent::Phase {
+            phase: "hashing_sample".to_string(),
+        });
+        let _ = types::emit_tui_event(&TuiEvent::Log {
+            message: "Hashing files to identify duplicate candidates".to_string(),
+        });
+    }
+
+    let mut cache = load_cache(cache_path);
+    let keys = CacheKeys::new(&roots.downloads.path, &roots.media.path);
+    let migrated = keys.migrate(&mut cache);
+    if migrated > 0 {
+        logger::info(
+            "cache",
+            format!("renamed {migrated} entries to keys relative to their folder"),
+        );
+    }
+
+    let seen_paths: HashSet<String> = files
+        .iter()
+        .map(|file| keys.key(&file.path, file.in_downloads))
+        .collect();
+    let mut groups = group_files_by_size(files);
+    if !options.only_sources.is_empty() {
+        // Linking selected rows: only the size groups holding those sources can
+        // produce their actions, so leave every other group unread.
+        groups.retain(|group| {
+            group
+                .iter()
+                .any(|file| file.in_downloads && options.only_sources.contains(&file.path))
+        });
+    }
+    let Hashed {
+        cache_writes,
+        result: hash_result,
+    } = pools.quick.install(|| {
+        hash_groups_and_update_cache(
+            &mut groups,
+            &mut cache,
+            &HashOptions {
+                strict: options.strict,
+                show_progress: options.show_progress,
+                tui_events: options.tui_events,
+                link_mode: options.link_mode,
+                selection: options,
+                cancel: &options.cancel,
+                full_pool: pools.full,
+                keys: &keys,
+                checkpoint: Checkpoint {
+                    path: cache_path,
+                    every: CHECKPOINT_EVERY,
+                },
+            },
+            warnings,
+        )
+    });
+    let mut pruned = 0;
+    if hash_result.is_ok() && warnings.walk_errors == 0 && warnings.metadata_errors == 0 {
+        pruned = prune_cache(&mut cache, &seen_paths);
+        if pruned > 0 {
+            logger::info(
+                "cache",
+                format!("pruned {pruned} entries for paths no longer present"),
+            );
+        }
+    } else {
+        logger::info(
+            "cache",
+            "walk was incomplete; keeping entries for paths not seen this run",
+        );
+    }
+    // Hashes finished before a cancel or a strict failure are valid: keep
+    // them. An unchanged cache is not written again: on a large library that
+    // is tens of megabytes and an fsync every run.
+    if migrated + cache_writes + pruned > 0 {
+        save_cache(cache_path, &cache)?;
+    } else {
+        logger::info("cache", "cache unchanged; not saved");
+    }
+    hash_result?;
+
+    let linking::Plan {
+        actions,
+        seen_through_second_mount,
+    } = plan_actions(&groups);
+    report_second_mount_skips(&seen_through_second_mount, options, metrics);
+    let actions = actions
+        .into_iter()
+        .filter(|action| options.selects(action))
+        .collect::<Vec<_>>();
+    Ok(Planned {
+        files_seen,
+        groups_found: groups.len(),
+        actions,
+    })
 }
 
 /// A pool of `threads` workers for one kind of I/O: `quick` walks and

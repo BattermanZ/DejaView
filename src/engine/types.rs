@@ -41,6 +41,37 @@ pub(super) struct FileSnapshot {
 }
 
 impl FileSnapshot {
+    pub(super) fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        FileSnapshot {
+            size: meta.len(),
+            mtime_ns: meta
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            ctime_ns: (meta.ctime() as i128 * 1_000_000_000) + meta.ctime_nsec() as i128,
+            dev: meta.dev(),
+            inode: meta.ino(),
+        }
+    }
+
+    /// Whether two paths are one file: one inode, or one file seen through
+    /// two mounts. A bind mount or a mergerfs branch shows a library file on a
+    /// second device, often under another inode number, but with the same
+    /// size and timestamps; two real copies almost never share a ctime to the
+    /// nanosecond.
+    pub(super) fn is_same_physical_file(&self, other: &Self) -> bool {
+        if self.dev == other.dev {
+            self.inode == other.inode
+        } else {
+            self.size == other.size
+                && self.mtime_ns == other.mtime_ns
+                && self.ctime_ns == other.ctime_ns
+        }
+    }
+
     pub(super) fn matches_source(&self, current: &Self) -> bool {
         current == self
     }
@@ -94,7 +125,7 @@ pub(super) struct RunMetrics {
     pub(super) dangling_symlinks: Vec<PathBuf>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(super) struct LinkAction {
     pub(super) src: PathBuf,
     pub(super) tgt: PathBuf,

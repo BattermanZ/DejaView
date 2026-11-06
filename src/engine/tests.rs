@@ -560,7 +560,7 @@ fn partially_linked_groups_still_plan_remaining_download_duplicates() {
     }
 
     let groups = group_files_by_size(files);
-    let actions = plan_actions_and_table(&groups).actions;
+    let actions = plan_actions(&groups).actions;
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].src, remaining_download);
     assert_eq!(actions[0].tgt, target);
@@ -2394,6 +2394,59 @@ fn hashing_saves_the_cache_as_it_goes() {
     let saved = load_cache(&cache_file);
     assert_eq!(saved.len(), 2, "{saved:?}");
     assert_eq!(hashed.cache_writes, 2);
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn the_cache_vouches_only_for_rows_the_walk_would_plan_the_same() {
+    let root = unique_temp_dir("vouch");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_file(&downloads.join("a.mkv"), b"same-content");
+    write_file(&media.join("a.mkv"), b"same-content");
+    write_file(&downloads.join("#recycle/b.mkv"), b"other-content");
+    write_file(&media.join("b.mkv"), b"other-content");
+    let mut config = make_config(&downloads, &media, 0);
+    // Scan with nothing excluded, so every file has a cached hash.
+    config.exclude = Some(Vec::new());
+    run_scan(&config, true, false, None);
+    let cache = load_cache(&downloads.join(".dejaview_cache.json"));
+    let keys = super::cache::CacheKeys::new(&downloads, &media);
+    let roots = (
+        RootId::of("downloads", &downloads).expect("downloads"),
+        RootId::of("media", &media).expect("media"),
+    );
+    let exclude = Exclude::new(Config::default().effective_exclude());
+    let filters = super::reviewed::Filters {
+        min_size: 1,
+        deadline: SystemTime::now(),
+        exclude: &exclude,
+    };
+    let vouch = |src: &Path, tgt: &Path| {
+        super::reviewed::plan_from_cache(
+            &[(src.to_path_buf(), tgt.to_path_buf())],
+            &roots.0,
+            &roots.1,
+            &cache,
+            &keys,
+            &filters,
+        )
+        .expect("no refusal")
+    };
+
+    let actions = vouch(&downloads.join("a.mkv"), &media.join("a.mkv")).expect("vouched");
+    assert_eq!(actions.len(), 1);
+    let why = vouch(&downloads.join("#recycle/b.mkv"), &media.join("b.mkv")).expect_err("excluded");
+    assert!(why.contains("exclude list"), "{why}");
+    let why = vouch(&downloads.join("a.mkv"), &media.join("b.mkv")).expect_err("different files");
+    assert!(why.contains("no longer hash alike"), "{why}");
+
+    // The download becomes a link to the library file: already one file.
+    fs::remove_file(downloads.join("a.mkv")).expect("remove download");
+    fs::hard_link(media.join("a.mkv"), downloads.join("a.mkv")).expect("hardlink");
+    let why = vouch(&downloads.join("a.mkv"), &media.join("a.mkv")).expect_err("changed");
+    assert!(why.contains("changed since it was hashed"), "{why}");
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

@@ -98,7 +98,7 @@ pub(super) struct CollectOptions<'a> {
 
 /// DejaView writes its cache, reports and temp files under the `.dejaview_`
 /// prefix in the downloads root; they are never candidates.
-fn is_own_file(name: &OsStr) -> bool {
+pub(super) fn is_own_file(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| name.starts_with(".dejaview_"))
 }
@@ -166,7 +166,7 @@ fn is_dangling_link_into(link: &Path, media: &RootId) -> bool {
 /// Path checks cannot see a bind mount, so the walk compares device and inode:
 /// without this, a library reached from inside downloads is walked as
 /// downloads and its files get rewritten.
-fn ensure_not_other_root(dir: &Path, walking: &RootId, other: &RootId) -> Result<()> {
+pub(super) fn ensure_not_other_root(dir: &Path, walking: &RootId, other: &RootId) -> Result<()> {
     let meta = match fs::metadata(dir) {
         Ok(meta) => meta,
         // An unreadable directory is the walk's own error to report.
