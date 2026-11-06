@@ -9,16 +9,24 @@ mod view;
 mod wordmark;
 
 use anyhow::Result;
-use crossterm::event::DisableMouseCapture;
-use crossterm::event::EnableMouseCapture;
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use std::io;
+use std::io::{self, Write};
 
 use crate::config::Config;
+
+/// Switch to the alternate screen. Mouse reporting stays off: the TUI handles
+/// no mouse events, and capturing them would stop the user selecting text.
+fn enter_screen<W: Write>(out: &mut W) -> io::Result<()> {
+    execute!(out, EnterAlternateScreen)
+}
+
+fn leave_screen<W: Write>(out: &mut W) -> io::Result<()> {
+    execute!(out, LeaveAlternateScreen)
+}
 
 #[derive(Default)]
 struct TerminalGuard {
@@ -29,8 +37,7 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn restore(&mut self) -> Result<()> {
         if self.alt_enabled {
-            let mut stdout = io::stdout();
-            execute!(stdout, LeaveAlternateScreen, DisableMouseCapture)?;
+            leave_screen(&mut io::stdout())?;
             self.alt_enabled = false;
         }
         if self.raw_enabled {
@@ -53,7 +60,7 @@ pub fn run(config: &Config, strict: bool) -> Result<()> {
     guard.raw_enabled = true;
 
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    enter_screen(&mut stdout)?;
     guard.alt_enabled = true;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -81,7 +88,7 @@ pub fn run_logo_preview() -> Result<()> {
     guard.raw_enabled = true;
 
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    enter_screen(&mut stdout)?;
     guard.alt_enabled = true;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -97,6 +104,21 @@ pub fn run_logo_preview() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entering_the_screen_leaves_mouse_reporting_off() {
+        let mut out = Vec::new();
+        enter_screen(&mut out).expect("enter screen");
+        leave_screen(&mut out).expect("leave screen");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(out.contains("\x1b[?1049h"), "alternate screen on: {out:?}");
+        for mouse_mode in ["?1000h", "?1002h", "?1003h", "?1006h"] {
+            assert!(
+                !out.contains(mouse_mode),
+                "mouse mode {mouse_mode} sent: {out:?}"
+            );
+        }
+    }
 
     #[test]
     fn terminal_guard_restore_noop_is_ok() {
