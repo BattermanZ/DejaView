@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
@@ -10,11 +10,12 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use crate::config::{Config, load_config, save_config};
 use crate::engine::LinkMode;
 use crate::fsutil::{expand_home, normalize_runtime_dir};
-use crate::protocol::{Counts, Mode, Outcome, Phase, PlannedPair};
+use crate::protocol::{Mode, Phase, PlannedPair};
 
 use super::actions;
 use super::events::{self, Event};
-use super::model::{LinkReportEntry, RunReport, TuiEvent};
+use super::model::{LinkReportEntry, TuiEvent};
+use super::run_state::{JobKind, RunState, Step};
 
 #[derive(Clone, Debug)]
 pub enum Overlay {
@@ -97,13 +98,6 @@ impl LinkCheck {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum JobKind {
-    Scan,
-    LinkAll,
-    LinkSelected(String),
-}
-
 struct RunningJob {
     kind: JobKind,
     receiver: Receiver<Result<TuiEvent>>,
@@ -140,11 +134,6 @@ pub struct App {
     overlay_scroll: usize,
     view: ViewSizes,
     pub overlay: Overlay,
-    report: Option<RunReport>,
-    /// The reviewed report, put aside while a link runs: restored if the run
-    /// ends without a report of its own, so the rows are not lost.
-    report_before_link: Option<RunReport>,
-    live_entries: Vec<LinkReportEntry>,
     logs: VecDeque<String>,
     downloads: Option<PathBuf>,
     media: Option<PathBuf>,
@@ -156,22 +145,8 @@ pub struct App {
     /// The names every walk leaves out, for the check before a test hardlink.
     exclude: Vec<String>,
     expand_paths: bool,
-    current_phase: Option<Phase>,
-    current_path: Option<String>,
-    latest_activity_message: Option<String>,
-    live_files_seen: Option<usize>,
-    live_groups_found: Option<usize>,
-    live_planned_actions: Option<usize>,
-    live_applied_actions: Option<usize>,
-    hash_progress_done: Option<usize>,
-    hash_progress_total: Option<usize>,
-    /// Bytes the full pass has read, of all it will read, and when it began:
-    /// speed and time left come from them.
-    hash_bytes: Option<(u64, u64)>,
-    full_pass_started_at: Option<Instant>,
-    active_workers: BTreeMap<usize, String>,
-    job_started_at: Option<Instant>,
-    last_run_duration: Option<Duration>,
+    /// The run being watched, and the report shown.
+    run: RunState,
     running_job: Option<RunningJob>,
     link_check: LinkCheck,
     link_check_rx: Option<Receiver<(LinkCheck, Vec<String>)>>,
@@ -188,9 +163,6 @@ impl App {
             overlay_scroll: 0,
             view: ViewSizes::default(),
             overlay: Overlay::None,
-            report: None,
-            report_before_link: None,
-            live_entries: Vec::new(),
             logs,
             downloads: config.downloads.clone(),
             media: config.media.clone(),
@@ -201,20 +173,7 @@ impl App {
             link_mode: config.link_mode.unwrap_or(LinkMode::Best),
             exclude: config.effective_exclude(),
             expand_paths: false,
-            current_phase: None,
-            current_path: None,
-            latest_activity_message: None,
-            live_files_seen: None,
-            live_groups_found: None,
-            live_planned_actions: None,
-            live_applied_actions: None,
-            hash_progress_done: None,
-            hash_progress_total: None,
-            hash_bytes: None,
-            full_pass_started_at: None,
-            active_workers: BTreeMap::new(),
-            job_started_at: None,
-            last_run_duration: None,
+            run: RunState::default(),
             running_job: None,
             link_check: LinkCheck::Untested,
             link_check_rx: None,
@@ -247,15 +206,17 @@ impl App {
     }
 
     pub fn files_considered(&self) -> usize {
-        self.live_files_seen
-            .or_else(|| self.report.as_ref().map(|r| r.files_considered))
+        self.run
+            .live_files_seen
+            .or_else(|| self.run.report.as_ref().map(|r| r.files_considered))
             .unwrap_or(0)
     }
 
     pub fn planned_actions(&self) -> usize {
-        self.live_planned_actions
+        self.run
+            .live_planned_actions
             .or_else(|| {
-                self.report.as_ref().map(|r| {
+                self.run.report.as_ref().map(|r| {
                     if r.mode == Mode::Link {
                         r.entries.iter().filter(|entry| entry.is_planned()).count()
                     } else {
@@ -269,17 +230,19 @@ impl App {
     /// What link runs freed: a download's bytes come back only once its
     /// last path is replaced, which the run counts as it links.
     pub fn saved_bytes(&self) -> u64 {
-        self.report
+        self.run
+            .report
             .as_ref()
             .filter(|report| report.mode == Mode::Link)
             .map_or(0, |report| report.freed_bytes)
     }
 
     pub fn potential_saved_bytes(&self) -> u64 {
-        if self.report.is_none() && !self.live_entries.is_empty() {
-            return self.live_entries.iter().map(|entry| entry.size).sum();
+        if self.run.report.is_none() && !self.run.live_entries.is_empty() {
+            return self.run.live_entries.iter().map(|entry| entry.size).sum();
         }
-        self.report
+        self.run
+            .report
             .as_ref()
             .map(|report| {
                 if report.mode == Mode::Link {
@@ -339,7 +302,8 @@ impl App {
 
     /// The planned rows of the last finished run, as shown: what `L` links.
     pub fn reviewed_planned_pairs(&self) -> Vec<PlannedPair> {
-        self.report
+        self.run
+            .report
             .iter()
             .flat_map(|report| &report.entries)
             .filter(|entry| entry.is_planned())
@@ -369,10 +333,10 @@ impl App {
     }
 
     pub fn rows(&self) -> &[LinkReportEntry] {
-        if let Some(report) = &self.report {
+        if let Some(report) = &self.run.report {
             return report.entries.as_slice();
         }
-        self.live_entries.as_slice()
+        self.run.live_entries.as_slice()
     }
 
     pub fn log_lines(&self) -> Vec<String> {
@@ -383,10 +347,10 @@ impl App {
     /// `12.3 GiB of 40.0 GiB  |  150.0 MiB/s  |  ETA 03:05`. Speed and time
     /// left wait for a second of reading.
     pub fn full_pass_progress(&self) -> Option<String> {
-        let (done, total) = self.hash_bytes?;
+        let (done, total) = self.run.hash_bytes?;
         use crate::human::format_size;
         let mut label = format!("{} of {}", format_size(done), format_size(total));
-        let elapsed = self.full_pass_started_at?.elapsed();
+        let elapsed = self.run.full_pass_started_at?.elapsed();
         if elapsed >= Duration::from_secs(1) && done > 0 {
             let rate = done as f64 / elapsed.as_secs_f64();
             let left = Duration::from_secs_f64(total.saturating_sub(done) as f64 / rate);
@@ -409,32 +373,34 @@ impl App {
     pub fn activity_message(&self) -> String {
         if self.running_job.is_some()
             && matches!(
-                self.current_phase,
+                self.run.current_phase,
                 Some(Phase::HashingSample | Phase::HashingFull | Phase::Applying)
             )
         {
             return String::new();
         }
-        self.latest_activity_message
+        self.run
+            .latest_activity_message
             .clone()
             .unwrap_or_else(|| self.last_log_line())
     }
 
     pub fn current_path(&self) -> Option<&str> {
-        self.current_path.as_deref()
+        self.run.current_path.as_deref()
     }
 
     pub fn active_worker_paths(&self) -> Vec<(usize, &str)> {
-        self.active_workers
+        self.run
+            .active_workers
             .iter()
             .map(|(worker, path)| (*worker, path.as_str()))
             .collect()
     }
 
     pub fn elapsed_label(&self) -> String {
-        let duration = if let Some(started) = self.job_started_at {
+        let duration = if let Some(started) = self.run.job_started_at {
             started.elapsed()
-        } else if let Some(duration) = self.last_run_duration {
+        } else if let Some(duration) = self.run.last_run_duration {
             duration
         } else {
             Duration::ZERO
@@ -464,23 +430,23 @@ impl App {
 
     /// The running job's phase, as the event stream last named it.
     pub fn phase(&self) -> Option<Phase> {
-        self.current_phase
+        self.run.current_phase
     }
 
     /// How far the running job is, as done of total: bytes in the full
     /// pass, files while hashing, links while applying.
     pub fn run_progress(&self) -> Option<(u64, u64)> {
         self.running_job.as_ref()?;
-        match self.current_phase {
-            Some(Phase::HashingFull) if self.hash_bytes.is_some() => self.hash_bytes,
+        match self.run.current_phase {
+            Some(Phase::HashingFull) if self.run.hash_bytes.is_some() => self.run.hash_bytes,
             Some(Phase::HashingSample | Phase::HashingFull) => {
-                let done = self.hash_progress_done?;
-                let total = self.hash_progress_total?;
+                let done = self.run.hash_progress_done?;
+                let total = self.run.hash_progress_total?;
                 Some((done as u64, total as u64))
             }
             Some(Phase::Applying) => {
-                let applied = self.live_applied_actions?;
-                let planned = self.live_planned_actions?;
+                let applied = self.run.live_applied_actions?;
+                let planned = self.run.live_planned_actions?;
                 Some((applied as u64, planned as u64))
             }
             _ => None,
@@ -489,18 +455,19 @@ impl App {
 
     /// Files hashed, or matches verified, of those the phase will read.
     pub fn hash_progress(&self) -> Option<(usize, usize)> {
-        Some((self.hash_progress_done?, self.hash_progress_total?))
+        Some((self.run.hash_progress_done?, self.run.hash_progress_total?))
     }
 
     /// Whether a report is loaded, and from a link run.
     pub fn showing_link_report(&self) -> bool {
-        self.report
+        self.run
+            .report
             .as_ref()
             .is_some_and(|report| report.mode == Mode::Link)
     }
 
     pub fn has_report(&self) -> bool {
-        self.report.is_some()
+        self.run.report.is_some()
     }
 
     /// The running job was asked to stop and has not yet.
@@ -516,7 +483,7 @@ impl App {
 
     /// How long the last finished run took, if one finished this session.
     pub fn last_run_label(&self) -> Option<String> {
-        self.last_run_duration.map(format_duration)
+        self.run.last_run_duration.map(format_duration)
     }
 
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<()> {
@@ -718,9 +685,7 @@ impl App {
         if !self.paths_are_set_or_ask() {
             return;
         }
-        self.reset_live_run_state();
-        self.report = None;
-        self.live_entries.clear();
+        self.run.start(&JobKind::Scan);
         self.selected_row = 0;
         self.push_log("Running scan...".to_string());
         let strict = self.strict;
@@ -729,9 +694,6 @@ impl App {
         thread::spawn(move || {
             let _ = actions::run_scan(strict, tx, cancel_rx);
         });
-        self.job_started_at = Some(Instant::now());
-        self.current_phase = Some(Phase::Collecting);
-        self.latest_activity_message = Some("Collecting candidate files".to_string());
         self.running_job = Some(RunningJob::new(JobKind::Scan, rx, cancel_tx));
     }
 
@@ -767,9 +729,7 @@ impl App {
             self.push_log("Run a scan first: nothing reviewed is planned.".to_string());
             return;
         };
-        self.reset_live_run_state();
-        self.report_before_link = self.report.take();
-        self.live_entries.clear();
+        self.run.start(&JobKind::LinkAll);
         self.selected_row = 0;
         self.push_log("Running link...".to_string());
         let strict = self.strict;
@@ -778,9 +738,6 @@ impl App {
         thread::spawn(move || {
             let _ = actions::run_link_pairs(strict, &downloads, &pairs, tx, cancel_rx);
         });
-        self.job_started_at = Some(Instant::now());
-        self.current_phase = Some(Phase::Planning);
-        self.latest_activity_message = Some("Preparing link run".to_string());
         self.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, cancel_tx));
     }
 
@@ -803,18 +760,8 @@ impl App {
             return Ok(());
         };
         let source = pair.source.clone();
-
-        self.live_entries.clear();
-        self.live_planned_actions = None;
-        self.live_applied_actions = None;
-        self.current_phase = Some(Phase::Planning);
-        self.latest_activity_message = Some("Preparing selected link".to_string());
-        self.current_path = Some(source.clone());
-        self.hash_progress_done = None;
-        self.hash_progress_total = None;
-        self.active_workers.clear();
-        self.job_started_at = Some(Instant::now());
-        self.last_run_duration = None;
+        let kind = JobKind::LinkSelected(source.clone());
+        self.run.start(&kind);
         self.push_log(format!("Running selected link for {source}"));
 
         let strict = self.strict;
@@ -823,11 +770,7 @@ impl App {
         thread::spawn(move || {
             let _ = actions::run_link_pairs(strict, &downloads, &[pair], tx, cancel_rx);
         });
-        self.running_job = Some(RunningJob::new(
-            JobKind::LinkSelected(source),
-            rx,
-            cancel_tx,
-        ));
+        self.running_job = Some(RunningJob::new(kind, rx, cancel_tx));
         Ok(())
     }
 
@@ -1037,7 +980,7 @@ impl App {
                 "Cancelling link; it stops before the next file."
             }
         };
-        self.latest_activity_message = Some(message.to_string());
+        self.run.latest_activity_message = Some(message.to_string());
         self.push_log(message.to_string());
     }
 
@@ -1093,270 +1036,33 @@ impl App {
         }
     }
 
-    /// A link run that ended without a report of its own (it failed, could not
-    /// start, or was cancelled before changing anything) gives the reviewed
-    /// rows back, so they can be linked again without a new scan.
-    fn restore_reviewed_rows(&mut self) {
-        if let Some(previous) = self.report_before_link.take()
-            && self.report.is_none()
-        {
-            self.report = Some(previous);
-            self.push_log(
-                "The rows shown are from before the link run; scan again to see what it changed."
-                    .to_string(),
-            );
+    /// Take what an event, or a failure, changed beyond the run's state.
+    /// Returns whether the run ended.
+    fn take_step(&mut self, step: Step) -> bool {
+        for line in step.logs {
+            self.push_log(line);
         }
+        if let Some(row) = step.select {
+            self.selected_row = row;
+        }
+        if step.finished {
+            self.running_job = None;
+        }
+        step.finished
     }
 
     fn fail_running_job(&mut self, kind: JobKind, message: String) {
-        self.running_job = None;
-        self.live_entries.clear();
-        self.live_planned_actions = None;
-        self.live_applied_actions = None;
-        self.finish_live_run();
-        let label = match kind {
-            JobKind::Scan => "Scan",
-            JobKind::LinkAll | JobKind::LinkSelected(_) => "Link",
-        };
-        let line = format!("{label} failed: {message}");
-        self.latest_activity_message = Some(line.clone());
-        self.push_log(line);
-        self.restore_reviewed_rows();
+        let step = self.run.fail(kind, message);
+        self.take_step(step);
     }
 
     fn apply_tui_event(&mut self, kind: JobKind, event: TuiEvent) -> bool {
-        match event {
-            TuiEvent::Phase { phase } => {
-                self.hash_bytes = None;
-                self.full_pass_started_at = (phase == Phase::HashingFull).then(Instant::now);
-                self.current_phase = Some(phase);
-                self.current_path = None;
-                self.active_workers.clear();
-                if !phase.is_hashing() {
-                    self.hash_progress_done = None;
-                    self.hash_progress_total = None;
-                }
-                let message = format!("Phase: {}", display_phase(phase));
-                self.latest_activity_message = Some(message.clone());
-                self.push_log(message);
-                false
-            }
-            TuiEvent::WorkerActivity {
-                phase,
-                worker,
-                path,
-            } => {
-                self.current_phase = Some(phase);
-                self.current_path = None;
-                match path {
-                    Some(path) => {
-                        self.active_workers.insert(worker, path);
-                    }
-                    None => {
-                        self.active_workers.remove(&worker);
-                    }
-                }
-                false
-            }
-            TuiEvent::File { phase, path } => {
-                if let Some(phase) = phase {
-                    self.current_phase = Some(phase);
-                }
-                // The current-file line shows it; the activity line keeps
-                // what the phase is doing, so it never names a file the run
-                // has long moved past.
-                self.current_path = Some(path);
-                false
-            }
-            TuiEvent::Count(Counts {
-                files_seen,
-                groups_found,
-                planned_actions,
-                applied_actions,
-                hash_progress_done,
-                hash_progress_total,
-            }) => {
-                // Progress goes to the activity line and the counters, never
-                // the Run Log: a line per step would push out what a person
-                // needs to read there, such as why a run failed.
-                if let Some(files_seen) = files_seen {
-                    self.live_files_seen = Some(files_seen);
-                }
-                if let Some(groups_found) = groups_found {
-                    self.live_groups_found = Some(groups_found);
-                }
-                if let Some(planned_actions) = planned_actions {
-                    self.live_planned_actions = Some(planned_actions);
-                }
-                if let Some(applied_actions) = applied_actions {
-                    self.live_applied_actions = Some(applied_actions);
-                }
-                if let Some(done) = hash_progress_done {
-                    self.hash_progress_done = Some(done);
-                }
-                if let Some(total) = hash_progress_total {
-                    self.hash_progress_total = Some(total);
-                }
-                if self.current_phase.is_some_and(Phase::is_hashing)
-                    && let (Some(done), Some(total)) =
-                        (self.hash_progress_done, self.hash_progress_total)
-                {
-                    self.latest_activity_message = Some(match self.current_phase {
-                        Some(Phase::HashingFull) => {
-                            format!("Verifying duplicate files: {done} / {total}")
-                        }
-                        _ => format!("Hashing files: {done} / {total}"),
-                    });
-                }
-                false
-            }
-            TuiEvent::PlannedEntries { entries } => {
-                if !entries.is_empty() {
-                    self.live_entries.extend(entries);
-                    // Groups finish in any order; keep the rows in the order
-                    // the finished report lists them, so they do not jump.
-                    // That order compares paths folder by folder, which a
-                    // string compare does not: `Show.S01/` sorts after
-                    // `Show/` as a path and before it as a string.
-                    self.live_entries
-                        .sort_by_cached_key(LinkReportEntry::row_order);
-                    self.live_planned_actions = Some(self.live_entries.len());
-                    self.latest_activity_message = Some(format!(
-                        "Planning actions: {} queued",
-                        self.live_entries.len()
-                    ));
-                }
-                false
-            }
-            TuiEvent::Log { message } => {
-                self.latest_activity_message = Some(message.clone());
-                self.push_log(message);
-                false
-            }
-            TuiEvent::Cancelled => {
-                self.running_job = None;
-                self.live_entries.clear();
-                self.live_planned_actions = None;
-                self.live_applied_actions = None;
-                self.finish_live_run();
-                let line = match kind {
-                    JobKind::Scan => "Scan cancelled. Finished hashes are cached.".to_string(),
-                    JobKind::LinkAll | JobKind::LinkSelected(_) => {
-                        "Link cancelled before any file was changed.".to_string()
-                    }
-                };
-                self.latest_activity_message = Some(line.clone());
-                self.push_log(line);
-                self.restore_reviewed_rows();
-                true
-            }
-            TuiEvent::Error { message, report } => {
-                self.running_job = None;
-                self.finish_live_run();
-                // A link --strict stopped partway reports which pairs it
-                // linked before the failure: show that, not the plan.
-                if let Some(report) = report {
-                    self.active_workers.clear();
-                    self.hash_progress_done = None;
-                    self.hash_progress_total = None;
-                    self.merge_report(kind.clone(), *report);
-                    self.report_before_link = None;
-                    self.live_entries.clear();
-                }
-                let label = match kind {
-                    JobKind::Scan => "Scan",
-                    JobKind::LinkAll | JobKind::LinkSelected(_) => "Link",
-                };
-                let line = format!("{label} failed: {message}");
-                self.latest_activity_message = Some(line.clone());
-                self.push_log(line);
-                self.restore_reviewed_rows();
-                true
-            }
-            TuiEvent::HashBytes { done, total } => {
-                self.hash_bytes = Some((done, total));
-                false
-            }
-            // The runner checks it before passing anything on.
-            TuiEvent::Hello { .. } => false,
-            TuiEvent::Done { report } => {
-                let report = *report;
-                let planned = report.planned_actions;
-                let applied = report.applied_actions;
-                let link_failures = report.warnings.link_errors;
-                let unreadable = report.warnings.total() - link_failures;
-                let cancelled = report.outcome == Outcome::Cancelled;
-                let symlinked = report
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.is_applied_symlink())
-                    .count();
-                self.current_path = None;
-                self.active_workers.clear();
-                self.hash_progress_done = None;
-                self.hash_progress_total = None;
-                self.merge_report(kind.clone(), report);
-                self.selected_row = match &kind {
-                    JobKind::LinkSelected(source) => self.next_planned_after(source),
-                    _ => 0,
-                };
-                self.report_before_link = None;
-                self.live_entries.clear();
-                self.running_job = None;
-                self.finish_live_run();
-                let line = match kind {
-                    JobKind::Scan => format!("Scan finished. Planned actions: {planned}"),
-                    _ if cancelled => format!(
-                        "Link cancelled after {applied} of {planned} action(s); the rest stay planned."
-                    ),
-                    JobKind::LinkAll => format!("Link finished. Applied actions: {applied}"),
-                    JobKind::LinkSelected(_) => {
-                        format!("Selected link finished. Applied actions: {applied}")
-                    }
-                };
-                self.latest_activity_message = Some(line.clone());
-                self.push_log(line);
-                if matches!(kind, JobKind::LinkAll | JobKind::LinkSelected(_)) && symlinked > 0 {
-                    self.push_log(format!(
-                        "{symlinked} of them as symlinks: each breaks if its library file is upgraded, renamed or deleted. See fallback_reason."
-                    ));
-                }
-                if unreadable > 0 {
-                    self.push_log(format!(
-                        "{unreadable} file(s) or folder(s) could not be read; the log names each. Make them readable, or leave a folder out with `dejaview config set-exclude`."
-                    ));
-                }
-                if matches!(kind, JobKind::LinkAll | JobKind::LinkSelected(_)) && link_failures > 0
-                {
-                    self.push_log(format!(
-                        "Link run had {link_failures} failure(s). Review failed rows for details."
-                    ));
-                }
-                true
-            }
-        }
-    }
-
-    /// The row to select after a single-row link of `source`: the next
-    /// planned row after it, else the first planned row, else where it was,
-    /// so linking a list row by row needs no moving back.
-    fn next_planned_after(&self, source: &str) -> usize {
-        let rows = self.rows();
-        let linked = rows
-            .iter()
-            .position(|row| row.source == source)
-            .unwrap_or(self.selected_row);
-        let planned = |row: &&LinkReportEntry| row.is_planned();
-        rows.iter()
-            .enumerate()
-            .skip(linked + 1)
-            .find(|(_, row)| planned(row))
-            .or_else(|| rows.iter().enumerate().find(|(_, row)| planned(row)))
-            .map_or(linked.min(rows.len().saturating_sub(1)), |(index, _)| index)
+        let step = self.run.apply(kind, event, self.selected_row);
+        self.take_step(step)
     }
 
     fn save_report(&mut self) -> Result<()> {
-        let Some(report) = &self.report else {
+        let Some(report) = &self.run.report else {
             self.push_log("No report to save yet.".to_string());
             return Ok(());
         };
@@ -1373,7 +1079,7 @@ impl App {
     }
 
     fn open_json_overlay(&mut self) -> Result<()> {
-        let Some(report) = &self.report else {
+        let Some(report) = &self.run.report else {
             self.push_log("No report available to preview.".to_string());
             return Ok(());
         };
@@ -1390,132 +1096,26 @@ impl App {
         }
         self.logs.push_back(line);
     }
-
-    fn reset_live_run_state(&mut self) {
-        self.current_phase = None;
-        self.current_path = None;
-        self.latest_activity_message = None;
-        self.live_files_seen = None;
-        self.live_groups_found = None;
-        self.live_planned_actions = None;
-        self.live_applied_actions = None;
-        self.live_entries.clear();
-        self.hash_progress_done = None;
-        self.hash_progress_total = None;
-        self.hash_bytes = None;
-        self.full_pass_started_at = None;
-        self.active_workers.clear();
-        self.last_run_duration = None;
-        self.job_started_at = None;
-    }
-
-    fn finish_live_run(&mut self) {
-        if let Some(started) = self.job_started_at.take() {
-            self.last_run_duration = Some(started.elapsed());
-        }
-        self.current_phase = None;
-        self.current_path = None;
-        self.active_workers.clear();
-    }
-
-    fn merge_report(&mut self, kind: JobKind, report: RunReport) {
-        match kind {
-            JobKind::LinkSelected(_) => {
-                if let Some(existing) = &mut self.report {
-                    // A scan's report freed nothing; a link's adds up.
-                    let freed_before = if existing.mode == Mode::Link {
-                        existing.freed_bytes
-                    } else {
-                        0
-                    };
-                    for entry in &report.entries {
-                        if let Some(current) = existing
-                            .entries
-                            .iter_mut()
-                            .find(|current| current.same_pair(entry))
-                        {
-                            *current = entry.clone();
-                        } else {
-                            existing.entries.push(entry.clone());
-                        }
-                    }
-                    existing.mode = Mode::Link;
-                    existing.dry_run = false;
-                    existing.strict = report.strict;
-                    existing.files_considered =
-                        report.files_considered.max(existing.files_considered);
-                    existing.applied_actions = existing
-                        .entries
-                        .iter()
-                        .filter(|entry| entry.is_applied())
-                        .count();
-                    existing.planned_actions = existing
-                        .entries
-                        .iter()
-                        .filter(|entry| entry.is_planned())
-                        .count();
-                    existing.freed_bytes = freed_before + report.freed_bytes;
-                    existing.total_saved_bytes = existing.freed_bytes;
-                    existing.symlinked = existing
-                        .entries
-                        .iter()
-                        .filter(|entry| entry.is_applied_symlink())
-                        .count();
-                    existing.warnings.link_errors = existing
-                        .entries
-                        .iter()
-                        .filter(|entry| entry.is_failed())
-                        .count() as u64;
-                    self.live_files_seen = Some(existing.files_considered);
-                    self.live_planned_actions = Some(existing.planned_actions);
-                    self.live_applied_actions = Some(existing.applied_actions);
-                } else {
-                    self.live_files_seen = Some(report.files_considered);
-                    self.live_planned_actions = Some(report.planned_actions);
-                    self.live_applied_actions = Some(report.applied_actions);
-                    self.report = Some(report);
-                }
-            }
-            JobKind::Scan | JobKind::LinkAll => {
-                let mut report = report;
-                // A link of reviewed rows the cache vouches for walks
-                // nothing and considers only the rows' files; keep the count
-                // the scan showed, as a single-row link does.
-                // A link run sets the scan's report aside while it runs.
-                if matches!(kind, JobKind::LinkAll)
-                    && let Some(previous) =
-                        self.report.as_ref().or(self.report_before_link.as_ref())
-                {
-                    report.files_considered =
-                        report.files_considered.max(previous.files_considered);
-                }
-                self.live_files_seen = Some(report.files_considered);
-                self.live_planned_actions = Some(report.planned_actions);
-                self.live_applied_actions = Some(report.applied_actions);
-                self.report = Some(report);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 impl App {
     pub(crate) fn set_hash_activity_for_test(&mut self, phase: Phase, workers: &[(usize, &str)]) {
-        self.current_phase = Some(phase);
-        self.active_workers = workers
+        self.run.current_phase = Some(phase);
+        self.run.active_workers = workers
             .iter()
             .map(|(worker, path)| (*worker, (*path).to_string()))
             .collect();
     }
 
     pub(crate) fn set_hash_progress_for_test(&mut self, done: usize, total: usize) {
-        self.hash_progress_done = Some(done);
-        self.hash_progress_total = Some(total);
+        self.run.hash_progress_done = Some(done);
+        self.run.hash_progress_total = Some(total);
     }
 
     pub(crate) fn set_full_pass_for_test(&mut self, done: u64, total: u64, elapsed: Duration) {
-        self.hash_bytes = Some((done, total));
-        self.full_pass_started_at = Instant::now().checked_sub(elapsed);
+        self.run.hash_bytes = Some((done, total));
+        self.run.full_pass_started_at = std::time::Instant::now().checked_sub(elapsed);
     }
 
     pub(crate) fn set_running_scan_for_test(&mut self) -> Receiver<()> {
@@ -1529,17 +1129,17 @@ impl App {
     pub(crate) fn set_running_link_for_test(&mut self, applied: usize, planned: usize) {
         let (_tx, rx) = mpsc::channel();
         self.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, mpsc::channel().0));
-        self.current_phase = Some(Phase::Applying);
-        self.live_applied_actions = Some(applied);
-        self.live_planned_actions = Some(planned);
+        self.run.current_phase = Some(Phase::Applying);
+        self.run.live_applied_actions = Some(applied);
+        self.run.live_planned_actions = Some(planned);
     }
 
     pub(crate) fn set_last_run_for_test(&mut self, duration: Duration) {
-        self.last_run_duration = Some(duration);
+        self.run.last_run_duration = Some(duration);
     }
 
-    pub(crate) fn set_report_for_test(&mut self, report: RunReport) {
-        self.report = Some(report);
+    pub(crate) fn set_report_for_test(&mut self, report: super::model::RunReport) {
+        self.run.report = Some(report);
     }
 
     pub(crate) fn toggle_path_mode_for_test(&mut self) {
@@ -1566,21 +1166,12 @@ fn format_duration(duration: Duration) -> String {
     format!("{minutes:02}:{seconds:02}")
 }
 
-fn display_phase(phase: Phase) -> &'static str {
-    match phase {
-        Phase::Collecting => "COLLECTING FILES",
-        Phase::HashingSample => "HASHING FILES",
-        Phase::HashingFull => "VERIFYING DUPLICATES",
-        Phase::Planning => "PLANNING ACTIONS",
-        Phase::Applying => "APPLYING LINKS",
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::protocol::{EntryStatus, LinkMethod, WarningSummary};
+    use crate::protocol::{Counts, EntryStatus, LinkMethod, WarningSummary};
     use crate::test_common::TempDir;
     use anyhow::anyhow;
+    use std::time::Instant;
 
     use super::super::model::{RunReport, TuiEvent};
     use super::*;
@@ -1611,11 +1202,11 @@ mod tests {
     #[test]
     fn savings_split_is_truthful_for_scan_and_link_reports() {
         let mut app = App::new(&Config::default(), false);
-        app.report = Some(sample_report());
+        app.run.report = Some(sample_report());
         assert_eq!(app.saved_bytes(), 0);
         assert_eq!(app.potential_saved_bytes(), 1024);
 
-        app.report = Some(RunReport {
+        app.run.report = Some(RunReport {
             mode: Mode::Link,
             dry_run: false,
             strict: false,
@@ -1670,7 +1261,7 @@ mod tests {
             ..Config::default()
         };
         let mut app = App::new(&config, false);
-        app.report = Some(sample_report());
+        app.run.report = Some(sample_report());
 
         app.handle_main_key(KeyCode::Char('r'))
             .expect("key handling should not fail");
@@ -1754,7 +1345,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         app.running_job = Some(RunningJob::new(JobKind::Scan, rx, mpsc::channel().0));
-        app.job_started_at = Some(Instant::now());
+        app.run.job_started_at = Some(Instant::now());
 
         tx.send(Ok(TuiEvent::Phase {
             phase: Phase::HashingSample,
@@ -1899,7 +1490,7 @@ mod tests {
             row("/dl/c.mkv", EntryStatus::Planned),
             row("/dl/d.mkv", EntryStatus::Planned),
         ];
-        app.report = Some(scanned);
+        app.run.report = Some(scanned);
         app.selected_row = 2;
         let mut linked = sample_report();
         linked.mode = Mode::Link;
@@ -1942,7 +1533,7 @@ mod tests {
             row("/dl/a.mkv", EntryStatus::Planned),
             row("/dl/b.mkv", EntryStatus::Planned),
         ];
-        app.report_before_link = Some(scanned);
+        app.run.report_before_link = Some(scanned);
         let mut partial = sample_report();
         partial.mode = Mode::Link;
         partial.outcome = crate::protocol::Outcome::Failed;
@@ -1961,7 +1552,7 @@ mod tests {
 
         let statuses: Vec<_> = app.rows().iter().map(|row| row.status).collect();
         assert_eq!(statuses, [EntryStatus::Applied, EntryStatus::Failed]);
-        assert!(app.report_before_link.is_none());
+        assert!(app.run.report_before_link.is_none());
         assert!(
             app.activity_message()
                 .starts_with("Link failed: --strict stopped")
@@ -1985,7 +1576,7 @@ mod tests {
         }];
         // What start_link_job leaves behind: the reviewed report put aside
         // while the child runs.
-        app.report_before_link = Some(report);
+        app.run.report_before_link = Some(report);
         let (tx, rx) = mpsc::channel();
         app.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, mpsc::channel().0));
         tx.send(Err(anyhow!(
@@ -2045,7 +1636,7 @@ mod tests {
         let mut app = App::new(&config, false);
         let (tx, rx) = mpsc::channel();
         app.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, mpsc::channel().0));
-        app.latest_activity_message = Some("Preparing link run".to_string());
+        app.run.latest_activity_message = Some("Preparing link run".to_string());
         tx.send(Err(anyhow!(
             "another DejaView run holds the lock /downloads/.dejaview_lock"
         )))
@@ -2088,7 +1679,7 @@ mod tests {
         assert!(app.running_job.is_none());
         assert!(app.rows().is_empty());
         assert_eq!(app.planned_actions(), 0);
-        assert_eq!(app.live_applied_actions, None);
+        assert_eq!(app.run.live_applied_actions, None);
         assert!(
             app.logs
                 .iter()
@@ -2259,12 +1850,12 @@ mod tests {
     fn starting_run_clears_stale_report_rows() {
         let config = config_with_paths();
         let mut app = App::new(&config, false);
-        app.report = Some(sample_report());
+        app.run.report = Some(sample_report());
         app.selected_row = 1;
 
         app.start_scan_job();
 
-        assert!(app.report.is_none());
+        assert!(app.run.report.is_none());
         assert_eq!(app.selected_row, 0);
         assert!(app.running_job.is_some());
     }
@@ -2323,7 +1914,7 @@ mod tests {
     fn phase_change_clears_stale_current_path() {
         let config = Config::default();
         let mut app = App::new(&config, false);
-        app.current_path = Some("/downloads/old.mkv".to_string());
+        app.run.current_path = Some("/downloads/old.mkv".to_string());
 
         let cleared = app.apply_tui_event(
             JobKind::Scan,
@@ -2367,7 +1958,7 @@ mod tests {
         let mut app = App::new(&Config::default(), false);
         let (tx, rx) = mpsc::channel();
         app.running_job = Some(RunningJob::new(JobKind::Scan, rx, mpsc::channel().0));
-        app.live_entries.push(sample_entry_for_cancel());
+        app.run.live_entries.push(sample_entry_for_cancel());
         tx.send(Ok(TuiEvent::Cancelled)).expect("send cancelled");
 
         app.poll_running_job();
@@ -2455,7 +2046,7 @@ mod tests {
         assert!(app.logs.iter().any(|line| line.contains("scan")));
 
         // A finished scan with nothing planned is no better.
-        app.report = Some(sample_report());
+        app.run.report = Some(sample_report());
         app.handle_main_key(KeyCode::Char('L'))
             .expect("key handling should not fail");
         assert!(matches!(app.overlay, Overlay::None));
@@ -2467,7 +2058,7 @@ mod tests {
         let mut scanned = sample_report();
         scanned.files_considered = 7;
         // As starting a link run leaves it: the scan's report set aside.
-        app.report_before_link = Some(scanned);
+        app.run.report_before_link = Some(scanned);
         let mut linked = sample_report();
         linked.files_considered = 3;
 
@@ -2478,9 +2069,9 @@ mod tests {
             }
         ));
 
-        assert_eq!(app.live_files_seen, Some(7));
-        assert_eq!(app.report.as_ref().map(|r| r.files_considered), Some(7));
-        assert!(app.report_before_link.is_none());
+        assert_eq!(app.run.live_files_seen, Some(7));
+        assert_eq!(app.run.report.as_ref().map(|r| r.files_considered), Some(7));
+        assert!(app.run.report_before_link.is_none());
     }
 
     #[test]
@@ -2503,7 +2094,7 @@ mod tests {
             row("/downloads/b.mkv", EntryStatus::Applied),
             row("/downloads/c.mkv", EntryStatus::Planned),
         ];
-        app.report = Some(report);
+        app.run.report = Some(report);
 
         let pairs = app.reviewed_planned_pairs();
         assert_eq!(
@@ -2533,7 +2124,7 @@ mod tests {
             error: None,
             ..Default::default()
         }];
-        app.report = Some(report);
+        app.run.report = Some(report);
 
         app.handle_main_key(KeyCode::Char('L'))
             .expect("key handling should not fail");
@@ -2561,7 +2152,7 @@ mod tests {
             ..Default::default()
         }];
         report.planned_actions = 1;
-        app.report = Some(report);
+        app.run.report = Some(report);
 
         app.handle_main_key(KeyCode::Char('l'))
             .expect("key handling should not fail");
@@ -2577,7 +2168,7 @@ mod tests {
     fn selected_link_done_keeps_rows_and_updates_status() {
         let config = Config::default();
         let mut app = App::new(&config, false);
-        app.report = Some(RunReport {
+        app.run.report = Some(RunReport {
             mode: Mode::Scan,
             dry_run: true,
             strict: false,
