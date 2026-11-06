@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct LoggerState {
-    file: File,
+    sink: Box<dyn Write + Send>,
     run_id: String,
 }
 
@@ -32,11 +32,25 @@ fn timestamp_nanos() -> u128 {
         .as_nanos()
 }
 
-pub fn default_log_path() -> Result<PathBuf> {
-    let base = dirs::state_dir()
-        .or_else(dirs::config_dir)
-        .ok_or_else(|| anyhow!("Could not find state or config directory"))?;
-    Ok(base.join("dejaview").join("dejaview.log"))
+/// Where the log goes: `DEJAVIEW_LOG` when set (`-` for stderr), else
+/// `dejaview/dejaview.log` under the platform's state folder.
+enum LogTarget {
+    File(PathBuf),
+    Stderr,
+}
+
+fn log_target() -> Result<LogTarget> {
+    if let Some(value) = std::env::var_os("DEJAVIEW_LOG").filter(|value| !value.is_empty()) {
+        return Ok(if value == "-" {
+            LogTarget::Stderr
+        } else {
+            LogTarget::File(PathBuf::from(value))
+        });
+    }
+    let base = dirs::state_dir().or_else(dirs::config_dir).ok_or_else(|| {
+        anyhow!("cannot find a state or config folder (neither XDG_STATE_HOME nor HOME is set)")
+    })?;
+    Ok(LogTarget::File(base.join("dejaview").join("dejaview.log")))
 }
 
 /// Past this size the log moves to `dejaview.log.1` and a new one starts, so the
@@ -59,35 +73,63 @@ fn rotate_if_large(path: &Path, max_bytes: u64) -> Result<()> {
     }
 }
 
-fn init_at_path(path: &PathBuf, command: &str) -> Result<Session> {
+fn open_log_file(path: &Path) -> Result<File> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("log path has no parent: {}", path.display()))?;
     fs::create_dir_all(parent)?;
     // Best effort: a log that cannot rotate must not stop the command.
     let _ = rotate_if_large(path, MAX_LOG_BYTES);
+    Ok(OpenOptions::new().create(true).append(true).open(path)?)
+}
 
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+fn install(mut sink: Box<dyn Write + Send>, command: &str) -> Result<Session> {
     let run_id = format!("{}-{}", std::process::id(), timestamp_nanos());
     writeln!(
-        file,
+        sink,
         "ts={} level=INFO run={} op={} msg=\"run started\"",
         timestamp_secs(),
         run_id,
         command
     )?;
-    file.flush()?;
+    sink.flush()?;
 
     if let Ok(mut slot) = logger_slot().lock() {
-        *slot = Some(LoggerState { file, run_id });
+        *slot = Some(LoggerState { sink, run_id });
     }
     Ok(Session)
 }
 
-pub fn init(command: &str) -> Result<(Session, PathBuf)> {
-    let path = default_log_path()?;
-    let session = init_at_path(&path, command)?;
-    Ok((session, path))
+#[cfg(test)]
+fn init_at_path(path: &Path, command: &str) -> Result<Session> {
+    install(Box::new(open_log_file(path)?), command)
+}
+
+/// Start the log for this command. A log that cannot be opened never stops the
+/// command: the second value is then a warning for the person, naming the path
+/// and the way out, and the command runs without a log. Otherwise it says where
+/// the log goes.
+pub fn init(command: &str) -> (Session, Result<String, String>) {
+    let started = log_target()
+        .map_err(|err| format!("{err:#}"))
+        .and_then(|target| match target {
+            LogTarget::Stderr => install(Box::new(std::io::stderr()), command)
+                .map(|session| (session, "stderr".to_string()))
+                .map_err(|err| format!("cannot log to stderr ({err:#})")),
+            LogTarget::File(path) => open_log_file(&path)
+                .and_then(|file| install(Box::new(file), command))
+                .map(|session| (session, path.display().to_string()))
+                .map_err(|err| format!("cannot write the log at {} ({err:#})", path.display())),
+        });
+    match started {
+        Ok((session, place)) => (session, Ok(place)),
+        Err(problem) => (
+            Session,
+            Err(format!(
+                "{problem}; running without a log. Set DEJAVIEW_LOG to a writable file, or to - for stderr"
+            )),
+        ),
+    }
 }
 
 fn write_line(level: &str, op: &str, message: &str) {
@@ -96,7 +138,7 @@ fn write_line(level: &str, op: &str, message: &str) {
         && let Some(state) = slot.as_mut()
     {
         let _ = writeln!(
-            state.file,
+            state.sink,
             "ts={} level={} run={} op={} msg=\"{}\"",
             timestamp_secs(),
             level,
@@ -104,7 +146,7 @@ fn write_line(level: &str, op: &str, message: &str) {
             op,
             escaped
         );
-        let _ = state.file.flush();
+        let _ = state.sink.flush();
     }
 }
 
@@ -124,12 +166,12 @@ pub fn shutdown() {
     if let Ok(mut slot) = logger_slot().lock() {
         if let Some(state) = slot.as_mut() {
             let _ = writeln!(
-                state.file,
+                state.sink,
                 "ts={} level=INFO run={} op=shutdown msg=\"run finished\"",
                 timestamp_secs(),
                 state.run_id
             );
-            let _ = state.file.flush();
+            let _ = state.sink.flush();
         }
         *slot = None;
     }
@@ -163,7 +205,10 @@ pub fn write_test_log(path: &Path, command: &str, message: &str) -> Result<Strin
     let file = OpenOptions::new().create(true).append(true).open(path)?;
     let run_id = "test-run".to_string();
     if let Ok(mut slot) = logger_slot().lock() {
-        *slot = Some(LoggerState { file, run_id });
+        *slot = Some(LoggerState {
+            sink: Box::new(file),
+            run_id,
+        });
     }
     info(command, message);
     shutdown();

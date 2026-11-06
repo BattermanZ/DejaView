@@ -31,9 +31,18 @@ impl Config {
     }
 }
 
+/// The config file: `DEJAVIEW_CONFIG` when set, else `dejaview/config.json`
+/// under the platform's config folder. A container run as a user with no home
+/// has no config folder, so the variable is the way to point at one.
 pub fn config_path() -> Result<PathBuf> {
-    let config_dir =
-        dirs::config_dir().ok_or_else(|| anyhow!("Could not find config directory"))?;
+    if let Some(path) = std::env::var_os("DEJAVIEW_CONFIG").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    let config_dir = dirs::config_dir().ok_or_else(|| {
+        anyhow!(
+            "cannot find a config folder: neither XDG_CONFIG_HOME nor HOME is set and this user has no home folder; set DEJAVIEW_CONFIG to the config file's path"
+        )
+    })?;
     Ok(config_dir.join("dejaview").join("config.json"))
 }
 

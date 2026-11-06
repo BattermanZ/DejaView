@@ -9,6 +9,7 @@
 
 ### Added
 
+- `DEJAVIEW_CONFIG` sets the config file's path and `DEJAVIEW_LOG` the log's, or `-` for stderr, for containers and services run as a user with no home folder.
 - Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder: a run that finds another one going changes nothing and exits with code 3. Before, two link runs failed each other's pairs and the last one overwrote the other's report and cache.
 - `dejaview config validate` tries one real hardlink from the library into downloads and says whether link runs will make hardlinks, and if not, why: different filesystems or mounts, or ownership and `fs.protected_hardlinks`.
 - Scans and links list symlinks in downloads that point into the library and no longer resolve, on stderr and in the report's `dangling_symlinks`.
@@ -21,6 +22,7 @@
 
 ### Fixed
 
+- A log that cannot be written no longer stops every command: DejaView warns once, naming the path, and runs without it. Before, an unwritable state folder failed even `config show`, with an error that named no path.
 - A run whose downloads folder reaches the library through a bind mount, or the reverse, stops before changing anything, and `config validate` reports it. Before, only paths were compared, so a library mounted inside downloads was walked as downloads and its files were rewritten.
 - A download already hardlinked to one library copy is left alone when the library holds a second identical copy. Before, it was relinked to the copy whose path sorted first, which broke the hardlink Sonarr or Radarr made and freed nothing.
 - A download that is a library file seen through a second mount (a bind mount, or a mergerfs branch while media points at the pool) is left alone, and the run warns and counts it in the report's `skipped_as_library_file`. Before, such a file could be replaced by a link to itself or to another copy, destroying the library's only copy.

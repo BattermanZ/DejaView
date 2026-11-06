@@ -1063,3 +1063,88 @@ fn a_second_run_exits_3_while_another_holds_the_lock() {
     );
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+fn run_cmd_env(root: &Path, args: &[&str], env: &[(&str, &Path)]) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dejaview"));
+    cmd.args(args)
+        .env("XDG_CONFIG_HOME", root.join("xdg"))
+        .env("HOME", root.join("home"))
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("DEJAVIEW_CONFIG")
+        .env_remove("DEJAVIEW_LOG");
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.output().expect("run command")
+}
+
+#[test]
+fn an_unwritable_log_location_warns_and_the_command_still_runs() {
+    let root = unique_temp_dir("unwritable_log");
+    fs::create_dir_all(&root).expect("create root");
+    // A state folder under a regular file cannot be created, even by root.
+    let blocker = root.join("not-a-dir");
+    fs::write(&blocker, b"file").expect("write blocker");
+    let state = blocker.join("state");
+
+    let out = run_cmd_env(&root, &["config", "show"], &[("XDG_STATE_HOME", &state)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr={stderr}");
+    assert!(
+        stderr.contains(&state.display().to_string()),
+        "the warning names the log path: {stderr}"
+    );
+    assert!(stderr.contains("DEJAVIEW_LOG"), "and the way out: {stderr}");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn dejaview_config_and_dejaview_log_choose_the_files() {
+    let root = unique_temp_dir("env_paths");
+    let downloads = root.join("downloads");
+    fs::create_dir_all(&downloads).expect("create downloads");
+    let config = root.join("elsewhere").join("dejaview.json");
+    let log = root.join("logs").join("run.log");
+
+    let out = run_cmd_env(
+        &root,
+        &["config", "set-downloads", downloads.to_str().expect("str")],
+        &[("DEJAVIEW_CONFIG", &config), ("DEJAVIEW_LOG", &log)],
+    );
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let saved = fs::read_to_string(&config).expect("config written at DEJAVIEW_CONFIG");
+    assert!(saved.contains("downloads"), "{saved}");
+    assert!(
+        !root
+            .join("xdg")
+            .join("dejaview")
+            .join("config.json")
+            .exists(),
+        "the XDG config is left alone"
+    );
+    let logged = fs::read_to_string(&log).expect("log written at DEJAVIEW_LOG");
+    assert!(logged.contains("run started"), "{logged}");
+
+    let out = run_cmd_env(
+        &root,
+        &["config", "show"],
+        &[
+            ("DEJAVIEW_CONFIG", &config),
+            ("DEJAVIEW_LOG", Path::new("-")),
+        ],
+    );
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(downloads.to_str().expect("str")),
+        "config show reads DEJAVIEW_CONFIG"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("run started"),
+        "DEJAVIEW_LOG=- logs to stderr"
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}

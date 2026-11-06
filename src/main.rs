@@ -194,12 +194,12 @@ fn main() -> ExitCode {
 fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     let command_name = command_name(&cli.command);
-    let (_log_session, log_path) = logger::init(command_name)?;
+    let (_log_session, log_place) = logger::init(command_name);
+    match &log_place {
+        Ok(place) => logger::info("main", format!("logger initialized at {place}")),
+        Err(warning) => eprintln!("{} {warning}", "⚠".yellow()),
+    }
     let mut config = load_config()?;
-    logger::info(
-        "main",
-        format!("logger initialized at {}", log_path.display()),
-    );
 
     if let Some(threads) = config.threads {
         rayon::ThreadPoolBuilder::new()

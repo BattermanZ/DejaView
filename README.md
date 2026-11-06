@@ -161,6 +161,15 @@ Linking a single row lists both folders again to re-check that row, but only has
 
 The configuration lives in `~/.config/dejaview/config.json` (under `$XDG_CONFIG_HOME` when that is set). Change it with the `config` commands rather than by hand.
 
+Two environment variables move DejaView's own files, for a container or a service run as a user with no home folder:
+
+| Variable | Effect |
+|---|---|
+| `DEJAVIEW_CONFIG` | The config file's path, in place of the one above. |
+| `DEJAVIEW_LOG` | The log file's path, or `-` to write the log to stderr. |
+
+If the log cannot be written, DejaView warns once, naming the path, and runs without a log.
+
 | Setting | Default | Purpose |
 |---|---|---|
 | `downloads` | unset | Folder whose duplicates get replaced. Must be writable. |
@@ -178,7 +187,7 @@ The configuration lives in `~/.config/dejaview/config.json` (under `$XDG_CONFIG_
 | `<downloads>/.dejaview_link_report.json` | Every link run without `--report`. |
 | `<downloads>/.dejaview_tui_report.json` | When you press `R` in the dashboard. |
 | `<downloads>/.dejaview_lock` | Every scan, link and `cache cleanup-temp`, which lock it while they run. It stays, empty; deleting it between runs is harmless. |
-| `~/.local/state/dejaview/dejaview.log` | Every command (under `$XDG_STATE_HOME` when set). Once it passes 5 MiB it moves to `dejaview.log.1`, replacing the previous one, so the two together stay near 10 MiB. |
+| `~/.local/state/dejaview/dejaview.log` | Every command (under `$XDG_STATE_HOME` when set, or at `$DEJAVIEW_LOG`). Once it passes 5 MiB it moves to `dejaview.log.1`, replacing the previous one, so the two together stay near 10 MiB. |
 
 Files whose name starts with `.dejaview_` are never treated as duplicates.
 
