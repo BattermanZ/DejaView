@@ -128,11 +128,23 @@ impl CacheKeys {
 }
 
 /// Drop entries for paths this run did not see, so the cache follows the trees
-/// instead of growing with every file that ever passed through them. Returns how
-/// many entries were dropped.
-pub(super) fn prune_cache(cache: &mut Cache, seen: &HashSet<String>) -> usize {
+/// instead of growing with every file that ever passed through them. An entry
+/// for a path the walk could not read, or under a folder it could not, is
+/// kept: the file may well still be there. Returns how many entries were
+/// dropped.
+pub(super) fn prune_cache(
+    cache: &mut Cache,
+    seen: &HashSet<String>,
+    unreadable: &[String],
+) -> usize {
+    let under = |key: &str, path: &str| {
+        key == path
+            || key
+                .strip_prefix(path)
+                .is_some_and(|rest| path.ends_with('/') || rest.starts_with('/'))
+    };
     let before = cache.len();
-    cache.retain(|path, _| seen.contains(path));
+    cache.retain(|key, _| seen.contains(key) || unreadable.iter().any(|path| under(key, path)));
     before - cache.len()
 }
 

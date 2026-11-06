@@ -1236,6 +1236,7 @@ impl App {
                 let planned = report.planned_actions;
                 let applied = report.applied_actions;
                 let link_failures = report.warnings.link_errors;
+                let unreadable = report.warning_total() - link_failures;
                 let cancelled = report.outcome == "cancelled";
                 let symlinked = report
                     .entries
@@ -1270,6 +1271,11 @@ impl App {
                 if matches!(kind, JobKind::LinkAll | JobKind::LinkSelected(_)) && symlinked > 0 {
                     self.push_log(format!(
                         "{symlinked} of them as symlinks: each breaks if its library file is upgraded, renamed or deleted. See fallback_reason."
+                    ));
+                }
+                if unreadable > 0 {
+                    self.push_log(format!(
+                        "{unreadable} file(s) or folder(s) could not be read; the log names each. Make them readable, or leave a folder out with `dejaview config set-exclude`."
                     ));
                 }
                 if matches!(kind, JobKind::LinkAll | JobKind::LinkSelected(_)) && link_failures > 0

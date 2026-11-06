@@ -141,6 +141,10 @@ pub(super) struct RunMetrics {
     pub(super) skipped_as_library_file: u64,
     /// Symlinks in downloads that point into the library and no longer resolve.
     pub(super) dangling_symlinks: Vec<PathBuf>,
+    /// Paths the walk could not read, each with whether it is in downloads:
+    /// a folder, or a file whose metadata failed. The cache keeps entries
+    /// under them, which this run could not see.
+    pub(super) unreadable: Vec<(PathBuf, bool)>,
 }
 
 #[derive(Clone, Debug)]

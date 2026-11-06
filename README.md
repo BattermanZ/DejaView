@@ -223,7 +223,7 @@ If the log cannot be written, DejaView warns once, naming the path, and runs wit
 
 | File | When |
 |---|---|
-| `<downloads>/.dejaview_cache.json` | Every scan and link that learns a hash or drops an entry. Each entry is keyed by its folder (`downloads` or `media`) and its path below it, so the same share mounted at another path, as in a Docker container, uses the same entries. Entries for files that no longer exist are dropped after each complete run. |
+| `<downloads>/.dejaview_cache.json` | Every scan and link that learns a hash or drops an entry. Each entry is keyed by its folder (`downloads` or `media`) and its path below it, so the same share mounted at another path, as in a Docker container, uses the same entries. Entries for files that no longer exist are dropped after each run that finishes hashing, except under a folder the run could not read. |
 | `<downloads>/.dejaview_link_report.json` | Every link run without `--report` that planned something. |
 | `<downloads>/.dejaview_tui_report.json` | When you press `R` in the dashboard. |
 | `<downloads>/.dejaview_lock` | Every scan, link and `cache cleanup-temp`, which lock it while they run. It stays, empty; deleting it between runs is harmless. |

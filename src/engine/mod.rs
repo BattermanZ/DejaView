@@ -685,8 +685,16 @@ fn plan_by_walking(
         )
     });
     let mut pruned = 0;
-    if hash_result.is_ok() && warnings.walk_errors == 0 && warnings.metadata_errors == 0 {
-        pruned = prune_cache(&mut cache, &seen_paths);
+    if hash_result.is_ok() {
+        // A folder that could not be read keeps its entries; the rest of
+        // the cache still follows the trees, so one unreadable folder (a
+        // NAS's recycle bin) does not stop pruning for good.
+        let unreadable: Vec<String> = metrics
+            .unreadable
+            .iter()
+            .map(|(path, in_downloads)| keys.key(path, *in_downloads))
+            .collect();
+        pruned = prune_cache(&mut cache, &seen_paths, &unreadable);
         if pruned > 0 {
             logger::info(
                 "cache",
@@ -696,7 +704,7 @@ fn plan_by_walking(
     } else {
         logger::info(
             "cache",
-            "walk was incomplete; keeping entries for paths not seen this run",
+            "hashing stopped early; keeping entries for paths not seen this run",
         );
     }
     // Hashes finished before a cancel or a strict failure are valid: keep

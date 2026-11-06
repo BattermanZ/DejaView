@@ -1439,6 +1439,100 @@ fn run_scan_prunes_cache_entries_for_removed_files() {
 }
 
 #[test]
+fn prune_cache_keeps_entries_under_what_the_walk_could_not_read() {
+    let entry = CacheEntry {
+        size: 1,
+        mtime_ns: 0,
+        ctime_ns: 0,
+        dev: 1,
+        inode: 1,
+        hash: Some("h".into()),
+        sample: None,
+    };
+    let mut cache: Cache = [
+        "media/#recycle/old.mkv",
+        "media/#recycle-not/a.mkv",
+        "media/locked.mkv",
+        "media/gone.mkv",
+        "downloads/x/a.mkv",
+    ]
+    .into_iter()
+    .map(|key| (key.to_string(), entry.clone()))
+    .collect();
+    let seen: std::collections::HashSet<String> =
+        ["downloads/x/a.mkv".to_string()].into_iter().collect();
+    let unreadable = ["media/#recycle".to_string(), "media/locked.mkv".to_string()];
+
+    let pruned = super::cache::prune_cache(&mut cache, &seen, &unreadable);
+
+    let mut kept: Vec<_> = cache.keys().cloned().collect();
+    kept.sort();
+    assert_eq!(
+        kept,
+        [
+            "downloads/x/a.mkv",
+            "media/#recycle/old.mkv",
+            "media/locked.mkv"
+        ]
+    );
+    assert_eq!(pruned, 2, "a sibling that merely shares a prefix is pruned");
+
+    // A root that could not be read keeps everything under it.
+    let mut cache: Cache = [("media/a.mkv".to_string(), entry)].into_iter().collect();
+    super::cache::prune_cache(&mut cache, &Default::default(), &["media/".to_string()]);
+    assert_eq!(cache.len(), 1);
+}
+
+#[test]
+fn a_folder_the_walk_cannot_read_keeps_its_entries_and_the_rest_is_pruned() {
+    if running_as_root() {
+        return;
+    }
+    let root = unique_temp_dir("prune_unreadable");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let locked = media.join("locked");
+    write_file(&downloads.join("kept.mkv"), b"kept-content");
+    write_file(&locked.join("kept.mkv"), b"kept-content");
+    write_file(&downloads.join("gone.mkv"), b"gone-content");
+    write_file(&media.join("gone.mkv"), b"gone-content");
+    let config = make_config(&downloads, &media, 0);
+    run_scan(&config, true, false, None);
+    let cache_file = downloads.join(".dejaview_cache.json");
+    assert!(load_cache(&cache_file).contains_key("media/locked/kept.mkv"));
+
+    fs::remove_file(media.join("gone.mkv")).expect("remove library file");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("lock folder");
+    let result = run_scan_with_options(
+        &config,
+        ScanRunOptions {
+            dry_run: true,
+            strict: false,
+            report_path: None,
+            json_output: false,
+            quiet: false,
+            show_progress: false,
+            require_confirm: false,
+            tui_events: false,
+            link_mode: LinkMode::Best,
+            only_sources: &[],
+            only_pairs: &[],
+            cancel: CancelToken::default(),
+        },
+    );
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("unlock folder");
+
+    assert_eq!(result.expect("the scan finishes"), RunEnd::WithFailures);
+    let cache = load_cache(&cache_file);
+    assert!(
+        cache.contains_key("media/locked/kept.mkv"),
+        "kept under the folder that could not be read"
+    );
+    assert!(!cache.contains_key("media/gone.mkv"), "pruned elsewhere");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
 fn prune_cache_keeps_only_seen_paths() {
     let mut cache: Cache = Cache::new();
     for path in ["/dl/a", "/dl/b", "/media/c"] {
@@ -1460,7 +1554,7 @@ fn prune_cache_keeps_only_seen_paths() {
         .map(|p| p.to_string())
         .collect();
 
-    let pruned = super::cache::prune_cache(&mut cache, &seen);
+    let pruned = super::cache::prune_cache(&mut cache, &seen, &[]);
 
     assert_eq!(pruned, 1);
     assert!(!cache.contains_key("/dl/b"));
