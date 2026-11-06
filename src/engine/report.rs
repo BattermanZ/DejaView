@@ -3,27 +3,14 @@ use colored::*;
 use std::path::{Path, PathBuf};
 
 use crate::fsutil::safe_write_bytes;
+use crate::human::format_size;
 use crate::logger;
-use crate::protocol::{LinkReportEntry, Outcome, RunReport, WarningSummary};
+use crate::protocol::{
+    EntryStatus, LinkMethod, LinkReportEntry, Mode, Outcome, RunReport, WarningSummary,
+};
 
 use super::linking::Applied;
-use super::types::{Audience, LinkAction, LinkMode, RunMetrics, RunWarnings, ScanRunOptions};
-
-/// A size for a person, in binary units: `8.0 MiB`.
-pub(super) fn format_size(bytes: u64) -> String {
-    let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
-    let mut size = bytes as f64;
-    let mut unit_index = 0;
-    while size >= 1024.0 && unit_index < units.len() - 1 {
-        size /= 1024.0;
-        unit_index += 1;
-    }
-    if unit_index == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{size:.1} {}", units[unit_index])
-    }
-}
+use super::types::{Audience, LinkAction, LinkMode, RunMetrics, ScanRunOptions};
 
 /// The plan for a person: the two folders once, then one row per pair with
 /// paths below them, or that there is nothing to do.
@@ -51,7 +38,7 @@ pub(super) fn print_run_summary(
     files_seen: usize,
     metrics: &RunMetrics,
     symlinked: usize,
-    warnings: &RunWarnings,
+    warnings: &WarningSummary,
     audience: Audience,
 ) {
     if audience.is_chatty() {
@@ -91,7 +78,7 @@ pub(super) fn print_run_summary(
         }
     }
 
-    let total = warning_total(warnings);
+    let total = warnings.total();
     if total > 0 {
         let counts = [
             ("walk", warnings.walk_errors),
@@ -229,14 +216,6 @@ pub(super) fn symlinked_count(entries: &[LinkReportEntry]) -> usize {
         .count()
 }
 
-pub(super) fn warning_total(warnings: &RunWarnings) -> u64 {
-    warnings.walk_errors
-        + warnings.metadata_errors
-        + warnings.sample_hash_errors
-        + warnings.full_hash_errors
-        + warnings.link_errors
-}
-
 fn write_run_report(path: &Path, report: &RunReport) -> Result<()> {
     let json = serde_json::to_vec_pretty(report)?;
     safe_write_bytes(path, &json)?;
@@ -323,16 +302,15 @@ pub(super) fn build_report_entries(
             source_raw: crate::protocol::raw_path_hex(&action.src),
             target_raw: crate::protocol::raw_path_hex(&action.tgt),
             size: action.size,
-            status: "planned".to_string(),
+            status: EntryStatus::Planned,
             method: Some(
-                if link_mode == LinkMode::SymlinkOnly {
-                    "symlink"
-                } else if action.src_snapshot.dev == action.tgt_snapshot.dev {
-                    "try-hardlink"
+                if link_mode == LinkMode::SymlinkOnly
+                    || action.src_snapshot.dev != action.tgt_snapshot.dev
+                {
+                    LinkMethod::Symlink
                 } else {
-                    "symlink"
-                }
-                .to_string(),
+                    LinkMethod::TryHardlink
+                },
             ),
             fallback_reason: if link_mode == LinkMode::SymlinkOnly {
                 Some("symlink-only mode enabled".to_string())
@@ -349,9 +327,9 @@ pub(super) fn build_report_entries(
 pub(super) fn build_run_report(options: &ScanRunOptions<'_>, input: RunReportInput) -> RunReport {
     RunReport {
         mode: if options.dry_run {
-            "scan".to_string()
+            Mode::Scan
         } else {
-            "link".to_string()
+            Mode::Link
         },
         outcome: input.outcome,
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -385,13 +363,7 @@ pub(super) fn build_run_report(options: &ScanRunOptions<'_>, input: RunReportInp
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
-        warnings: WarningSummary {
-            walk_errors: input.warnings.walk_errors,
-            metadata_errors: input.warnings.metadata_errors,
-            sample_hash_errors: input.warnings.sample_hash_errors,
-            full_hash_errors: input.warnings.full_hash_errors,
-            link_errors: input.warnings.link_errors,
-        },
+        warnings: input.warnings,
         entries: input.entries,
     }
 }
@@ -406,7 +378,7 @@ pub(super) struct RunReportInput<'a> {
     pub(super) planned_bytes: u64,
     pub(super) applied: Applied,
     pub(super) metrics: RunMetrics,
-    pub(super) warnings: RunWarnings,
+    pub(super) warnings: WarningSummary,
     pub(super) entries: Vec<LinkReportEntry>,
 }
 
@@ -414,15 +386,15 @@ pub(super) struct RunReportInput<'a> {
 pub(super) fn strict_failure(
     strict_link_error: Option<anyhow::Error>,
     strict: bool,
-    warnings: &RunWarnings,
+    warnings: &WarningSummary,
 ) -> Option<anyhow::Error> {
     if strict_link_error.is_some() {
         return strict_link_error;
     }
-    if strict && warning_total(warnings) > 0 {
+    if strict && warnings.total() > 0 {
         return Some(anyhow!(
             "--strict stopped the run: {} file(s) could not be read, hashed or linked; the log names each. Make them readable, leave their folder out with `dejaview config set-exclude`, or run without --strict",
-            warning_total(warnings)
+            warnings.total()
         ));
     }
     None

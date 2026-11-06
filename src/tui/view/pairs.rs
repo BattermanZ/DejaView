@@ -9,9 +9,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::{
-    SYMLINK_BREAKS, cut, format_bytes, group_digits, line_width, pad, pad_left, row_path, rule,
+    SYMLINK_BREAKS, cut, format_size, group_digits, line_width, pad, pad_left, row_path, rule,
     sentence, take_top, trim_keep_name, visible_row_window,
 };
+use crate::protocol::{LinkMethod, Phase};
 use crate::tui::app::App;
 use crate::tui::layout;
 use crate::tui::model::LinkReportEntry;
@@ -50,7 +51,7 @@ impl LinkKind {
             Self::Symlink
         } else if entry.is_applied() {
             Self::Hardlink
-        } else if entry.method.as_deref() == Some("symlink") {
+        } else if entry.method == Some(LinkMethod::Symlink) {
             Self::PlannedSymlink
         } else {
             Self::Planned
@@ -449,7 +450,7 @@ pub(super) fn render_pairs(frame: &mut Frame, area: Rect, app: &App) {
                     pad(&trim_keep_name(library, columns.library), columns.library),
                     Theme::muted(),
                 ),
-                Span::styled(pad_left(&format_bytes(*bytes), SIZE_WIDTH), Theme::muted()),
+                Span::styled(pad_left(&format_size(*bytes), SIZE_WIDTH), Theme::muted()),
             ),
             Item::Pair { index, nested } => {
                 let entry = &rows[*index];
@@ -489,7 +490,7 @@ pub(super) fn render_pairs(frame: &mut Frame, area: Rect, app: &App) {
                         library_style,
                     ),
                     Span::styled(
-                        pad_left(&format_bytes(entry.size), SIZE_WIDTH),
+                        pad_left(&format_size(entry.size), SIZE_WIDTH),
                         kind.text_style(),
                     ),
                 )
@@ -570,7 +571,7 @@ pub(super) fn render_details(frame: &mut Frame, area: Rect, app: &App) {
         .source
         .rsplit_once('/')
         .map_or(("", entry.source.as_str()), |(folder, name)| (folder, name));
-    let size = format_bytes(entry.size);
+    let size = format_size(entry.size);
     let says = link_sentence(kind);
     let drawing = kind.drawing(true);
     let target_room = width.saturating_sub(drawing.chars().count() + says.len() + 2);
@@ -611,17 +612,17 @@ pub(super) fn render_details(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// The steps of a scan, which run in this order.
-const SCAN_STEPS: [(&str, &str); 4] = [
-    ("collecting", "Find files"),
-    ("hashing_sample", "Hash"),
-    ("hashing_full", "Verify matches"),
-    ("planning", "Plan links"),
+const SCAN_STEPS: [(Phase, &str); 4] = [
+    (Phase::Collecting, "Find files"),
+    (Phase::HashingSample, "Hash"),
+    (Phase::HashingFull, "Verify matches"),
+    (Phase::Planning, "Plan links"),
 ];
 
 fn steps_line(app: &App) -> Line<'static> {
     let current = app
         .phase()
-        .and_then(|phase| SCAN_STEPS.iter().position(|(name, _)| *name == phase))
+        .and_then(|phase| SCAN_STEPS.iter().position(|(step, _)| *step == phase))
         .unwrap_or(0);
     let mut spans = vec![Span::raw("  ")];
     for (index, (_, label)) in SCAN_STEPS.iter().enumerate() {
@@ -828,6 +829,7 @@ pub(super) fn render_empty(frame: &mut Frame, area: Rect, app: &App) {
 mod tests {
     use super::super::test_support::{app_with_episodes, app_with_link_report, screen};
     use super::*;
+    use crate::protocol::{EntryStatus, LinkMethod, Mode};
     use crate::tui::app::LinkCheck;
 
     /// The lines that show a pair: those with a link drawing.
@@ -983,24 +985,24 @@ mod tests {
             ..crate::config::Config::default()
         };
         let mut app = App::new(&config, false);
-        let planned = |name: &str, method: &str, reason: &str| LinkReportEntry {
+        let planned = |name: &str, method: LinkMethod, reason: &str| LinkReportEntry {
             source: format!("/downloads/{name}/{name}.mkv"),
             target: format!("/media/Movies/{name}.mkv"),
             size: 1_000_000_000,
-            status: "planned".to_string(),
-            method: Some(method.to_string()),
+            status: EntryStatus::Planned,
+            method: Some(method),
             fallback_reason: Some(reason.to_string()),
             ..Default::default()
         };
         app.set_report_for_test(crate::tui::model::RunReport {
-            mode: "scan".to_string(),
+            mode: Mode::Scan,
             planned_actions: 2,
             total_saved_bytes: 2_000_000_000,
             entries: vec![
-                planned("Alpha", "symlink", "symlink-only mode enabled"),
+                planned("Alpha", LinkMethod::Symlink, "symlink-only mode enabled"),
                 planned(
                     "Beta",
-                    "try-hardlink",
+                    LinkMethod::TryHardlink,
                     "tries hardlink first; may fall back to symlink",
                 ),
             ],
@@ -1046,12 +1048,12 @@ mod tests {
             source: format!("/dl/{name}"),
             target: format!("/media/{name}"),
             size: 1_000_000_000,
-            status: "planned".to_string(),
-            method: Some("try-hardlink".to_string()),
+            status: EntryStatus::Planned,
+            method: Some(LinkMethod::TryHardlink),
             ..Default::default()
         };
         app.set_report_for_test(crate::tui::model::RunReport {
-            mode: "scan".to_string(),
+            mode: Mode::Scan,
             planned_actions: 2,
             entries: vec![entry("葬送のフリーレン 01.mkv"), entry("Plain 01.mkv")],
             ..Default::default()
@@ -1090,13 +1092,13 @@ mod tests {
                     source: format!("/dl/G{group:02}/G{group:02}E{episode}.mkv"),
                     target: format!("/media/G{group:02}/G{group:02}E{episode}.mkv"),
                     size: 1,
-                    status: "planned".to_string(),
+                    status: EntryStatus::Planned,
                     ..Default::default()
                 })
             })
             .collect();
         app.set_report_for_test(crate::tui::model::RunReport {
-            mode: "scan".to_string(),
+            mode: Mode::Scan,
             entries,
             ..Default::default()
         });
@@ -1135,12 +1137,12 @@ mod tests {
             source: format!("/dl/{path}"),
             target: format!("/media/TV/{path}"),
             size: 1,
-            status: "planned".to_string(),
+            status: EntryStatus::Planned,
             ..Default::default()
         })
         .collect();
         app.set_report_for_test(crate::tui::model::RunReport {
-            mode: "scan".to_string(),
+            mode: Mode::Scan,
             entries,
             ..Default::default()
         });
@@ -1166,7 +1168,7 @@ mod tests {
         let mut app = app_with_episodes(0);
         let _cancel = app.set_running_scan_for_test();
         app.set_hash_activity_for_test(
-            "hashing_sample",
+            Phase::HashingSample,
             &[(1, "/srv/media/TV/Show Name/Season 1/Show Name S01E03.mkv")],
         );
         let text = screen(&app, 120, 36);

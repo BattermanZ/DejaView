@@ -10,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use crate::config::{Config, load_config, save_config, validate_runtime_paths};
 use crate::engine::LinkMode;
 use crate::fsutil::{expand_home, normalize_runtime_dir};
-use crate::protocol::PlannedPair;
+use crate::protocol::{Mode, Outcome, Phase, PlannedPair};
 
 use super::actions;
 use super::events::{self, Event};
@@ -156,7 +156,7 @@ pub struct App {
     /// The names every walk leaves out, for the check before a test hardlink.
     exclude: Vec<String>,
     expand_paths: bool,
-    current_phase: Option<String>,
+    current_phase: Option<Phase>,
     current_path: Option<String>,
     latest_activity_message: Option<String>,
     live_files_seen: Option<usize>,
@@ -256,7 +256,7 @@ impl App {
         self.live_planned_actions
             .or_else(|| {
                 self.report.as_ref().map(|r| {
-                    if r.mode == "link" {
+                    if r.mode == Mode::Link {
                         r.entries.iter().filter(|entry| entry.is_planned()).count()
                     } else {
                         r.planned_actions
@@ -271,7 +271,7 @@ impl App {
     pub fn saved_bytes(&self) -> u64 {
         self.report
             .as_ref()
-            .filter(|report| report.mode == "link")
+            .filter(|report| report.mode == Mode::Link)
             .map_or(0, |report| report.freed_bytes)
     }
 
@@ -282,7 +282,7 @@ impl App {
         self.report
             .as_ref()
             .map(|report| {
-                if report.mode == "link" {
+                if report.mode == Mode::Link {
                     report
                         .entries
                         .iter()
@@ -384,15 +384,15 @@ impl App {
     /// left wait for a second of reading.
     pub fn full_pass_progress(&self) -> Option<String> {
         let (done, total) = self.hash_bytes?;
-        let format_bytes = super::view::format_bytes;
-        let mut label = format!("{} of {}", format_bytes(done), format_bytes(total));
+        use crate::human::format_size;
+        let mut label = format!("{} of {}", format_size(done), format_size(total));
         let elapsed = self.full_pass_started_at?.elapsed();
         if elapsed >= Duration::from_secs(1) && done > 0 {
             let rate = done as f64 / elapsed.as_secs_f64();
             let left = Duration::from_secs_f64(total.saturating_sub(done) as f64 / rate);
             label.push_str(&format!(
                 "  |  {}/s  |  ETA {}",
-                format_bytes(rate as u64),
+                format_size(rate as u64),
                 format_duration(left)
             ));
         }
@@ -409,8 +409,8 @@ impl App {
     pub fn activity_message(&self) -> String {
         if self.running_job.is_some()
             && matches!(
-                self.current_phase.as_deref(),
-                Some("hashing_sample") | Some("hashing_full") | Some("applying")
+                self.current_phase,
+                Some(Phase::HashingSample | Phase::HashingFull | Phase::Applying)
             )
         {
             return String::new();
@@ -462,24 +462,23 @@ impl App {
             .is_some_and(|job| job.kind == JobKind::Scan)
     }
 
-    /// The running job's phase as the event stream names it, such as
-    /// `hashing_sample`.
-    pub fn phase(&self) -> Option<&str> {
-        self.current_phase.as_deref()
+    /// The running job's phase, as the event stream last named it.
+    pub fn phase(&self) -> Option<Phase> {
+        self.current_phase
     }
 
     /// How far the running job is, as done of total: bytes in the full
     /// pass, files while hashing, links while applying.
     pub fn run_progress(&self) -> Option<(u64, u64)> {
         self.running_job.as_ref()?;
-        match self.current_phase.as_deref() {
-            Some("hashing_full") if self.hash_bytes.is_some() => self.hash_bytes,
-            Some("hashing_sample") | Some("hashing_full") => {
+        match self.current_phase {
+            Some(Phase::HashingFull) if self.hash_bytes.is_some() => self.hash_bytes,
+            Some(Phase::HashingSample | Phase::HashingFull) => {
                 let done = self.hash_progress_done?;
                 let total = self.hash_progress_total?;
                 Some((done as u64, total as u64))
             }
-            Some("applying") => {
+            Some(Phase::Applying) => {
                 let applied = self.live_applied_actions?;
                 let planned = self.live_planned_actions?;
                 Some((applied as u64, planned as u64))
@@ -497,7 +496,7 @@ impl App {
     pub fn showing_link_report(&self) -> bool {
         self.report
             .as_ref()
-            .is_some_and(|report| report.mode == "link")
+            .is_some_and(|report| report.mode == Mode::Link)
     }
 
     pub fn has_report(&self) -> bool {
@@ -731,7 +730,7 @@ impl App {
             let _ = actions::run_scan(strict, tx, cancel_rx);
         });
         self.job_started_at = Some(Instant::now());
-        self.current_phase = Some("collecting".to_string());
+        self.current_phase = Some(Phase::Collecting);
         self.latest_activity_message = Some("Collecting candidate files".to_string());
         self.running_job = Some(RunningJob::new(JobKind::Scan, rx, cancel_tx));
     }
@@ -780,7 +779,7 @@ impl App {
             let _ = actions::run_link_pairs(strict, &downloads, &pairs, tx, cancel_rx);
         });
         self.job_started_at = Some(Instant::now());
-        self.current_phase = Some("planning".to_string());
+        self.current_phase = Some(Phase::Planning);
         self.latest_activity_message = Some("Preparing link run".to_string());
         self.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, cancel_tx));
     }
@@ -808,7 +807,7 @@ impl App {
         self.live_entries.clear();
         self.live_planned_actions = None;
         self.live_applied_actions = None;
-        self.current_phase = Some("planning".to_string());
+        self.current_phase = Some(Phase::Planning);
         self.latest_activity_message = Some("Preparing selected link".to_string());
         self.current_path = Some(source.clone());
         self.hash_progress_done = None;
@@ -1129,17 +1128,15 @@ impl App {
         match event {
             TuiEvent::Phase { phase } => {
                 self.hash_bytes = None;
-                self.full_pass_started_at = (phase == "hashing_full").then(Instant::now);
-                self.current_phase = Some(phase.clone());
+                self.full_pass_started_at = (phase == Phase::HashingFull).then(Instant::now);
+                self.current_phase = Some(phase);
                 self.current_path = None;
-                if phase.starts_with("hashing_") {
-                    self.active_workers.clear();
-                } else {
-                    self.active_workers.clear();
+                self.active_workers.clear();
+                if !phase.is_hashing() {
                     self.hash_progress_done = None;
                     self.hash_progress_total = None;
                 }
-                let message = format!("Phase: {}", display_phase(&phase));
+                let message = format!("Phase: {}", display_phase(phase));
                 self.latest_activity_message = Some(message.clone());
                 self.push_log(message);
                 false
@@ -1200,14 +1197,12 @@ impl App {
                 if let Some(total) = hash_progress_total {
                     self.hash_progress_total = Some(total);
                 }
-                if matches!(
-                    self.current_phase.as_deref(),
-                    Some("hashing_sample") | Some("hashing_full")
-                ) && let (Some(done), Some(total)) =
-                    (self.hash_progress_done, self.hash_progress_total)
+                if self.current_phase.is_some_and(Phase::is_hashing)
+                    && let (Some(done), Some(total)) =
+                        (self.hash_progress_done, self.hash_progress_total)
                 {
-                    self.latest_activity_message = Some(match self.current_phase.as_deref() {
-                        Some("hashing_full") => {
+                    self.latest_activity_message = Some(match self.current_phase {
+                        Some(Phase::HashingFull) => {
                             format!("Verifying duplicate files: {done} / {total}")
                         }
                         _ => format!("Hashing files: {done} / {total}"),
@@ -1289,8 +1284,8 @@ impl App {
                 let planned = report.planned_actions;
                 let applied = report.applied_actions;
                 let link_failures = report.warnings.link_errors;
-                let unreadable = report.warning_total() - link_failures;
-                let cancelled = report.outcome == crate::protocol::Outcome::Cancelled;
+                let unreadable = report.warnings.total() - link_failures;
+                let cancelled = report.outcome == Outcome::Cancelled;
                 let symlinked = report
                     .entries
                     .iter()
@@ -1428,7 +1423,7 @@ impl App {
             JobKind::LinkSelected(_) => {
                 if let Some(existing) = &mut self.report {
                     // A scan's report freed nothing; a link's adds up.
-                    let freed_before = if existing.mode == "link" {
+                    let freed_before = if existing.mode == Mode::Link {
                         existing.freed_bytes
                     } else {
                         0
@@ -1444,7 +1439,7 @@ impl App {
                             existing.entries.push(entry.clone());
                         }
                     }
-                    existing.mode = "link".to_string();
+                    existing.mode = Mode::Link;
                     existing.dry_run = false;
                     existing.strict = report.strict;
                     existing.files_considered =
@@ -1505,8 +1500,8 @@ impl App {
 
 #[cfg(test)]
 impl App {
-    pub(crate) fn set_hash_activity_for_test(&mut self, phase: &str, workers: &[(usize, &str)]) {
-        self.current_phase = Some(phase.to_string());
+    pub(crate) fn set_hash_activity_for_test(&mut self, phase: Phase, workers: &[(usize, &str)]) {
+        self.current_phase = Some(phase);
         self.active_workers = workers
             .iter()
             .map(|(worker, path)| (*worker, (*path).to_string()))
@@ -1534,7 +1529,7 @@ impl App {
     pub(crate) fn set_running_link_for_test(&mut self, applied: usize, planned: usize) {
         let (_tx, rx) = mpsc::channel();
         self.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, mpsc::channel().0));
-        self.current_phase = Some("applying".to_string());
+        self.current_phase = Some(Phase::Applying);
         self.live_applied_actions = Some(applied);
         self.live_planned_actions = Some(planned);
     }
@@ -1571,20 +1566,19 @@ fn format_duration(duration: Duration) -> String {
     format!("{minutes:02}:{seconds:02}")
 }
 
-fn display_phase(phase: &str) -> &'static str {
+fn display_phase(phase: Phase) -> &'static str {
     match phase {
-        "collecting" => "COLLECTING FILES",
-        "hashing_sample" => "HASHING FILES",
-        "hashing_full" => "VERIFYING DUPLICATES",
-        "planning" => "PLANNING ACTIONS",
-        "applying" => "APPLYING LINKS",
-        _ => "PROCESSING",
+        Phase::Collecting => "COLLECTING FILES",
+        Phase::HashingSample => "HASHING FILES",
+        Phase::HashingFull => "VERIFYING DUPLICATES",
+        Phase::Planning => "PLANNING ACTIONS",
+        Phase::Applying => "APPLYING LINKS",
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::protocol::WarningSummary;
+    use crate::protocol::{EntryStatus, LinkMethod, WarningSummary};
     use anyhow::anyhow;
 
     use super::super::model::{RunReport, TuiEvent};
@@ -1608,7 +1602,7 @@ mod tests {
 
     fn sample_report() -> RunReport {
         RunReport {
-            mode: "scan".to_string(),
+            mode: Mode::Scan,
             dry_run: true,
             strict: false,
             files_considered: 2,
@@ -1640,7 +1634,7 @@ mod tests {
         assert_eq!(app.potential_saved_bytes(), 1024);
 
         app.report = Some(RunReport {
-            mode: "link".to_string(),
+            mode: Mode::Link,
             dry_run: false,
             strict: false,
             files_considered: 2,
@@ -1665,8 +1659,8 @@ mod tests {
                     source: "a".to_string(),
                     target: "b".to_string(),
                     size: 10,
-                    status: "applied".to_string(),
-                    method: Some("hardlink".to_string()),
+                    status: EntryStatus::Applied,
+                    method: Some(LinkMethod::Hardlink),
                     fallback_reason: None,
                     error: None,
                     ..Default::default()
@@ -1675,7 +1669,7 @@ mod tests {
                     source: "c".to_string(),
                     target: "d".to_string(),
                     size: 20,
-                    status: "failed".to_string(),
+                    status: EntryStatus::Failed,
                     method: None,
                     fallback_reason: None,
                     error: Some("boom".to_string()),
@@ -1755,7 +1749,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, mpsc::channel().0));
         let mut report = sample_report();
-        report.mode = "link".to_string();
+        report.mode = Mode::Link;
         report.warnings.link_errors = 2;
         tx.send(Ok(TuiEvent::Done {
             report: Box::new(report),
@@ -1786,11 +1780,11 @@ mod tests {
         app.job_started_at = Some(Instant::now());
 
         tx.send(Ok(TuiEvent::Phase {
-            phase: "hashing_sample".to_string(),
+            phase: Phase::HashingSample,
         }))
         .expect("send phase");
         tx.send(Ok(TuiEvent::WorkerActivity {
-            phase: "hashing_sample".to_string(),
+            phase: Phase::HashingSample,
             worker: 2,
             path: Some("/downloads/movie.mkv".to_string()),
         }))
@@ -1809,7 +1803,7 @@ mod tests {
 
         assert_eq!(app.files_considered(), 42);
         assert_eq!(app.planned_actions(), 2);
-        assert_eq!(app.phase(), Some("hashing_sample"));
+        assert_eq!(app.phase(), Some(Phase::HashingSample));
         assert_eq!(app.active_worker_paths(), vec![(2, "/downloads/movie.mkv")]);
         assert_eq!(app.hash_progress(), Some((23, 42)));
     }
@@ -1827,8 +1821,8 @@ mod tests {
                 source: "/downloads/a.mkv".to_string(),
                 target: "/media/a.mkv".to_string(),
                 size: 10,
-                status: "planned".to_string(),
-                method: Some("try-hardlink".to_string()),
+                status: EntryStatus::Planned,
+                method: Some(LinkMethod::TryHardlink),
                 fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
                 error: None,
                 ..Default::default()
@@ -1842,9 +1836,8 @@ mod tests {
         assert_eq!(app.planned_actions(), 1);
         assert_eq!(app.potential_saved_bytes(), 10);
         assert_eq!(
-            app.selected_entry()
-                .and_then(|entry| entry.method.as_deref()),
-            Some("try-hardlink")
+            app.selected_entry().and_then(|entry| entry.method),
+            Some(LinkMethod::TryHardlink)
         );
     }
 
@@ -1855,7 +1848,7 @@ mod tests {
             source: source.to_string(),
             target: "/media/a.mkv".to_string(),
             size: 10,
-            status: "planned".to_string(),
+            status: EntryStatus::Planned,
             method: None,
             fallback_reason: None,
             error: None,
@@ -1880,7 +1873,7 @@ mod tests {
             source: source.to_string(),
             target: "/media/a.mkv".to_string(),
             size: 10,
-            status: "planned".to_string(),
+            status: EntryStatus::Planned,
             ..Default::default()
         };
         // As paths, Show/ sorts before Show.S01/; as strings, after.
@@ -1912,11 +1905,11 @@ mod tests {
     #[test]
     fn a_single_link_selects_the_next_planned_row() {
         let mut app = App::new(&Config::default(), false);
-        let row = |source: &str, status: &str| LinkReportEntry {
+        let row = |source: &str, status: EntryStatus| LinkReportEntry {
             source: source.to_string(),
             target: format!("/media{source}"),
             size: 10,
-            status: status.to_string(),
+            status,
             method: None,
             fallback_reason: None,
             error: None,
@@ -1924,16 +1917,16 @@ mod tests {
         };
         let mut scanned = sample_report();
         scanned.entries = vec![
-            row("/dl/a.mkv", "planned"),
-            row("/dl/b.mkv", "applied"),
-            row("/dl/c.mkv", "planned"),
-            row("/dl/d.mkv", "planned"),
+            row("/dl/a.mkv", EntryStatus::Planned),
+            row("/dl/b.mkv", EntryStatus::Applied),
+            row("/dl/c.mkv", EntryStatus::Planned),
+            row("/dl/d.mkv", EntryStatus::Planned),
         ];
         app.report = Some(scanned);
         app.selected_row = 2;
         let mut linked = sample_report();
-        linked.mode = "link".to_string();
-        linked.entries = vec![row("/dl/c.mkv", "applied")];
+        linked.mode = Mode::Link;
+        linked.entries = vec![row("/dl/c.mkv", EntryStatus::Applied)];
 
         app.apply_tui_event(
             JobKind::LinkSelected("/dl/c.mkv".to_string()),
@@ -1944,7 +1937,7 @@ mod tests {
         assert_eq!(app.selected_row(), 3, "the next planned row, d");
 
         // From the last row, back to the first still planned.
-        linked.entries = vec![row("/dl/d.mkv", "applied")];
+        linked.entries = vec![row("/dl/d.mkv", EntryStatus::Applied)];
         app.apply_tui_event(
             JobKind::LinkSelected("/dl/d.mkv".to_string()),
             TuiEvent::Done {
@@ -1957,23 +1950,29 @@ mod tests {
     #[test]
     fn a_link_stopped_by_strict_shows_the_pairs_it_linked() {
         let mut app = App::new(&Config::default(), false);
-        let row = |source: &str, status: &str| LinkReportEntry {
+        let row = |source: &str, status: EntryStatus| LinkReportEntry {
             source: source.to_string(),
             target: format!("/media{source}"),
             size: 10,
-            status: status.to_string(),
+            status,
             method: None,
             fallback_reason: None,
             error: None,
             ..Default::default()
         };
         let mut scanned = sample_report();
-        scanned.entries = vec![row("/dl/a.mkv", "planned"), row("/dl/b.mkv", "planned")];
+        scanned.entries = vec![
+            row("/dl/a.mkv", EntryStatus::Planned),
+            row("/dl/b.mkv", EntryStatus::Planned),
+        ];
         app.report_before_link = Some(scanned);
         let mut partial = sample_report();
-        partial.mode = "link".to_string();
+        partial.mode = Mode::Link;
         partial.outcome = crate::protocol::Outcome::Failed;
-        partial.entries = vec![row("/dl/a.mkv", "applied"), row("/dl/b.mkv", "failed")];
+        partial.entries = vec![
+            row("/dl/a.mkv", EntryStatus::Applied),
+            row("/dl/b.mkv", EntryStatus::Failed),
+        ];
 
         assert!(app.apply_tui_event(
             JobKind::LinkAll,
@@ -1983,8 +1982,8 @@ mod tests {
             },
         ));
 
-        let statuses: Vec<_> = app.rows().iter().map(|row| row.status.as_str()).collect();
-        assert_eq!(statuses, ["applied", "failed"]);
+        let statuses: Vec<_> = app.rows().iter().map(|row| row.status).collect();
+        assert_eq!(statuses, [EntryStatus::Applied, EntryStatus::Failed]);
         assert!(app.report_before_link.is_none());
         assert!(
             app.activity_message()
@@ -2001,8 +2000,8 @@ mod tests {
             source: "/downloads/a.mkv".to_string(),
             target: "/media/a.mkv".to_string(),
             size: 10,
-            status: "planned".to_string(),
-            method: Some("try-hardlink".to_string()),
+            status: EntryStatus::Planned,
+            method: Some(LinkMethod::TryHardlink),
             fallback_reason: None,
             error: None,
             ..Default::default()
@@ -2096,8 +2095,8 @@ mod tests {
                 source: "/downloads/a.mkv".to_string(),
                 target: "/media/a.mkv".to_string(),
                 size: 10,
-                status: "planned".to_string(),
-                method: Some("try-hardlink".to_string()),
+                status: EntryStatus::Planned,
+                method: Some(LinkMethod::TryHardlink),
                 fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
                 error: None,
                 ..Default::default()
@@ -2158,7 +2157,7 @@ mod tests {
         app.apply_tui_event(
             JobKind::Scan,
             TuiEvent::Phase {
-                phase: "hashing_full".to_string(),
+                phase: Phase::HashingFull,
             },
         );
         app.set_hash_progress_for_test(0, 2);
@@ -2179,7 +2178,7 @@ mod tests {
         app.apply_tui_event(
             JobKind::Scan,
             TuiEvent::Phase {
-                phase: "hashing_full".to_string(),
+                phase: Phase::HashingFull,
             },
         );
         app.set_hash_progress_for_test(0, 1);
@@ -2227,21 +2226,21 @@ mod tests {
             hash_progress_total: done.map(|_| 10),
         };
         tx.send(Ok(TuiEvent::Phase {
-            phase: "collecting".to_string(),
+            phase: Phase::Collecting,
         }))
         .expect("send");
         for n in [1, 25, 50] {
             tx.send(Ok(count(Some(n), None, None))).expect("send");
         }
         tx.send(Ok(TuiEvent::Phase {
-            phase: "hashing_sample".to_string(),
+            phase: Phase::HashingSample,
         }))
         .expect("send");
         for n in [1, 10] {
             tx.send(Ok(count(None, Some(n), None))).expect("send");
         }
         tx.send(Ok(TuiEvent::Phase {
-            phase: "applying".to_string(),
+            phase: Phase::Applying,
         }))
         .expect("send");
         tx.send(Ok(count(None, None, Some(1)))).expect("send");
@@ -2263,13 +2262,13 @@ mod tests {
         app.apply_tui_event(
             JobKind::Scan,
             TuiEvent::Phase {
-                phase: "collecting".to_string(),
+                phase: Phase::Collecting,
             },
         );
         app.apply_tui_event(
             JobKind::Scan,
             TuiEvent::File {
-                phase: Some("collecting".to_string()),
+                phase: Some(Phase::Collecting),
                 path: "/downloads/a.mkv".to_string(),
             },
         );
@@ -2351,13 +2350,13 @@ mod tests {
         let cleared = app.apply_tui_event(
             JobKind::Scan,
             TuiEvent::Phase {
-                phase: "planning".to_string(),
+                phase: Phase::Planning,
             },
         );
 
         assert!(!cleared);
         assert_eq!(app.current_path(), None);
-        assert_eq!(app.phase(), Some("planning"));
+        assert_eq!(app.phase(), Some(Phase::Planning));
     }
 
     #[test]
@@ -2425,7 +2424,7 @@ mod tests {
             source: "/dl/a".to_string(),
             target: "/media/a".to_string(),
             size: 1,
-            status: "planned".to_string(),
+            status: EntryStatus::Planned,
             method: None,
             fallback_reason: None,
             error: None,
@@ -2511,20 +2510,20 @@ mod tests {
         let config = Config::default();
         let mut app = App::new(&config, false);
         let mut report = sample_report();
-        let row = |source: &str, status: &str| LinkReportEntry {
+        let row = |source: &str, status: EntryStatus| LinkReportEntry {
             source: source.to_string(),
             target: format!("/media{source}"),
             size: 10,
-            status: status.to_string(),
+            status,
             method: None,
             fallback_reason: None,
             error: None,
             ..Default::default()
         };
         report.entries = vec![
-            row("/downloads/a.mkv", "planned"),
-            row("/downloads/b.mkv", "applied"),
-            row("/downloads/c.mkv", "planned"),
+            row("/downloads/a.mkv", EntryStatus::Planned),
+            row("/downloads/b.mkv", EntryStatus::Applied),
+            row("/downloads/c.mkv", EntryStatus::Planned),
         ];
         app.report = Some(report);
 
@@ -2550,8 +2549,8 @@ mod tests {
             source: "/downloads/a.mkv".to_string(),
             target: "/media/a.mkv".to_string(),
             size: 10,
-            status: "planned".to_string(),
-            method: Some("try-hardlink".to_string()),
+            status: EntryStatus::Planned,
+            method: Some(LinkMethod::TryHardlink),
             fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
             error: None,
             ..Default::default()
@@ -2577,8 +2576,8 @@ mod tests {
             source: "/downloads/a.mkv".to_string(),
             target: "/media/a.mkv".to_string(),
             size: 10,
-            status: "planned".to_string(),
-            method: Some("try-hardlink".to_string()),
+            status: EntryStatus::Planned,
+            method: Some(LinkMethod::TryHardlink),
             fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
             error: None,
             ..Default::default()
@@ -2601,7 +2600,7 @@ mod tests {
         let config = Config::default();
         let mut app = App::new(&config, false);
         app.report = Some(RunReport {
-            mode: "scan".to_string(),
+            mode: Mode::Scan,
             dry_run: true,
             strict: false,
             files_considered: 2,
@@ -2625,8 +2624,8 @@ mod tests {
                     source: "/downloads/a.mkv".to_string(),
                     target: "/media/a.mkv".to_string(),
                     size: 10,
-                    status: "planned".to_string(),
-                    method: Some("try-hardlink".to_string()),
+                    status: EntryStatus::Planned,
+                    method: Some(LinkMethod::TryHardlink),
                     fallback_reason: Some(
                         "tries hardlink first; may fall back to symlink".to_string(),
                     ),
@@ -2637,8 +2636,8 @@ mod tests {
                     source: "/downloads/b.mkv".to_string(),
                     target: "/media/b.mkv".to_string(),
                     size: 20,
-                    status: "planned".to_string(),
-                    method: Some("try-hardlink".to_string()),
+                    status: EntryStatus::Planned,
+                    method: Some(LinkMethod::TryHardlink),
                     fallback_reason: Some(
                         "tries hardlink first; may fall back to symlink".to_string(),
                     ),
@@ -2657,7 +2656,7 @@ mod tests {
         ));
         tx.send(Ok(TuiEvent::Done {
             report: Box::new(RunReport {
-                mode: "link".to_string(),
+                mode: Mode::Link,
                 dry_run: false,
                 strict: false,
                 files_considered: 2,
@@ -2680,8 +2679,8 @@ mod tests {
                     source: "/downloads/a.mkv".to_string(),
                     target: "/media/a.mkv".to_string(),
                     size: 10,
-                    status: "applied".to_string(),
-                    method: Some("hardlink".to_string()),
+                    status: EntryStatus::Applied,
+                    method: Some(LinkMethod::Hardlink),
                     fallback_reason: None,
                     error: None,
                     ..Default::default()
@@ -2696,8 +2695,8 @@ mod tests {
         assert_eq!(app.rows().len(), 2);
         assert_eq!(app.rows().iter().filter(|row| row.is_applied()).count(), 1);
         assert_eq!(app.planned_actions(), 1);
-        assert_eq!(app.rows()[0].status, "applied");
-        assert_eq!(app.rows()[1].status, "planned");
+        assert_eq!(app.rows()[0].status, EntryStatus::Applied);
+        assert_eq!(app.rows()[1].status, EntryStatus::Planned);
         assert!(
             app.logs
                 .iter()

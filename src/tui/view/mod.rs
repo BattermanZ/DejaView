@@ -15,21 +15,7 @@ use crate::tui::app::{App, Overlay};
 use crate::tui::layout;
 use crate::tui::theme::Theme;
 
-/// A size in binary units, as the CLI prints it: `4.9 KiB`.
-pub(crate) fn format_bytes(bytes: u64) -> String {
-    let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
-    let mut value = bytes as f64;
-    let mut idx = 0usize;
-    while value >= 1024.0 && idx < units.len() - 1 {
-        value /= 1024.0;
-        idx += 1;
-    }
-    if idx == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", units[idx])
-    }
-}
+pub(crate) use crate::human::format_size;
 
 /// A count with its thousands grouped: `3,412`.
 fn group_digits(count: u64) -> String {
@@ -618,7 +604,7 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
-    use crate::protocol::WarningSummary;
+    use crate::protocol::{EntryStatus, LinkMethod, Mode, WarningSummary};
     use crate::tui::model::{LinkReportEntry, RunReport};
 
     /// A scan of `episodes` downloads under a long downloads folder.
@@ -637,15 +623,15 @@ pub(crate) mod test_support {
                 ),
                 target: format!("/srv/media/TV/Show Name/Season 1/Show Name S01E{n:02}.mkv"),
                 size: 1_500_000_000,
-                status: "planned".to_string(),
-                method: Some("try-hardlink".to_string()),
+                status: EntryStatus::Planned,
+                method: Some(LinkMethod::TryHardlink),
                 fallback_reason: None,
                 error: None,
                 ..Default::default()
             })
             .collect();
         app.set_report_for_test(RunReport {
-            mode: "scan".to_string(),
+            mode: Mode::Scan,
             planned_actions: episodes as usize,
             total_saved_bytes: u64::from(episodes) * 1_500_000_000,
             warnings: WarningSummary::default(),
@@ -663,26 +649,30 @@ pub(crate) mod test_support {
             ..crate::config::Config::default()
         };
         let mut app = App::new(&config, false);
-        let entry = |name: &str, status: &str, method: &str| LinkReportEntry {
+        let entry = |name: &str, status: EntryStatus, method: LinkMethod| LinkReportEntry {
             source: format!("/downloads/{name}/{name}.mkv"),
             target: format!("/media/Movies/{name}.mkv"),
             size: 2_000_000_000,
-            status: status.to_string(),
-            method: Some(method.to_string()),
+            status,
+            method: Some(method),
             ..Default::default()
         };
-        let mut symlink = entry("Beta.2021", "applied", "symlink");
+        let mut symlink = entry("Beta.2021", EntryStatus::Applied, LinkMethod::Symlink);
         symlink.fallback_reason = Some("different filesystems".to_string());
-        let mut failed = entry("Gamma.2022", "failed", "hardlink");
+        let mut failed = entry("Gamma.2022", EntryStatus::Failed, LinkMethod::Hardlink);
         failed.error = Some("Permission denied (os error 13)".to_string());
         app.set_report_for_test(RunReport {
-            mode: "link".to_string(),
+            mode: Mode::Link,
             files_considered: 9,
             applied_actions: 2,
             symlinked: 1,
             freed_bytes: 4_000_000_000,
             total_saved_bytes: 4_000_000_000,
-            entries: vec![entry("Alpha.2020", "applied", "hardlink"), symlink, failed],
+            entries: vec![
+                entry("Alpha.2020", EntryStatus::Applied, LinkMethod::Hardlink),
+                symlink,
+                failed,
+            ],
             ..RunReport::default()
         });
         app

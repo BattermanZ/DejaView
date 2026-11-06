@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod config;
 mod engine;
 mod fsutil;
+mod human;
 mod logger;
 mod protocol;
 mod tui;

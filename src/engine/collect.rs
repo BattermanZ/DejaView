@@ -12,10 +12,10 @@ use std::time::{Duration, SystemTime};
 use walkdir::WalkDir;
 
 use super::cancel::{CancelToken, FirstError};
-use super::types::{FileInfo, RunMetrics, RunWarnings};
+use super::types::{FileInfo, RunMetrics};
 use super::types::{emit_tui_event, progress_due};
 use crate::logger;
-use crate::protocol::TuiEvent;
+use crate::protocol::{Phase, TuiEvent, WarningSummary};
 
 /// Names every walk leaves out, with everything under them: a folder a NAS
 /// keeps for itself is never read, so a recycle-bin copy never becomes a link
@@ -284,7 +284,7 @@ impl Found {
     fn finish(
         mut self,
         in_downloads: bool,
-        warnings: &mut RunWarnings,
+        warnings: &mut WarningSummary,
         metrics: &mut RunMetrics,
     ) -> Vec<FileInfo> {
         warnings.walk_errors += self.walk_errors;
@@ -474,7 +474,7 @@ impl<'a> Walk<'a> {
             let seen = shared.files_seen.fetch_add(1, Ordering::Relaxed) + 1;
             if progress_due() {
                 let _ = emit_tui_event(&TuiEvent::File {
-                    phase: Some("collecting".to_string()),
+                    phase: Some(Phase::Collecting),
                     path: path.display().to_string(),
                 });
                 let _ = emit_tui_event(&TuiEvent::Count {
@@ -505,7 +505,7 @@ impl<'a> Walk<'a> {
 /// files in the order given.
 fn walk_roots(
     walks: &[Walk<'_>],
-    warnings: &mut RunWarnings,
+    warnings: &mut WarningSummary,
     metrics: &mut RunMetrics,
 ) -> Result<Vec<Vec<FileInfo>>> {
     let shared = WalkShared::default();
@@ -542,7 +542,7 @@ pub(super) fn collect_files(
     in_downloads: bool,
     min_age: Duration,
     options: &CollectOptions<'_>,
-    warnings: &mut RunWarnings,
+    warnings: &mut WarningSummary,
     metrics: &mut RunMetrics,
 ) -> Result<Vec<FileInfo>> {
     let walks = [Walk::new(root, other_root, in_downloads, min_age, options)];
@@ -557,7 +557,7 @@ pub(super) fn collect_run_files(
     min_age: Duration,
     options: CollectOptions<'_>,
     pool: &rayon::ThreadPool,
-    warnings: &mut RunWarnings,
+    warnings: &mut WarningSummary,
     metrics: &mut RunMetrics,
 ) -> Result<Vec<FileInfo>> {
     let spinner = if options.show_progress {

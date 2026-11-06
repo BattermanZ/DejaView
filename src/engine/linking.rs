@@ -11,11 +11,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::logger;
 use crate::protocol::TuiEvent;
 
-use crate::protocol::LinkReportEntry;
+use crate::protocol::{EntryStatus, LinkMethod, LinkReportEntry, Phase, WarningSummary};
 
 use super::cancel::CancelToken;
 use super::types::emit_tui_event;
-use super::types::{FileInfo, FileSnapshot, LinkAction, LinkMode, RunWarnings};
+use super::types::{FileInfo, FileSnapshot, LinkAction, LinkMode};
 
 /// The target guard by path alone, as the tests drive it.
 #[cfg(test)]
@@ -304,8 +304,8 @@ pub(super) struct LinkRequest<'a> {
 /// What a replacement did.
 #[derive(Debug)]
 pub(super) struct Linked {
-    /// "hardlink" or "symlink": what the download is now.
-    pub(super) method: &'static str,
+    /// Hardlink or symlink: what the download is now.
+    pub(super) method: LinkMethod,
     pub(super) fallback_reason: Option<String>,
     /// The download already was the library file, so nothing changed.
     pub(super) already_linked: bool,
@@ -597,12 +597,12 @@ where
         .map_err(|err| HardlinkError::Failed(with_note(err)))?;
     Ok(match made {
         TempLink::Hardlink => Linked {
-            method: "hardlink",
+            method: LinkMethod::Hardlink,
             fallback_reason: None,
             already_linked,
         },
         TempLink::FilesystemSymlink => Linked {
-            method: "symlink",
+            method: LinkMethod::Symlink,
             fallback_reason: Some(
                 "the filesystem made a symlink when asked for a hardlink (mergerfs link-exdev, the two files are on different disks)"
                     .to_string(),
@@ -634,7 +634,7 @@ where
         );
         replace_with_symlink(&dir, req, &rename_fn)?;
         return Ok(Linked {
-            method: "symlink",
+            method: LinkMethod::Symlink,
             fallback_reason: Some("symlink-only mode enabled".to_string()),
             already_linked: false,
         });
@@ -678,7 +678,7 @@ where
 
     replace_with_symlink(&dir, req, &rename_fn)?;
     Ok(Linked {
-        method: "symlink",
+        method: LinkMethod::Symlink,
         fallback_reason,
         already_linked: false,
     })
@@ -827,7 +827,7 @@ pub(super) fn action_table(actions: &[LinkAction], downloads: &Path, media: &Pat
         table.add_row(vec![
             below(&action.src, downloads),
             below(&action.tgt, media),
-            super::report::format_size(action.size),
+            crate::human::format_size(action.size),
         ]);
     }
     table
@@ -868,7 +868,7 @@ pub(super) fn apply_actions(
     actions: &[LinkAction],
     media: &Path,
     options: &ApplyOptions<'_>,
-    warnings: &mut RunWarnings,
+    warnings: &mut WarningSummary,
     report_entries: &mut [LinkReportEntry],
 ) -> ApplyOutcome {
     let ApplyOptions {
@@ -903,7 +903,7 @@ pub(super) fn apply_actions(
         }
         if tui_events {
             let _ = emit_tui_event(&TuiEvent::File {
-                phase: Some("applying".to_string()),
+                phase: Some(Phase::Applying),
                 path: action.src.display().to_string(),
             });
         }
@@ -941,7 +941,7 @@ pub(super) fn apply_actions(
                 read_access_refusal(&action.src, &src_meta, &action.tgt, &tgt_meta)
             {
                 let entry = &mut report_entries[index];
-                entry.status = "skipped".to_string();
+                entry.status = EntryStatus::Skipped;
                 entry.method = None;
                 entry.fallback_reason = None;
                 entry.error = Some(reason.clone());
@@ -956,14 +956,14 @@ pub(super) fn apply_actions(
                 roots,
                 link_mode,
             })?;
-            report_entries[index].method = Some(linked.method.to_string());
+            report_entries[index].method = Some(linked.method);
             if linked.already_linked {
-                report_entries[index].status = "already-linked".to_string();
+                report_entries[index].status = EntryStatus::AlreadyLinked;
                 report_entries[index].fallback_reason = Some(
                     "already this library file; nothing changed. The filesystem gives one file different inode numbers: on mergerfs, mount with inodecalc=hybrid-hash, or use_ino on older versions".to_string(),
                 );
             } else {
-                report_entries[index].status = "applied".to_string();
+                report_entries[index].status = EntryStatus::Applied;
                 report_entries[index].fallback_reason = linked.fallback_reason;
             }
             Ok(if linked.already_linked {
@@ -980,7 +980,7 @@ pub(super) fn apply_actions(
                 // and the OS error that says why is in its cause.
                 let err = format!("{err:#}");
                 let entry = &mut report_entries[index];
-                entry.status = "failed".to_string();
+                entry.status = EntryStatus::Failed;
                 // What the plan expected no longer applies to a pair that
                 // was not linked.
                 entry.method = None;
@@ -1055,7 +1055,9 @@ pub(super) fn apply_actions(
                 "applied {} -> {} via {}",
                 action.src.display(),
                 action.tgt.display(),
-                report_entries[index].method.as_deref().unwrap_or("unknown")
+                report_entries[index]
+                    .method
+                    .map_or("an unknown method", LinkMethod::as_str)
             ),
         );
         if tui_events {

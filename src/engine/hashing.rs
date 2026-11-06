@@ -17,10 +17,10 @@ use super::cache::CacheKeys;
 use super::cancel::{CancelToken, Cancelled, FirstError};
 use super::linking::{plan_hashed_group_actions, snapshot_from_file_info};
 use super::report::build_report_entries;
-use super::types::{Cache, CacheEntry, FileInfo, LinkMode, RunWarnings};
+use super::types::{Cache, CacheEntry, FileInfo, LinkMode};
 use super::types::{emit_tui_event, progress_due};
 use crate::logger;
-use crate::protocol::TuiEvent;
+use crate::protocol::{Phase, TuiEvent, WarningSummary};
 
 /// Every path a hash opened, so a test can count reads under its own folder.
 #[cfg(test)]
@@ -108,10 +108,10 @@ fn worker_id() -> usize {
     current_thread_index().map_or(1, |idx| idx + 1)
 }
 
-fn emit_worker_activity(phase: &str, worker: usize, path: Option<String>, tui_events: bool) {
+fn emit_worker_activity(phase: Phase, worker: usize, path: Option<String>, tui_events: bool) {
     if tui_events {
         let _ = emit_tui_event(&TuiEvent::WorkerActivity {
-            phase: phase.to_string(),
+            phase,
             worker,
             path,
         });
@@ -491,7 +491,7 @@ pub(super) fn hash_groups_and_update_cache(
     groups: &mut [Vec<FileInfo>],
     cache: &mut Cache,
     options: &HashOptions<'_>,
-    warnings: &mut RunWarnings,
+    warnings: &mut WarningSummary,
 ) -> Hashed {
     let strict = options.strict;
     let tui_events = options.tui_events;
@@ -567,7 +567,7 @@ pub(super) fn hash_groups_and_update_cache(
                     let worker = worker_id();
                     let file = &group[physical.members[0]];
                     emit_worker_activity(
-                        "hashing_sample",
+                        Phase::HashingSample,
                         worker,
                         Some(file.path.display().to_string()),
                         tui_events,
@@ -578,7 +578,7 @@ pub(super) fn hash_groups_and_update_cache(
                     if let Some(progress_bar) = &bar {
                         progress_bar.inc(1);
                     }
-                    emit_worker_activity("hashing_sample", worker, None, tui_events);
+                    emit_worker_activity(Phase::HashingSample, worker, None, tui_events);
                     match digest_result {
                         Ok(digest) => {
                             let sample = blake3::Hash::from(digest).to_hex().to_string();
@@ -631,7 +631,7 @@ pub(super) fn hash_groups_and_update_cache(
         .sum();
     if tui_events && total_full_files > 0 {
         let _ = emit_tui_event(&TuiEvent::Phase {
-            phase: "hashing_full".to_string(),
+            phase: Phase::HashingFull,
         });
         let _ = emit_tui_event(&TuiEvent::Log {
             message: format!("Verifying {total_full_files} duplicate candidate file(s)"),
@@ -705,7 +705,7 @@ pub(super) fn hash_groups_and_update_cache(
                         let file = &group[work.files[idx].members[0]];
                         let path = &file.path;
                         emit_worker_activity(
-                            "hashing_full",
+                            Phase::HashingFull,
                             worker,
                             Some(path.display().to_string()),
                             tui_events,
@@ -718,7 +718,7 @@ pub(super) fn hash_groups_and_update_cache(
                             let done = full_done.fetch_add(1, Ordering::Relaxed) + 1;
                             emit_hash_progress(done as usize, total_full_files, tui_events);
                         }
-                        emit_worker_activity("hashing_full", worker, None, tui_events);
+                        emit_worker_activity(Phase::HashingFull, worker, None, tui_events);
                         match digest_result {
                             Ok(hash) => {
                                 let physical = &work.files[idx];

@@ -15,8 +15,8 @@ use super::linking::{
     Applied, ApplyOptions, ApplyOutcome, CanonicalRoots, LinkRequest, Linked, apply_actions,
     ensure_target_within_media_root, plan_group_actions, replace_file_with_best_link_with,
 };
-use super::types::{Cache, CacheEntry, FileInfo, LinkMode, RunMetrics, RunWarnings};
-use crate::protocol::LinkReportEntry;
+use super::types::{Cache, CacheEntry, FileInfo, LinkMode, RunMetrics};
+use crate::protocol::{EntryStatus, LinkMethod, LinkReportEntry};
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     let ts = SystemTime::now()
@@ -239,7 +239,7 @@ fn replaces_file_with_relative_symlink_atomically() {
         |from, to| fs::rename(from, to),
     )
     .expect("replace with symlink");
-    assert_eq!(linked.method, "symlink");
+    assert_eq!(linked.method, LinkMethod::Symlink);
 
     let meta = fs::symlink_metadata(&src).expect("metadata");
     assert!(meta.file_type().is_symlink());
@@ -281,7 +281,7 @@ fn replace_file_with_best_link_falls_back_to_symlink_on_hardlink_error() {
     )
     .expect("replace with fallback");
 
-    assert_eq!(result.method, "symlink");
+    assert_eq!(result.method, LinkMethod::Symlink);
     let fallback_reason = result.fallback_reason.expect("fallback reason");
     assert!(fallback_reason.contains("hardlink failed"));
     assert!(fallback_reason.contains("symlink applied successfully"));
@@ -352,7 +352,7 @@ fn planned_entry_for(action: &super::types::LinkAction) -> LinkReportEntry {
         source: action.src.display().to_string(),
         target: action.tgt.display().to_string(),
         size: action.size,
-        status: "planned".to_string(),
+        status: EntryStatus::Planned,
         method: None,
         fallback_reason: None,
         error: None,
@@ -500,7 +500,7 @@ fn plan_group_actions_requires_both_sides() {
 #[test]
 fn collect_files_strict_fails_on_walk_error() {
     let missing = PathBuf::from("/this/path/does/not/exist/dejaview");
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut metrics = RunMetrics::default();
     let result = collect_files(
         &test_root(&missing),
@@ -536,7 +536,7 @@ fn partially_linked_groups_still_plan_remaining_download_duplicates() {
         .expect("create downloads");
     fs::hard_link(&target, &linked_download).expect("create already-linked download");
 
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut metrics = RunMetrics::default();
     let mut files = collect_run_files(
         &downloads,
@@ -701,7 +701,7 @@ fn apply_actions_rejects_source_metadata_change_after_planning() {
     std::thread::sleep(Duration::from_millis(2));
     write_file(&src, b"changed-content");
 
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut report_entries = vec![planned_entry_for(&action)];
     let ApplyOutcome {
         counts: Applied { applied, .. },
@@ -724,7 +724,7 @@ fn apply_actions_rejects_source_metadata_change_after_planning() {
     assert_eq!(applied, 0);
     assert!(strict_error.is_none());
     assert_eq!(warnings.link_errors, 1);
-    assert_eq!(report_entries[0].status, "failed");
+    assert_eq!(report_entries[0].status, EntryStatus::Failed);
     assert!(
         report_entries[0]
             .error
@@ -781,7 +781,7 @@ fn apply_actions_rejects_target_metadata_change_after_planning() {
     std::thread::sleep(Duration::from_millis(2));
     write_file(&tgt, b"changed-content");
 
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut report_entries = vec![planned_entry_for(&action)];
     let ApplyOutcome {
         counts: Applied { applied, .. },
@@ -804,7 +804,7 @@ fn apply_actions_rejects_target_metadata_change_after_planning() {
     assert_eq!(applied, 0);
     assert!(strict_error.is_none());
     assert_eq!(warnings.link_errors, 1);
-    assert_eq!(report_entries[0].status, "failed");
+    assert_eq!(report_entries[0].status, EntryStatus::Failed);
     assert!(
         report_entries[0]
             .error
@@ -886,7 +886,7 @@ fn apply_actions_allow_multiple_sources_for_same_target_in_one_run() {
         },
     ];
 
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut report_entries = actions.iter().map(planned_entry_for).collect::<Vec<_>>();
     let ApplyOutcome {
         counts: Applied { applied, .. },
@@ -909,7 +909,11 @@ fn apply_actions_allow_multiple_sources_for_same_target_in_one_run() {
     assert_eq!(applied, 2);
     assert!(strict_error.is_none());
     assert_eq!(warnings.link_errors, 0);
-    assert!(report_entries.iter().all(|entry| entry.status == "applied"));
+    assert!(
+        report_entries
+            .iter()
+            .all(|entry| entry.status == EntryStatus::Applied)
+    );
 
     let src_a_meta = fs::metadata(&src_a).expect("src_a metadata after apply");
     let src_b_meta = fs::metadata(&src_b).expect("src_b metadata after apply");
@@ -1276,7 +1280,7 @@ fn apply_actions_refuses_to_replace_a_file_inside_the_media_root() {
         src_snapshot: snapshot_of(&library_copy),
         tgt_snapshot: snapshot_of(&canonical),
     };
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut report_entries = vec![planned_entry_for(&action)];
     let ApplyOutcome {
         counts: Applied { applied, .. },
@@ -1324,7 +1328,7 @@ fn collect_refuses_a_directory_that_is_the_other_root() {
     let mut media = RootId::of("media", &library_view).expect("media id");
     media.path = root.join("media");
 
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut metrics = RunMetrics::default();
     let err = collect_files(
         &test_root(&downloads),
@@ -1380,7 +1384,7 @@ fn collect_files_skips_dejaview_own_files() {
     );
     write_file(&root.join(".dejaview-notes.txt"), b"not ours");
 
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut metrics = RunMetrics::default();
     let files = collect_files(
         &test_root(&root),
@@ -1626,7 +1630,7 @@ fn apply_actions_stops_before_the_next_file_when_cancelled() {
     };
     let cancel = CancelToken::default();
     cancel.cancel();
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut report_entries = vec![planned_entry_for(&action)];
 
     let outcome = apply_actions(
@@ -1645,7 +1649,7 @@ fn apply_actions_stops_before_the_next_file_when_cancelled() {
 
     assert!(outcome.cancelled);
     assert_eq!(outcome.counts.applied, 0);
-    assert_eq!(report_entries[0].status, "planned");
+    assert_eq!(report_entries[0].status, EntryStatus::Planned);
     assert_eq!(fs::metadata(&src).expect("meta").ino(), src_inode);
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
@@ -1829,7 +1833,7 @@ fn a_download_found_to_be_the_library_file_at_link_time_is_already_linked() {
         src_snapshot: snapshot_of(&src),
         tgt_snapshot: snapshot_of(&tgt),
     };
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut report_entries = vec![planned_entry_for(&action)];
 
     let outcome = apply_actions(
@@ -1849,7 +1853,7 @@ fn a_download_found_to_be_the_library_file_at_link_time_is_already_linked() {
     assert!(outcome.strict_error.is_none());
     assert_eq!(outcome.counts.applied, 0, "nothing was linked");
     assert_eq!(outcome.counts.already_linked, 1);
-    assert_eq!(report_entries[0].status, "already-linked");
+    assert_eq!(report_entries[0].status, EntryStatus::AlreadyLinked);
     assert_eq!(warnings.link_errors, 0);
     let leftovers = fs::read_dir(&downloads)
         .expect("read downloads")
@@ -1883,7 +1887,11 @@ fn a_symlink_the_filesystem_made_for_a_hardlink_is_reported_as_a_symlink() {
     )
     .expect("link");
 
-    assert_eq!(linked.method, "symlink", "the report says what is on disk");
+    assert_eq!(
+        linked.method,
+        LinkMethod::Symlink,
+        "the report says what is on disk"
+    );
     assert!(
         linked
             .fallback_reason
@@ -2051,7 +2059,7 @@ fn a_folder_swapped_for_a_symlink_while_linking_cannot_redirect_the_rename() {
     )
     .expect("link");
 
-    assert_eq!(linked.method, "hardlink");
+    assert_eq!(linked.method, LinkMethod::Hardlink);
     assert_eq!(
         fs::read(elsewhere.join("movie.mkv")).expect("decoy"),
         b"someone else's file",
@@ -2208,7 +2216,7 @@ fn excluded_folders_are_never_walked() {
     write_file(&downloads.join("@eaDir/thumb.mkv"), b"same-content");
     let config = make_config(&downloads, &media, 0);
     let exclude = Exclude::new(config.effective_exclude());
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut metrics = RunMetrics::default();
 
     let files = collect_run_files(
@@ -2260,7 +2268,7 @@ fn the_parallel_walk_finds_every_file_in_a_wide_tree() {
     }
     let config = make_config(&downloads, &media, 0);
     let exclude = Exclude::new(config.effective_exclude());
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut metrics = RunMetrics::default();
 
     let files = collect_run_files(
@@ -2321,7 +2329,7 @@ fn a_cancelled_walk_stops_with_cancelled() {
             cancel: &cancel,
         },
         &test_pool(),
-        &mut RunWarnings::default(),
+        &mut WarningSummary::default(),
         &mut RunMetrics::default(),
     );
     assert!(result.expect_err("cancelled").is::<Cancelled>());
@@ -2438,7 +2446,7 @@ fn hashing_saves_the_cache_as_it_goes() {
     write_file(&downloads.join("movie.mkv"), b"same-content");
     write_file(&media.join("movie.mkv"), b"same-content");
     let exclude = Exclude::default();
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let files = collect_run_files(
         &downloads,
         &media,
@@ -2644,12 +2652,12 @@ fn a_failed_pair_names_the_os_error_and_drops_the_planned_method() {
         tgt_snapshot: snapshot_of(&tgt),
     };
     let mut entry = planned_entry_for(&action);
-    entry.method = Some("try-hardlink".to_string());
+    entry.method = Some(LinkMethod::TryHardlink);
     entry.fallback_reason = Some("tries hardlink first; may fall back to symlink".to_string());
     // Gone between the plan and the link, as when a torrent is removed.
     fs::remove_file(&src).expect("remove download");
 
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut report_entries = vec![entry];
     apply_actions(
         &[action],
@@ -2666,7 +2674,7 @@ fn a_failed_pair_names_the_os_error_and_drops_the_planned_method() {
     );
 
     let entry = &report_entries[0];
-    assert_eq!(entry.status, "failed");
+    assert_eq!(entry.status, EntryStatus::Failed);
     let error = entry.error.as_deref().expect("error");
     assert!(error.contains("cannot look up"), "{error}");
     assert!(

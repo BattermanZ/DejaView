@@ -119,15 +119,6 @@ impl CacheEntry {
 pub(super) type Cache = HashMap<String, CacheEntry>;
 
 #[derive(Default, Clone)]
-pub(super) struct RunWarnings {
-    pub(super) walk_errors: u64,
-    pub(super) metadata_errors: u64,
-    pub(super) sample_hash_errors: u64,
-    pub(super) full_hash_errors: u64,
-    pub(super) link_errors: u64,
-}
-
-#[derive(Default, Clone)]
 pub(super) struct RunMetrics {
     /// Files the walk found and kept, before hashing.
     pub(super) files_seen: usize,

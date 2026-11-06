@@ -301,6 +301,7 @@ pub fn save_report(report: &RunReport, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{Mode, Phase};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -366,9 +367,9 @@ mod tests {
         }"#;
 
         let report: RunReport = serde_json::from_str(json).expect("parse run report");
-        assert_eq!(report.mode, "scan");
+        assert_eq!(report.mode, Mode::Scan);
         assert_eq!(report.files_considered, 10);
-        assert_eq!(report.warning_total(), 0);
+        assert_eq!(report.warnings.total(), 0);
     }
 
     #[test]
@@ -417,7 +418,7 @@ mod tests {
         );
         // A binary from before the handshake opens with a phase.
         let older = TuiEvent::Phase {
-            phase: "collecting".to_string(),
+            phase: Phase::Collecting,
         };
         assert!(check_hello(&older, exe).is_err());
     }

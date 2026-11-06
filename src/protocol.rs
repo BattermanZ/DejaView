@@ -38,13 +38,108 @@ pub fn path_from(text: &str, raw: Option<&str>) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("the raw bytes of {text} are not hex: {raw}"))
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// Files a run could not read, hash or link, by step. The engine counts
+/// into it as the run goes and the report carries it as it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct WarningSummary {
     pub walk_errors: u64,
     pub metadata_errors: u64,
     pub sample_hash_errors: u64,
     pub full_hash_errors: u64,
     pub link_errors: u64,
+}
+
+impl WarningSummary {
+    /// Every failure, whatever the step: what `--strict` stops on.
+    pub fn total(&self) -> u64 {
+        self.walk_errors
+            + self.metadata_errors
+            + self.sample_hash_errors
+            + self.full_hash_errors
+            + self.link_errors
+    }
+}
+
+/// What kind of run wrote a report: a scan changes nothing, a link run
+/// replaces downloads.
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mode {
+    #[default]
+    Scan,
+    Link,
+}
+
+/// Where a report row's pair stands.
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EntryStatus {
+    /// Still to do: the plan's row, not yet linked.
+    #[default]
+    Planned,
+    /// Linked by a run.
+    Applied,
+    /// A link that failed; `error` says why.
+    Failed,
+    /// Left alone on purpose; `error` says why.
+    Skipped,
+    /// Found at link time to be one file already; nothing changed.
+    AlreadyLinked,
+}
+
+/// How a row's download is, or will be, linked to its library file.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinkMethod {
+    /// Planned: a hardlink will be tried first, with a symlink to fall back
+    /// on (ADR 0001).
+    TryHardlink,
+    Hardlink,
+    Symlink,
+}
+
+/// A step of a run, as the event stream names it.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    /// Walking both folders and grouping files by size.
+    Collecting,
+    /// Quick hashes of the first and last MiB.
+    HashingSample,
+    /// Full hashes of files whose quick hashes matched.
+    HashingFull,
+    /// Pairing each download with its library file.
+    Planning,
+    /// Replacing downloads with links.
+    Applying,
+}
+
+impl Mode {
+    /// The name the report gives it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Scan => "scan",
+            Mode::Link => "link",
+        }
+    }
+}
+
+impl LinkMethod {
+    /// The name the report gives it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinkMethod::TryHardlink => "try-hardlink",
+            LinkMethod::Hardlink => "hardlink",
+            LinkMethod::Symlink => "symlink",
+        }
+    }
+}
+
+impl Phase {
+    /// Hashing, quick or full: the phases whose progress counts files read.
+    pub fn is_hashing(self) -> bool {
+        matches!(self, Phase::HashingSample | Phase::HashingFull)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -60,8 +155,8 @@ pub struct LinkReportEntry {
     pub target_raw: Option<String>,
     #[serde(default)]
     pub size: u64,
-    pub status: String,
-    pub method: Option<String>,
+    pub status: EntryStatus,
+    pub method: Option<LinkMethod>,
     pub fallback_reason: Option<String>,
     pub error: Option<String>,
 }
@@ -94,27 +189,27 @@ impl PlannedPair {
 impl LinkReportEntry {
     /// Still to do: the plan's row, not yet linked.
     pub fn is_planned(&self) -> bool {
-        self.status.eq_ignore_ascii_case("planned")
+        self.status == EntryStatus::Planned
     }
 
     /// Linked by a run.
     pub fn is_applied(&self) -> bool {
-        self.status.eq_ignore_ascii_case("applied")
+        self.status == EntryStatus::Applied
     }
 
     /// A link that failed; `error` says why.
     pub fn is_failed(&self) -> bool {
-        self.status.eq_ignore_ascii_case("failed")
+        self.status == EntryStatus::Failed
     }
 
     /// Left alone on purpose; `error` says why.
     pub fn is_skipped(&self) -> bool {
-        self.status.eq_ignore_ascii_case("skipped")
+        self.status == EntryStatus::Skipped
     }
 
     /// Found at link time to be one file already.
     pub fn is_already_linked(&self) -> bool {
-        self.status.eq_ignore_ascii_case("already-linked")
+        self.status == EntryStatus::AlreadyLinked
     }
 
     /// Where the row sorts: by download path, then library path, compared
@@ -141,7 +236,7 @@ impl LinkReportEntry {
     /// This run turned the download into a symlink, which breaks if its
     /// library file is upgraded, renamed or deleted (ADR 0001).
     pub fn is_applied_symlink(&self) -> bool {
-        self.is_applied() && self.method.as_deref() == Some("symlink")
+        self.is_applied() && self.method == Some(LinkMethod::Symlink)
     }
 }
 
@@ -173,7 +268,8 @@ pub enum Outcome {
 /// report written before them is read.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RunReport {
-    pub mode: String,
+    /// `scan` or `link`.
+    pub mode: Mode,
     /// `complete`, `cancelled` or `failed`; see [`Outcome`].
     #[serde(default)]
     pub outcome: Outcome,
@@ -246,7 +342,9 @@ pub struct RunReport {
 
 /// The version of the `--tui-events` stream. The dashboard refuses a child
 /// that speaks another, such as a binary an upgrade replaced on disk while
-/// the dashboard was open. Raise it whenever an event changes shape.
+/// the dashboard was open. Raise it whenever an event changes shape, a new
+/// [`Phase`] or [`EntryStatus`] included: the dashboard cannot read a value
+/// it does not know.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// One line of the `--tui-events` stream. It opens with `hello` and ends with
@@ -260,15 +358,15 @@ pub enum TuiEvent {
         version: String,
     },
     Phase {
-        phase: String,
+        phase: Phase,
     },
     WorkerActivity {
-        phase: String,
+        phase: Phase,
         worker: usize,
         path: Option<String>,
     },
     File {
-        phase: Option<String>,
+        phase: Option<Phase>,
         path: String,
     },
     Count {
@@ -307,16 +405,6 @@ pub enum TuiEvent {
     Cancelled,
 }
 
-impl RunReport {
-    pub fn warning_total(&self) -> u64 {
-        self.warnings.walk_errors
-            + self.warnings.metadata_errors
-            + self.warnings.sample_hash_errors
-            + self.warnings.full_hash_errors
-            + self.warnings.link_errors
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,15 +430,19 @@ mod tests {
         );
     }
 
-    fn golden_entry(name: &str, status: &str, method: Option<&str>) -> LinkReportEntry {
+    fn golden_entry(
+        name: &str,
+        status: EntryStatus,
+        method: Option<LinkMethod>,
+    ) -> LinkReportEntry {
         LinkReportEntry {
             source: format!("/srv/downloads/{name}.mkv"),
             target: format!("/srv/media/Movies/{name}.mkv"),
             source_raw: None,
             target_raw: None,
             size: 4_194_304,
-            status: status.to_string(),
-            method: method.map(str::to_string),
+            status,
+            method,
             fallback_reason: None,
             error: None,
         }
@@ -359,28 +451,36 @@ mod tests {
     /// A link run's report with every field set and a row of every status:
     /// what a cron script parses.
     fn golden_report() -> RunReport {
-        let planned = golden_entry("Planned", "planned", Some("try-hardlink"));
-        let applied = golden_entry("Applied", "applied", Some("hardlink"));
+        let planned = golden_entry(
+            "Planned",
+            EntryStatus::Planned,
+            Some(LinkMethod::TryHardlink),
+        );
+        let applied = golden_entry("Applied", EntryStatus::Applied, Some(LinkMethod::Hardlink));
         let symlinked = LinkReportEntry {
             fallback_reason: Some("cross-device: no hardlink is possible".to_string()),
-            ..golden_entry("Symlinked", "applied", Some("symlink"))
+            ..golden_entry("Symlinked", EntryStatus::Applied, Some(LinkMethod::Symlink))
         };
         let already = LinkReportEntry {
             fallback_reason: Some("already this library file; nothing changed".to_string()),
-            ..golden_entry("Already", "already-linked", Some("hardlink"))
+            ..golden_entry(
+                "Already",
+                EntryStatus::AlreadyLinked,
+                Some(LinkMethod::Hardlink),
+            )
         };
         let skipped = LinkReportEntry {
             error: Some("left alone: its owner could no longer read it".to_string()),
-            ..golden_entry("Skipped", "skipped", None)
+            ..golden_entry("Skipped", EntryStatus::Skipped, None)
         };
         let failed = LinkReportEntry {
             source: "/srv/downloads/Bad\u{fffd}.mkv".to_string(),
             source_raw: Some("2f7372762f646f776e6c6f6164732f426164ff2e6d6b76".to_string()),
             error: Some("rename: Read-only file system (os error 30)".to_string()),
-            ..golden_entry("Failed", "failed", None)
+            ..golden_entry("Failed", EntryStatus::Failed, None)
         };
         RunReport {
-            mode: "link".to_string(),
+            mode: Mode::Link,
             outcome: Outcome::Complete,
             version: "0.1.0".to_string(),
             started_at: "2026-11-06T03:17:00Z".to_string(),
@@ -416,6 +516,23 @@ mod tests {
     }
 
     #[test]
+    fn the_names_the_log_uses_are_the_names_the_report_uses() {
+        for mode in [Mode::Scan, Mode::Link] {
+            assert_eq!(serde_json::to_value(mode).expect("mode"), mode.as_str());
+        }
+        for method in [
+            LinkMethod::TryHardlink,
+            LinkMethod::Hardlink,
+            LinkMethod::Symlink,
+        ] {
+            assert_eq!(
+                serde_json::to_value(method).expect("method"),
+                method.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn the_report_json_is_what_scripts_parse() {
         let json = serde_json::to_string_pretty(&golden_report()).expect("serialise report");
         assert_golden("run_report.json", &json);
@@ -427,7 +544,7 @@ mod tests {
     #[test]
     fn the_event_stream_is_what_the_dashboard_parses() {
         let mut scan = golden_report();
-        scan.mode = "scan".to_string();
+        scan.mode = Mode::Scan;
         scan.dry_run = true;
         scan.entries.truncate(1);
         let events = vec![
@@ -436,10 +553,10 @@ mod tests {
                 version: "0.1.0".to_string(),
             },
             TuiEvent::Phase {
-                phase: "collecting".to_string(),
+                phase: Phase::Collecting,
             },
             TuiEvent::File {
-                phase: Some("collecting".to_string()),
+                phase: Some(Phase::Collecting),
                 path: "/srv/downloads/Planned.mkv".to_string(),
             },
             TuiEvent::Count {
@@ -451,15 +568,15 @@ mod tests {
                 hash_progress_total: None,
             },
             TuiEvent::Phase {
-                phase: "hashing_sample".to_string(),
+                phase: Phase::HashingSample,
             },
             TuiEvent::WorkerActivity {
-                phase: "hashing_sample".to_string(),
+                phase: Phase::HashingSample,
                 worker: 3,
                 path: Some("/srv/media/Movies/Planned.mkv".to_string()),
             },
             TuiEvent::Phase {
-                phase: "hashing_full".to_string(),
+                phase: Phase::HashingFull,
             },
             TuiEvent::HashBytes {
                 done: 1_048_576,
@@ -469,13 +586,13 @@ mod tests {
                 entries: scan.entries.clone(),
             },
             TuiEvent::Phase {
-                phase: "planning".to_string(),
+                phase: Phase::Planning,
             },
             TuiEvent::Phase {
-                phase: "applying".to_string(),
+                phase: Phase::Applying,
             },
             TuiEvent::File {
-                phase: Some("applying".to_string()),
+                phase: Some(Phase::Applying),
                 path: "/srv/downloads/Planned.mkv".to_string(),
             },
             TuiEvent::Log {

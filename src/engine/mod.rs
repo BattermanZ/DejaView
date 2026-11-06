@@ -18,7 +18,8 @@ pub use types::LinkMode;
 pub use types::ScanRunOptions;
 
 use crate::protocol::Outcome;
-use crate::protocol::TuiEvent;
+use crate::protocol::WarningSummary;
+use crate::protocol::{Phase, TuiEvent};
 use cache::{CacheKeys, load_cache, prune_cache, save_cache};
 use collect::{CollectOptions, collect_run_files, group_files_by_size};
 use hashing::{CHECKPOINT_EVERY, Checkpoint, HashOptions, Hashed, hash_groups_and_update_cache};
@@ -27,7 +28,7 @@ use report::{
     RunReportInput, build_report_entries, build_run_report, maybe_confirm_apply, planned_bytes,
     print_run_summary, resolve_report_path, strict_failure, try_write_run_report,
 };
-use types::{Audience, Cache, LinkAction, RunMetrics, RunWarnings};
+use types::{Audience, Cache, LinkAction, RunMetrics};
 
 use crate::config::{Config, cache_path};
 use crate::logger;
@@ -243,7 +244,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
     let exclude = collect::Exclude::new(config.effective_exclude());
     let quick_pool = build_pool("quick", config.effective_threads())?;
     let full_pool = build_pool("full", config.effective_full_threads())?;
-    let mut warnings = RunWarnings::default();
+    let mut warnings = WarningSummary::default();
     let mut metrics = RunMetrics::default();
     let cache_path = cache_path(config)?;
     logger::info("run", format!("using cache path {}", cache_path.display()));
@@ -318,7 +319,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
     );
     if options.tui_events {
         let _ = types::emit_tui_event(&TuiEvent::Phase {
-            phase: "planning".to_string(),
+            phase: Phase::Planning,
         });
         let _ = types::emit_tui_event(&TuiEvent::Count {
             files_seen: Some(files_seen),
@@ -353,7 +354,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         }
         if options.tui_events {
             let _ = types::emit_tui_event(&TuiEvent::Phase {
-                phase: "applying".to_string(),
+                phase: Phase::Applying,
             });
             let _ = types::emit_tui_event(&TuiEvent::Log {
                 message: "Applying filesystem changes".to_string(),
@@ -473,11 +474,11 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         "run",
         format!(
             "finished mode={} outcome={:?} planned={} applied={} warnings={}",
-            report.mode,
+            report.mode.as_str(),
             report.outcome,
             report.planned_actions,
             report.applied_actions,
-            report.warning_total()
+            report.warnings.total()
         ),
     );
 
@@ -488,7 +489,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         }));
     }
 
-    let end = RunEnd::of(outcome, report.warning_total() > 0);
+    let end = RunEnd::of(outcome, report.warnings.total() > 0);
     if options.tui_events {
         let _ = types::emit_tui_event(&TuiEvent::Done {
             report: Box::new(report),
@@ -508,9 +509,9 @@ fn stopped_before_planning(
     started_at: std::time::SystemTime,
     (downloads, media): (&std::path::Path, &std::path::Path),
     metrics: RunMetrics,
-    warnings: RunWarnings,
+    warnings: WarningSummary,
 ) -> anyhow::Error {
-    if !options.strict || err.is::<Cancelled>() || report::warning_total(&warnings) == 0 {
+    if !options.strict || err.is::<Cancelled>() || warnings.total() == 0 {
         return err;
     }
     let report = build_run_report(
@@ -636,12 +637,12 @@ fn plan_by_walking(
     cache_path: &std::path::Path,
     filters: &reviewed::Filters<'_>,
     pools: Pools<'_>,
-    warnings: &mut RunWarnings,
+    warnings: &mut WarningSummary,
     metrics: &mut RunMetrics,
 ) -> Result<Planned> {
     if options.tui_events {
         let _ = types::emit_tui_event(&TuiEvent::Phase {
-            phase: "collecting".to_string(),
+            phase: Phase::Collecting,
         });
         let _ = types::emit_tui_event(&TuiEvent::Log {
             message: "Collecting candidate files".to_string(),
@@ -694,7 +695,7 @@ fn plan_by_walking(
             hash_progress_total: None,
         });
         let _ = types::emit_tui_event(&TuiEvent::Phase {
-            phase: "hashing_sample".to_string(),
+            phase: Phase::HashingSample,
         });
         let _ = types::emit_tui_event(&TuiEvent::Log {
             message: "Hashing files to identify duplicate candidates".to_string(),
