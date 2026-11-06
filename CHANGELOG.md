@@ -9,14 +9,14 @@
 - A pair that mergerfs's `link-exdev` option turned into a symlink is reported with `method` `symlink`, where it used to say `hardlink`. [#3]
 - Building DejaView needs Rust 1.89 or newer. [#3]
 - Files under 1 MiB are now skipped by default, so `.nfo` files, text subtitles and artwork are no longer linked. Set `dejaview config set-min-size 1` to link small files again. [#3]
-- `threads` now sets how many files are walked and quick-hashed at once, 16 when unset, where it was every hash's thread count and the number of CPUs when unset. Full reads have their own `full_threads`, 2 when unset; set it to 1 for a single spinning disk.
-- The cache file changes form on the first run: each entry is keyed by its folder and its path below it, and may hold a quick hash only. The change hashes nothing again, but a version older than this one reads the new cache as unusable and hashes every candidate again.
-- Walks now leave out the folders a NAS or an OS keeps for itself: `@eaDir`, `#recycle`, `#snapshot`, `@Recycle`, `.@__thumb`, `.recycle`, `.snapshots`, `.Trash-*`, `$RECYCLE.BIN` and `lost+found`. A file in one of them is no longer linked, nor used as the library file a download links to. `dejaview config set-exclude` changes the list, and with no pattern leaves nothing out.
+- `threads` now sets how many files are walked and quick-hashed at once, 16 when unset, where it was every hash's thread count and the number of CPUs when unset. Full reads have their own `full_threads`, 2 when unset; set it to 1 for a single spinning disk. [#4]
+- The cache file changes form on the first run: each entry is keyed by its folder and its path below it, and may hold a quick hash only. The change hashes nothing again, but a version older than this one reads the new cache as unusable and hashes every candidate again. [#4]
+- Walks now leave out the folders a NAS or an OS keeps for itself: `@eaDir`, `#recycle`, `#snapshot`, `@Recycle`, `.@__thumb`, `.recycle`, `.snapshots`, `.Trash-*`, `$RECYCLE.BIN` and `lost+found`. A file in one of them is no longer linked, nor used as the library file a download links to. `dejaview config set-exclude` changes the list, and with no pattern leaves nothing out. [#4]
 
 ### Added
 
-- `dejaview config set-full-threads N` sets how many files are read in full at once.
-- `dejaview config set-exclude [PATTERN]...` sets the file and folder names every walk leaves out, as globs, with everything under them. The report counts what the list left out in `skipped_by_exclude`, the summary says how many, and the log names each.
+- `dejaview config set-full-threads N` sets how many files are read in full at once. [#4]
+- `dejaview config set-exclude [PATTERN]...` sets the file and folder names every walk leaves out, as globs, with everything under them. The report counts what the list left out in `skipped_by_exclude`, the summary says how many, and the log names each. [#4]
 - `DEJAVIEW_CONFIG` sets the config file's path and `DEJAVIEW_LOG` the log's, or `-` for stderr, for containers and services run as a user with no home folder. [#3]
 - `dejaview config validate` tries one real hardlink from the library into downloads and says whether link runs will make hardlinks, and if not, why: different filesystems or mounts, or ownership and `fs.protected_hardlinks`. [#3]
 - Scans and links list symlinks in downloads that point into the library and no longer resolve, on stderr and in the report's `dangling_symlinks`. [#3]
@@ -25,22 +25,22 @@
 
 ### Changed
 
-- A scan or link run from the dashboard reports which file it is on and how many it has found or hashed up to ten times a second, instead of once for every file, which on a large library sent the dashboard hundreds of thousands of updates.
-- Hashing makes fewer round trips to a network drive: quick and full hashes read exactly the bytes they hash, where each spent one or two more reads finding the end of the file, and a full hash reads 8 MiB at a time instead of 1 MiB.
-- Linking makes fewer round trips to a network drive: each link looks up the library file once, where it looked it up four times, and the download once instead of twice.
-- In the dashboard, `l` and `L` link the reviewed rows without walking both folders again when neither file of any row has changed since the scan hashed it; a row that changed sends the run back to the walk, which checks every row as before, and so does a download that has other hardlinks or that the cache knows as a library file seen through a second mount. Such a run's report counts only the rows' files in `files_considered`. Before, every link from the dashboard walked both folders first, which takes minutes on a network drive.
-- The same share mounted at two paths, such as in a Docker cron job and on the host the dashboard runs on, now uses one set of cache entries. Before, each run pruned the other's entries as gone and the next one hashed them again.
-- A run that learns nothing new leaves the cache file as it is. Before, every run rewrote and flushed it, tens of megabytes on a large library.
-- Downloads and media are walked at once, many folders in parallel, so a run on a network drive no longer waits on one `stat` after another before hashing starts.
-- A repeat scan reads only files it has not hashed before: the cache now keeps each file's quick hash too, so a file whose quick hash matched no other is not read again. Before, every file sharing its size with a new or changed one was read again on every run.
-- A file of 1 MiB or less is read once, not twice: its quick hash reads it whole and stands as its full hash.
-- Files of a size that no download shares with a library file are no longer read, nor are those where every download already is a library file: no link can come of them.
+- A scan or link run from the dashboard reports which file it is on and how many it has found or hashed up to ten times a second, instead of once for every file, which on a large library sent the dashboard hundreds of thousands of updates. [#4]
+- Hashing makes fewer round trips to a network drive: quick and full hashes read exactly the bytes they hash, where each spent one or two more reads finding the end of the file, and a full hash reads 8 MiB at a time instead of 1 MiB. [#4]
+- Linking makes fewer round trips to a network drive: each link looks up the library file once, where it looked it up four times, and the download once instead of twice. [#4]
+- In the dashboard, `l` and `L` link the reviewed rows without walking both folders again when neither file of any row has changed since the scan hashed it; a row that changed sends the run back to the walk, which checks every row as before, and so does a download that has other hardlinks or that the cache knows as a library file seen through a second mount. Such a run's report counts only the rows' files in `files_considered`. Before, every link from the dashboard walked both folders first, which takes minutes on a network drive. [#4]
+- The same share mounted at two paths, such as in a Docker cron job and on the host the dashboard runs on, now uses one set of cache entries. Before, each run pruned the other's entries as gone and the next one hashed them again. [#4]
+- A run that learns nothing new leaves the cache file as it is. Before, every run rewrote and flushed it, tens of megabytes on a large library. [#4]
+- Downloads and media are walked at once, many folders in parallel, so a run on a network drive no longer waits on one `stat` after another before hashing starts. [#4]
+- A repeat scan reads only files it has not hashed before: the cache now keeps each file's quick hash too, so a file whose quick hash matched no other is not read again. Before, every file sharing its size with a new or changed one was read again on every run. [#4]
+- A file of 1 MiB or less is read once, not twice: its quick hash reads it whole and stands as its full hash. [#4]
+- Files of a size that no download shares with a library file are no longer read, nor are those where every download already is a library file: no link can come of them. [#4]
 
 ### Fixed
 
-- Ctrl+C, SIGTERM (a cron timeout, `docker stop`) or SIGHUP stops a scan or link before its next file and keeps the hashes it finished; a second Ctrl+C stops at once. Before, it ended the process on the spot and every hash of the run was lost, so a first run over a network drive that was interrupted started over from nothing. A run started under `nohup` still ignores hang-ups.
-- While hashing, the cache is saved every five minutes, so a run killed outright (SIGKILL, a power cut, a container stopped without grace) loses at most that much hashing. Before, it was saved only once hashing ended.
-- A cache file that cannot be read or parsed is named in the log with the reason before DejaView starts over with an empty one. Before, it was replaced silently, and the next run hashed the whole library again with no explanation.
+- Ctrl+C, SIGTERM (a cron timeout, `docker stop`) or SIGHUP stops a scan or link before its next file and keeps the hashes it finished; a second Ctrl+C stops at once. Before, it ended the process on the spot and every hash of the run was lost, so a first run over a network drive that was interrupted started over from nothing. A run started under `nohup` still ignores hang-ups. [#4]
+- While hashing, the cache is saved every five minutes, so a run killed outright (SIGKILL, a power cut, a container stopped without grace) loses at most that much hashing. Before, it was saved only once hashing ended. [#4]
+- A cache file that cannot be read or parsed is named in the log with the reason before DejaView starts over with an empty one. Before, it was replaced silently, and the next run hashed the whole library again with no explanation. [#4]
 - The dashboard's Run Log shows its newest lines, and the activity line says how the last run ended. Before, the log stayed on its first few lines, so "Scan finished", a failed link and the reason for it (such as another run holding the lock) showed nowhere. The link confirmations show `y link` and `n cancel` on their border, so a small terminal no longer cuts the prompt off. [#3]
 - Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder. Before, two link runs failed each other's pairs, the later one overwrote the other's report and cache, and `cache cleanup-temp` could delete a link another run was about to rename into place. [#3]
 - A download that already is its library file is reported as `already-linked` and counted apart from applied pairs. On mergerfs without `use_ino` or `inodecalc=hybrid-hash`, which gives one file two inode numbers, such pairs were reported as applied on every run. [#3]
@@ -56,3 +56,4 @@
 - Empty files are never linked. Before, every empty download was linked to an empty library file, and a torrent client that later wrote into a freshly created file wrote into the library. [#3]
 
 [#3]: https://github.com/BattermanZ/DejaView/pull/3
+[#4]: https://github.com/BattermanZ/DejaView/pull/4
