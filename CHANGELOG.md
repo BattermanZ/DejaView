@@ -4,10 +4,12 @@
 
 ### After upgrading
 
+- Building DejaView needs Rust 1.89 or newer.
 - Files under 1 MiB are now skipped by default, so `.nfo` files, text subtitles and artwork are no longer linked. Set `dejaview config set-min-size 1` to link small files again.
 
 ### Added
 
+- Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder: a run that finds another one going changes nothing and exits with code 3. Before, two link runs failed each other's pairs and the last one overwrote the other's report and cache.
 - `dejaview config validate` tries one real hardlink from the library into downloads and says whether link runs will make hardlinks, and if not, why: different filesystems or mounts, or ownership and `fs.protected_hardlinks`.
 - Scans and links list symlinks in downloads that point into the library and no longer resolve, on stderr and in the report's `dangling_symlinks`.
 - A link run's summary says how many downloads became symlinks.

@@ -121,11 +121,14 @@ dejaview link --confirm
 | `--min-size BYTES` | Skip files smaller than this for this run, in place of the configured floor. |
 | `--confirm` | `link` only. Ask before changing anything. Needs a terminal and cannot be combined with `--json`. |
 
-For a cron job:
+For a cron job, give the binary's absolute path (cron's `PATH` is short), send stdout to `/dev/null` so cron mails only warnings and errors, and treat exit code 3 as nothing to report:
 
 ```bash
-dejaview link --json --no-progress --report /var/log/dejaview-link.json
+# Every night at 03:17. The report stays at <downloads>/.dejaview_link_report.json.
+17 3 * * * /home/me/.cargo/bin/dejaview link --no-progress >/dev/null; rc=$?; [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || echo "dejaview link exited $rc"
 ```
+
+Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder. A run that finds another one going does nothing and exits with code 3, so a cron run that overlaps a long first run, or a run from the dashboard, skips its turn. Exit code 0 means the run finished, and 1 that it could not start or stopped on an error (with `--strict`, on the first failure).
 
 ### Terminal dashboard
 
@@ -174,6 +177,7 @@ The configuration lives in `~/.config/dejaview/config.json` (under `$XDG_CONFIG_
 | `<downloads>/.dejaview_cache.json` | Every scan and link. Entries for files that no longer exist are dropped after each complete run. |
 | `<downloads>/.dejaview_link_report.json` | Every link run without `--report`. |
 | `<downloads>/.dejaview_tui_report.json` | When you press `R` in the dashboard. |
+| `<downloads>/.dejaview_lock` | Every scan, link and `cache cleanup-temp`, which lock it while they run. It stays, empty; deleting it between runs is harmless. |
 | `~/.local/state/dejaview/dejaview.log` | Every command (under `$XDG_STATE_HOME` when set). Once it passes 5 MiB it moves to `dejaview.log.1`, replacing the previous one, so the two together stay near 10 MiB. |
 
 Files whose name starts with `.dejaview_` are never treated as duplicates.

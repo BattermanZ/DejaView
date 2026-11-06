@@ -4,6 +4,7 @@ use colored::*;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod config;
@@ -174,7 +175,23 @@ impl From<LinkModeArg> for LinkMode {
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+    match run_cli() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            // ADR 0003: 3 tells a script that another run had the lock and
+            // this one did nothing, which is not a failure to alert on.
+            if err.is::<engine::LockHeld>() {
+                ExitCode::from(3)
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     let command_name = command_name(&cli.command);
     let (_log_session, log_path) = logger::init(command_name)?;

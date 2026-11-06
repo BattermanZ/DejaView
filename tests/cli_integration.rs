@@ -1010,3 +1010,56 @@ fn config_validate_tries_a_real_hardlink() {
     }
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+#[test]
+fn a_second_run_exits_3_while_another_holds_the_lock() {
+    let root = unique_temp_dir("run_lock");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("a.mkv"), 5000, 1);
+    write_seeded(&media.join("a.mkv"), 5000, 1);
+    configure_small_files(&root, &downloads, &media);
+
+    // Stand in for a run in progress: hold the lock it would take.
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(downloads.join(".dejaview_lock"))
+        .expect("open lock file");
+    held.try_lock().expect("take the lock");
+
+    for args in [
+        &["scan", "--no-progress"][..],
+        &["link", "--no-progress"],
+        &["cache", "cleanup-temp"],
+    ] {
+        let out = run_cmd(&root, args);
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "{args:?} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("another DejaView run"),
+            "{args:?} stderr={stderr}"
+        );
+    }
+    let src = fs::metadata(downloads.join("a.mkv")).expect("download");
+    let lib = fs::metadata(media.join("a.mkv")).expect("library");
+    assert_ne!(src.ino(), lib.ino(), "the locked-out link changed nothing");
+
+    held.unlock().expect("release");
+    drop(held);
+    let out = run_cmd(&root, &["link", "--no-progress"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}

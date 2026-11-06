@@ -7,10 +7,12 @@ mod cancel;
 mod collect;
 mod hashing;
 mod linking;
+mod lock;
 mod report;
 mod types;
 
 pub use cancel::{CancelToken, Cancelled};
+pub use lock::LockHeld;
 pub use types::LinkMode;
 pub use types::ScanRunOptions;
 
@@ -42,6 +44,11 @@ pub fn audit_temp_artifacts(config: &Config) -> Result<Vec<std::path::PathBuf>> 
 }
 
 pub fn cleanup_temp_artifacts(config: &Config) -> Result<Vec<std::path::PathBuf>> {
+    let downloads = config
+        .downloads
+        .as_ref()
+        .ok_or_else(|| anyhow!("Downloads path not set"))?;
+    let _lock = lock::acquire(downloads)?;
     cache::cleanup_temp_artifacts(config)
 }
 
@@ -156,6 +163,8 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         ),
     );
 
+    // Held until the run returns, cache save and report included.
+    let _lock = lock::acquire(downloads)?;
     let mut warnings = RunWarnings::default();
     let mut metrics = RunMetrics::default();
     if options.tui_events {
