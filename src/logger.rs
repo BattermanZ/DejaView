@@ -141,8 +141,21 @@ impl Drop for Session {
     }
 }
 
+/// Tests that install the global logger hold this, so two of them running at
+/// once cannot write into each other's files.
+#[cfg(test)]
+static TEST_LOGGER_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+fn lock_test_logger() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOGGER_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 pub fn write_test_log(path: &Path, command: &str, message: &str) -> Result<String> {
+    let _guard = lock_test_logger();
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("log path has no parent: {}", path.display()))?;
@@ -222,6 +235,7 @@ mod tests {
             timestamp_nanos()
         ));
         let path = root.join("dejaview.log");
+        let _guard = lock_test_logger();
         {
             let _session = init_at_path(&path, "scan").expect("init test logger");
             info("scan", "doing work");
