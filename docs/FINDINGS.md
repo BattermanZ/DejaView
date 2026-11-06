@@ -4,7 +4,7 @@ Written for the next session that works on this repo. It holds every open findin
 
 ## Where things stand
 
-- Repo: `BattermanZ/DejaView`. The review was written against `a3959f9`. The safety group of the suggested order (S1 to S6, C1, C2, C4, C5, C6, with P1's size floor) is done on `claude/happy-fermat-r9d08c`; each of those findings ends with a Done line saying what was built and where it differs from the fix proposed.
+- Repo: `BattermanZ/DejaView`. The review was written against `a3959f9`. The safety group of the suggested order (S1 to S6, C1, C2, C4, C5, C6, with P1's size floor) is done and merged; the NAS speed group (P2 to P11) is done on `claude/happy-fermat-r9d08c`. Each of those findings ends with a Done line saying what was built and where it differs from the fix proposed.
 - All line numbers below refer to `a3959f9`, and the safety fixes moved many of them. Re-check them before editing.
 - State at `a3959f9`: 134 unit tests and 14 CLI tests pass as root and as non-root; `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean; CI (`.github/workflows/ci.yml`) passed on GitHub.
 - The reviewers' scratch files lived in the old container and are gone. Each finding below says how to reproduce it.
@@ -148,54 +148,64 @@ Measured by the reviewer on a 93,730-file library shaped like a Jellyfin/Kodi li
 - Fix (small): `min_size` config and flag; skip before building FileInfo and before the TUI File event; report a `skipped_by_min_size` count like `skipped_by_min_age`.
 - Done with S2 (see there); the report counts `skipped_by_min_size`.
 
-**P2. High. Small files in shared-size groups are re-read on every run.** **[verified]**
+**P2. Done. High. Small files in shared-size groups are re-read on every run.** **[verified]**
 - Where: `src/engine/hashing.rs:282-334` (phase 1 quick-hashes every physical file in a group that has any uncached member), `:326-332`, `sync_cache` at `:188-211` (only full-hashed files get entries).
 - 200 same-size `tvshow.nfo` files with different content plus one same-size download: 201 files read on every scan, cache stays at 0 entries. On the 94k library: 34,525 files and 593 MB still re-read on the second (warm) run, against 34,775 on the cold run (25.7 s sim).
 - Key fact: for files of 1 MiB or less, `sample_digest_from` reads the whole file and hashes it, so the quick hash already equals the full BLAKE3 (`full_digest` returns hex of the same value).
 - Fix: for size <= 1 MiB, store the quick hash as the full hash and cache it (small, low risk; prototype gave 0 warm reads and an identical plan). For larger files, optionally add `sample: Option<...>` to `CacheEntry` with a serde default so old caches still load.
 - The README's "rescanning ... costs very little" holds only for hardlinked videos; correct it.
+- Done: cache entries hold the quick hash beside the full hash, both optional, so a file whose quick hash matched no other is not read again while unchanged, and a file of 1 MiB or less stores its quick hash as its full hash. A warm scan of unchanged files reads nothing (a test counts the opens). An entry without a full hash makes an older binary read the cache as unusable and start empty: a rehash on downgrade, never a wrong pair. README's repeat-run claims now hold and say why.
 
-**P3. High. The folder walk is single-threaded and is the floor for every run.** **[reproduced]**
+**P3. Done. High. The folder walk is single-threaded and is the floor for every run.** **[reproduced]**
 - Where: `collect.rs:49-120` (WalkDir, one statx per file at :64).
 - Real mergerfs: 4.2-5.7 s for 93.7k files vs 0.23 s on ext4. Prototype parallel walk (rayon over `read_dir` plus `symlink_metadata`): serial 5.25 s, 4 threads 1.45 s, 16 threads 0.67 s. Sim: serial 65 s, 16 threads 4.0 s.
 - Fix (medium): parallel walk on rayon (decision 3) with its own concurrency (default about 16, not tied to CPU count); walk downloads and media at the same time; keep walk/metadata error counts, strict errors and cancel checks.
+- Done: each folder is read by one worker of a rayon pool, which hands the folders it finds back to the pool, and downloads and media are walked at once. Errors, strict failures, the other-root check and cancel behave as before; each root's files come back sorted by path. The pool is `threads` (P4), not tied to the CPU count.
 
-**P4. Medium. One thread setting for two kinds of I/O.** **[reproduced in sim]**
+**P4. Done. Medium. One thread setting for two kinds of I/O.** **[reproduced in sim]**
 - Where: `main.rs:176-180` (rayon global pool, CPU count), `hashing.rs:282`, `:365`.
 - Quick hashes are latency-bound (4 threads 25.7 s, 16 threads 8.6 s); full hashes are bandwidth-bound (more threads gain little, and on one spinning disk with seeks 4 threads were slower than 1 in the model).
 - Fix (small): separate `sample_threads` (default about 16) and `full_threads` (default 1-2); queue quick-hash work per file, not per group, so one large same-size group doesn't run on one worker.
+- Done: `threads` (default 16) sizes the pool that walks and quick-hashes, and `full_threads` (default 2, `config set-full-threads`) the pool that reads files whole; the global rayon pool is no longer configured. Quick and full hashes are queued per file inside each group through nested parallel iterators, so one large group spreads over the pool. One setting covers the walk and the quick hash rather than a separate `sample_threads`: both wait on the drive's latency.
 
-**P5. Medium-High. Ctrl+C, SIGTERM or a cron timeout on a CLI run throws away every finished hash.** **[reproduced]**
+**P5. Done. Medium-High. Ctrl+C, SIGTERM or a cron timeout on a CLI run throws away every finished hash.** **[reproduced]**
 - Where: `main.rs:321-327` (cancel token wired only for `--tui-events`), `mod.rs:146-174` (cache saved once, after hashing).
 - A first run over copied pairs can take hours on a NAS; any interruption restarts from zero.
 - Fix: catch SIGINT/SIGTERM and call `CancelToken::cancel` (with `ctrlc`, decision 3); also save the cache periodically during the full pass (every few minutes or N GB).
+- Done: `ctrlc` with `termination` turns SIGINT, SIGTERM and SIGHUP during a scan or link into a cancel, so the run stops before its next file or chunk, saves its hashes and exits 1 saying so; a second signal exits 130 at once. Each finished hash goes into the cache as it lands and the cache is saved every five minutes while hashing. A link run stopped this way still exits 0 after its report, as a dashboard cancel did; exit code 2 stays with C3.
 
-**P6. Medium. TUI single-row link and link-all repeat the whole walk.** **[reproduced]**
+**P6. Done. Medium. TUI single-row link and link-all repeat the whole walk.** **[reproduced]**
 - Where: `src/tui/actions.rs:127-148`, `src/engine/mod.rs:99-145`.
 - Real mergerfs: `link --only-source <row>` took 6.67 s, of which 6.29 s walking; about 65 s per row in the sim.
 - Fix (medium): pass the planned pair and both snapshots to the child, check both against the cache (the scan full-hashed both) and the existing pre-link checks, fall back to today's path otherwise. Do the same for L with the planned list (ties in with S5).
+- Done: `link --plan`, which `l` and `L` run, plans from the cache when it vouches for every reviewed row: both files where the walk would find and take them, unchanged since their full hashes were cached, hashing alike and not already one file, with every folder up to each root checked against the other root's device and inode as the walk does. Then neither folder is walked. Any row it cannot vouch for sends the whole run to the walk, and the log says why. The snapshots come from the cache and a fresh `stat` rather than from the plan file, so the plan format is unchanged.
 
-**P7. Low-Medium. Cache rewritten and fsynced every run; absolute-path keys.** **[reproduced]**
+**P7. Done. Low-Medium. Cache rewritten and fsynced every run; absolute-path keys.** **[reproduced]**
 - Where: `mod.rs:174`, `cache.rs:14-34`, `fsutil.rs:15-46`.
 - 200k entries: 78.5 MB file, 0.3 s load, 0.3-0.4 s save, 170 MB peak RSS (`read_to_string` holds the whole file). Two mount paths for the same share (Docker cron vs host TUI) prune each other's entries.
 - Fix: skip the save when nothing changed; keys relative to the downloads or media root (old cache misses once); `from_reader(BufReader)`; optionally move the cache to `XDG_CACHE_HOME`.
+- Done: keys name the root and the path below it (`media/Movies/a.mkv`), and a cache with absolute keys is renamed on load, so the upgrade rereads nothing; the cache is saved only when a key was renamed, an entry written or one pruned; it is parsed from a buffered reader. A cache that cannot be read or parsed is logged as a warning (M4's corrupt-cache point). It stays in the downloads folder rather than `XDG_CACHE_HOME`.
 
-**P8. Medium. Size groups that can't produce an action are still hashed; no exclude list.** **[reproduced]**
+**P8. Done. Medium. Size groups that can't produce an action are still hashed; no exclude list.** **[reproduced]**
 - Where: `hashing.rs:167-169` (only checks `inodes.len() < 2`), `collect.rs:49-63`.
 - Groups with no download member, or no media member, are quick-hashed every run (20 unrelated same-size library files: 20 reads per run, never cached).
 - NAS housekeeping folders (`@eaDir`, `#recycle`, `.Trash-*`) are walked and hashed; `#recycle` sorts first by bytes, so a recycle-bin copy can become the link target.
 - Fix: drop groups lacking either side before hashing (tiny); add `exclude` glob lists per root with sensible defaults, applied with `filter_entry` so excluded trees are never read (small).
+- Done: a size group is not read when it lacks a download or a library file, or when every download in it already is a library file. An `exclude` list of name globs (`*`, `?`), by default the folders a NAS or an OS keeps for itself, is applied as the walk meets each name, so an excluded tree is never read; `config set-exclude` sets it and `config validate` walks the same way. One list covers both roots rather than one per root, since the folders it is for appear in both.
 
-**P9. Low-Medium. Read path.** **[reproduced]**
+**P9. Done. Low-Medium. Read path.** **[reproduced]**
 - Where: `hashing.rs:26-55, 86-99`.
 - `read_up_to` always does one extra read at end of file (a 4 KB file costs 2 reads; on mergerfs with `cache.files=off`, 20 of 30 daemon preads returned 0); a fresh zeroed 1 MiB buffer per quick hash; full hash reads 1 MiB at a time synchronously (10-15% under link rate in the sim).
 - Fix: read exactly `min(size, 1 MiB)` for head and tail (size is known); reuse one buffer per thread; 4-8 MiB reads or one-chunk read-ahead for full hashes. Keep the short-read tolerance. BLAKE3 is not the limit (4.1 GB/s single thread).
+- Done: a quick hash reads exactly min(size, 1 MiB) from each end, each worker reuses one buffer per kind of hash, and full hashes read 8 MiB at a time. No fadvise, which went with libc (decision 3).
 
-**P10. Low. Per-link syscalls and an unbuffered log.** **[reproduced]**
+**P10. Done. Low. Per-link syscalls and an unbuffered log.** **[reproduced]**
 - Where: `linking.rs:51-74` (two canonicalize per action, media root every time), `20, 86-101, 285-290` (target stat'ed three times), `:131` (`exists()` after rename), `logger.rs:93-108` (about 11 write calls per line).
 - Fix: canonicalize the media root once per run; one lstat for the target; drop the post-rename `exists()`; write each log line with one `write_all`.
+- Done: each pair takes one lstat of the download and one of the library file for every check, the media root is resolved once per run, and each log line is written with one `write_all`. The temp name's lstat after the rename stays, since C5 relies on it to find a pair that already was one file.
 
-**P11. Low.** TUI event stream: 201k NDJSON lines (33.5 MB) for 93.7k files, one flush per event; it keeps up but costs 0.1-0.3 s locally. Throttle File/Count events to about every 100 ms and buffer stdout. Memory: about 0.7 KB per file (91 MB peak at 94k files); store `seen_paths` as 64-bit hashes and the hash as `[u8; 32]` if it matters.
+**P11. Done. Low.** TUI event stream: 201k NDJSON lines (33.5 MB) for 93.7k files, one flush per event; it keeps up but costs 0.1-0.3 s locally. Throttle File/Count events to about every 100 ms and buffer stdout. Memory: about 0.7 KB per file (91 MB peak at 94k files); store `seen_paths` as 64-bit hashes and the hash as `[u8; 32]` if it matters.
+- Done: `file` and `count` events from the walk and the hashing go at most once per 100 ms across all workers; the count that ends a phase always goes. stdout stays line-buffered with a flush per event, since what is left is a few lines a second. The memory points are not done.
 
 ### TUI and CLI usability
 
@@ -253,6 +263,7 @@ All reproduced by rendering the TUI in a pty with pyte at 60x20, 80x24, 100x30, 
 **M4. Medium. Test gaps.**
 - Done in `just test`, which reruns the unit tests as `nobody` under root. A bare `cargo test` as root still reports the five as `ok`.
 - TUI tests `starting_run_clears_stale_report_rows` and `rescan_clears_cache_then_starts_scan` really spawn the test binary with `scan --tui-events --no-progress`. Inject the job spawner into App so tests never spawn a process.
+- Done with P7: a cache that cannot be read or parsed is logged as a warning before DejaView starts with an empty one.
 - Untested: cross-device symlink fallback end to end (CI can use `/dev/shm` when its device differs from temp_dir), corrupt cache (today silently replaced by an empty one at `cache.rs:18` with no log line; `cache info` shows 0 and a multi-TB library is rehashed without explanation; log a warning), concurrent runs, partial-failure and cancel reports, the TUI strict path (U5). `run_scan_respects_min_age_filter` has no positive control.
 - Line coverage is 75.6%.
 
@@ -272,7 +283,7 @@ All reproduced by rendering the TUI in a pty with pyte at 60x20, 80x24, 100x30, 
 
 ### Docs to correct
 
-- README "Cheap repeat runs" and "rescanning ... costs very little": true for hardlinked videos, not for small sidecars (P2).
+- Done: README "Cheap repeat runs" now holds, since P2 keeps quick hashes, and says so.
 - Done: README mergerfs section has `use_ino` for older mergerfs (C5) and the symlink-fallback risks (S3).
 - Done: `fallback_reason` names the cause and the OS error (S3).
 - Done: README cron example has the absolute binary path, drops stdout and treats exit 3 as nothing to report (C2, ADR 0003).
@@ -281,6 +292,6 @@ All reproduced by rendering the TUI in a pty with pyte at 60x20, 80x24, 100x30, 
 ## Suggested order
 
 1. Safety, done on `claude/happy-fermat-r9d08c`: S1, S2 (empty files, with P1's floor), S3, S4, S5, C1, C6, C2 (lock), C4 (logging), C5, then S6.
-2. NAS speed: P1 (done with S2), P2, P8, P3, P4, P7, then P5 and P6, then P9, P10, P11.
+2. NAS speed, done on `claude/happy-fermat-r9d08c`: P1 (with S2), P2, P8, P3, P4, P7, then P5 and P6, then P9, P10, P11.
 3. Reports and UI: C3, C10, U1, U5, U2, U3, U4, U6, U7, U8, U9, C7, C8, C9.
 4. Maintenance and release: M1, M5, M6, M3, M2, M4, M7, M9, M8, docs.
