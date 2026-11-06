@@ -6,17 +6,12 @@ use super::cancel::CancelToken;
 use crate::protocol::TuiEvent;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LinkMode {
+    #[default]
     Best,
     SymlinkOnly,
-}
-
-impl Default for LinkMode {
-    fn default() -> Self {
-        Self::Best
-    }
 }
 
 #[derive(Debug, Clone)]

@@ -67,7 +67,7 @@ fn init_at_path(path: &PathBuf, command: &str) -> Result<Session> {
     // Best effort: a log that cannot rotate must not stop the command.
     let _ = rotate_if_large(path, MAX_LOG_BYTES);
 
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     let run_id = format!("{}-{}", std::process::id(), timestamp_nanos());
     writeln!(
         file,
@@ -139,6 +139,22 @@ impl Drop for Session {
     fn drop(&mut self) {
         shutdown();
     }
+}
+
+#[cfg(test)]
+pub fn write_test_log(path: &Path, command: &str, message: &str) -> Result<String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("log path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)?;
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let run_id = "test-run".to_string();
+    if let Ok(mut slot) = logger_slot().lock() {
+        *slot = Some(LoggerState { file, run_id });
+    }
+    info(command, message);
+    shutdown();
+    Ok(fs::read_to_string(path)?)
 }
 
 #[cfg(test)]
@@ -214,20 +230,4 @@ mod tests {
         assert!(contents.contains("msg=\"run finished\""));
         fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
-}
-
-#[cfg(test)]
-pub fn write_test_log(path: &Path, command: &str, message: &str) -> Result<String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("log path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent)?;
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
-    let run_id = "test-run".to_string();
-    if let Ok(mut slot) = logger_slot().lock() {
-        *slot = Some(LoggerState { file, run_id });
-    }
-    info(command, message);
-    shutdown();
-    Ok(fs::read_to_string(path)?)
 }
