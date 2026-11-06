@@ -20,17 +20,38 @@ use crate::protocol::TuiEvent;
 
 fn sample_digest(path: &Path, size: u64) -> Result<[u8; 32]> {
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    sample_digest_from(&mut file, size)
+}
+
+fn sample_digest_from<R: Read + Seek>(reader: &mut R, size: u64) -> Result<[u8; 32]> {
     let mut hasher = Hasher::new();
     let mut buf = vec![0u8; 1 << 20];
-    let n = file.read(&mut buf)?;
+    let n = read_up_to(reader, &mut buf)?;
     hasher.update(&buf[..n]);
     if size > buf.len() as u64 {
         let offset = size - buf.len() as u64;
-        file.seek(SeekFrom::Start(offset))?;
-        let n = file.read(&mut buf)?;
+        reader.seek(SeekFrom::Start(offset))?;
+        let n = read_up_to(reader, &mut buf)?;
         hasher.update(&buf[..n]);
     }
     Ok(hasher.finalize().into())
+}
+
+/// Fill `buf` unless the reader hits end of file first, and return how many
+/// bytes were read. A single `read` may return fewer bytes than asked for (FUSE
+/// mounts such as mergerfs do), which would make identical files sample
+/// differently.
+fn read_up_to<R: Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(filled)
 }
 
 fn worker_id() -> usize {
@@ -68,7 +89,7 @@ pub(super) fn full_digest(path: &Path, cancel: &CancelToken) -> Result<String> {
     let mut buf = vec![0u8; 1 << 20];
     loop {
         cancel.check()?;
-        let n = file.read(&mut buf)?;
+        let n = read_up_to(&mut file, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -430,6 +451,68 @@ mod tests {
             inode: file.inode,
             hash: hash.to_string(),
         }
+    }
+
+    /// Returns at most `max` bytes per read, as a FUSE mount such as mergerfs
+    /// with direct I/O can.
+    struct ShortReads<R> {
+        inner: R,
+        max: usize,
+    }
+
+    impl<R: Read> Read for ShortReads<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let len = buf.len().min(self.max);
+            self.inner.read(&mut buf[..len])
+        }
+    }
+
+    impl<R: Seek> Seek for ShortReads<R> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    #[test]
+    fn sample_digest_is_the_same_when_reads_come_back_short() {
+        // Bigger than the 1 MiB sample so both the head and the tail are read.
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        let size = data.len() as u64;
+        let whole = sample_digest_from(&mut std::io::Cursor::new(data.clone()), size)
+            .expect("digest with full reads");
+        let mut short = ShortReads {
+            inner: std::io::Cursor::new(data),
+            max: 7,
+        };
+        let chunked = sample_digest_from(&mut short, size).expect("digest with short reads");
+        assert_eq!(whole, chunked);
+    }
+
+    /// Fails the first read with EINTR, then reads normally.
+    struct InterruptedOnce<R> {
+        inner: R,
+        interrupted: bool,
+    }
+
+    impl<R: Read> Read for InterruptedOnce<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    #[test]
+    fn read_up_to_retries_an_interrupted_read() {
+        let mut reader = InterruptedOnce {
+            inner: std::io::Cursor::new(vec![9u8; 10]),
+            interrupted: false,
+        };
+        let mut buf = [0u8; 16];
+        assert_eq!(read_up_to(&mut reader, &mut buf).expect("read"), 10);
+        assert_eq!(&buf[..10], &[9u8; 10]);
     }
 
     #[test]
