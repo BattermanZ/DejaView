@@ -32,15 +32,21 @@ change that breaks one is wrong whatever else it fixes.
 - **`--tui-events` stdout is pure NDJSON**: one event per line and nothing
   else, because the TUI parses it (see How the program is shaped). Anything
   meant for a person is left out in that mode.
-  `link_tui_events_stdout_stays_machine_parseable` holds it.
+  `link_tui_events_stdout_stays_machine_parseable` holds it, and `src/engine`
+  denies clippy's print lints, so every line the engine prints goes through
+  `report::print_out`, which writes nothing to stdout in that mode.
 - **The report JSON and `--json` output are a public format.** Cron scripts
   parse them. Renaming, removing or retyping a field breaks those scripts: it
   takes a ticket that asks for it and an `### After upgrading` line in the
-  changelog. Adding a field does not.
+  changelog. Adding a field does not. The golden files in `tests/golden/`
+  hold the report and the event stream byte for byte; a change made on
+  purpose rewrites them with `DEJAVIEW_BLESS=1`, and their diff is what a
+  script will see.
 - **The cache, `<downloads>/.dejaview_cache.json`, survives an upgrade.** A
   cache that no longer parses is replaced by an empty one, which means
   rehashing the whole library over a network drive. Change its format the way
-  you would change the report's.
+  you would change the report's. `a_cache_entry_is_one_flat_object_on_disk`
+  holds an entry's bytes.
 
 ## Who runs it, and where
 
@@ -148,6 +154,10 @@ just try <args>     # run dejaview against it: just try scan, just try link --js
 **A fix starts from a test that fails on the bug.** Run it red before the fix
 and green after, and say in the pull request that it failed first.
 
+**A test takes its folder from `TempDir`** in `tests/common/mod.rs`, which
+removes it on drop, even after a failed assertion; unit tests reach the same
+module as `crate::test_common`.
+
 **`just test` reruns the unit tests as `nobody` under root**, because five
 engine tests make a file unreadable and root reads it anyway: as root those
 tests return early and still report `ok`. Run `just test` rather than `cargo
@@ -162,7 +172,10 @@ terminal; say so in the pull request when you could not.
 
 ## How the program is shaped
 
-- `src/main.rs` is the CLI and wires every command.
+- `src/main.rs` is the CLI and wires every command. `config::check` in
+  `src/config.rs` is the one check a configuration passes, for `config
+  validate`, every run and the dashboard's path editor: a new requirement on
+  the folders goes there.
 - `src/engine/` does the work, in this order: `collect.rs` walks both roots
   and groups files by size, `hashing.rs` hashes them (a quick hash of the
   first and last MiB, a full hash only when quick hashes collide), `cache.rs`
@@ -171,7 +184,9 @@ terminal; say so in the pull request when you could not.
 - `src/tui/` never runs a scan or a link itself. It starts `dejaview scan`
   or `dejaview link` with `--tui-events` as a child process, reads the event
   stream (`src/tui/actions.rs`), and stops it by writing `cancel` to the
-  child's stdin. `src/protocol.rs` holds the stream's types. Two short calls
+  child's stdin. `src/protocol.rs` holds the stream's types, and
+  `src/tui/run_state.rs` what each event changes, with no thread or process,
+  so a test drives it with events alone. Two short calls
   into the engine run in the dashboard's process, both from `actions.rs`:
   clearing the cache, and the path editor's test hardlink, which runs on a
   thread of its own and only after the same second-mount check `config
