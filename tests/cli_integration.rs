@@ -1892,7 +1892,11 @@ fn quiet_and_json_cannot_be_combined() {
     let root = unique_temp_dir("quiet_json");
     fs::create_dir_all(&root).expect("create root");
     let out = run_cmd(&root, &["link", "--quiet", "--json"]);
-    assert_eq!(out.status.code(), Some(2), "clap's usage error");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a command line that cannot run exits 1; 2 means a run finished with failures"
+    );
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
@@ -2071,5 +2075,100 @@ fn a_plan_row_whose_path_is_not_utf8_links_that_file() {
         "the reviewed row is linked"
     );
     assert_ne!(inode(&ff), inode(&media.join("x.mkv")), "and nothing else");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_usage_error_exits_1_and_help_exits_0() {
+    let root = unique_temp_dir("usage");
+    fs::create_dir_all(&root).expect("create root");
+    let out = run_cmd(&root, &["link", "--bogus"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--bogus"));
+    let out = run_cmd(&root, &["--help"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Usage"));
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_broken_config_file_ends_the_event_stream_with_one_error() {
+    let root = unique_temp_dir("stream_broken_config");
+    let config = root.join("xdg").join("dejaview").join("config.json");
+    fs::create_dir_all(config.parent().expect("config folder")).expect("create config folder");
+    fs::write(&config, "{").expect("write broken config");
+
+    let out = run_cmd(&root, &["scan", "--tui-events", "--no-progress"]);
+
+    assert_eq!(out.status.code(), Some(1));
+    let events = stream_of(&out);
+    let last = final_event_of(&events);
+    assert_eq!(last["type"], "error");
+    assert!(
+        last["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("not valid JSON")),
+        "{last}"
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_strict_hash_failure_still_writes_and_prints_its_report() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = unique_temp_dir("strict_hash_report");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("unreadable.mkv"), 4000, 1);
+    write_seeded(&media.join("unreadable.mkv"), 4000, 1);
+    configure_small_files(&root, &downloads, &media);
+    fs::create_dir_all(root.join("home")).expect("create home");
+    let unreadable = downloads.join("unreadable.mkv");
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).expect("lock");
+    let report = root.join("report.json");
+
+    let out = run_unprivileged(
+        &root,
+        &[
+            "scan",
+            "--strict",
+            "--json",
+            "--no-progress",
+            "--report",
+            report.to_str().expect("report path"),
+        ],
+    );
+
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).expect("unlock");
+    assert_eq!(out.status.code(), Some(1));
+    let printed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("--json report");
+    assert_eq!(printed["outcome"], "failed");
+    assert_eq!(printed["warnings"]["sample_hash_errors"], 1);
+    assert_eq!(printed["files_considered"], 2);
+    let written: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("--report is written")).expect("parse");
+    assert_eq!(written["outcome"], "failed");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_quiet_run_says_how_many_downloads_became_symlinks() {
+    let root = unique_temp_dir("quiet_symlinks");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("a.mkv"), 2048, 1);
+    write_seeded(&media.join("a.mkv"), 2048, 1);
+    configure_small_files(&root, &downloads, &media);
+
+    let out = run_cmd(&root, &["link", "--quiet", "--symlink-only"]);
+
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim_end(),
+        format!(
+            "✔ Linked 1 of 1, 2.0 KiB freed, 1 as symlinks: see {}",
+            downloads.join(".dejaview_link_report.json").display()
+        )
+    );
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

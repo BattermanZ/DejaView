@@ -918,7 +918,10 @@ fn render_scrolling_overlay(
     }
     hint.push(Span::styled(close.to_string(), Theme::title(false)));
     frame.render_widget(Clear, area);
-    let body = Paragraph::new(lines.join("\n"))
+    // The lines on screen, cut out here: Paragraph::scroll counts in u16,
+    // which a report of a few thousand entries outgrows.
+    let visible = lines[scroll..(scroll + shown).min(lines.len())].join("\n");
+    let body = Paragraph::new(visible)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -930,8 +933,7 @@ fn render_scrolling_overlay(
                 .style(Theme::popup())
                 .border_style(Theme::accent()),
         )
-        .style(Theme::popup())
-        .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0));
+        .style(Theme::popup());
     frame.render_widget(body, area);
 }
 
@@ -1950,5 +1952,23 @@ mod editor_tests {
             error_lines.contains("library"),
             "the end of the path: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod long_overlay_tests {
+    use super::row_tests::{app_with_episodes, screen};
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn a_report_longer_than_65535_lines_scrolls_to_its_end() {
+        let mut app = app_with_episodes(7000);
+        app.handle_key_for_test(KeyCode::Char('J'), KeyModifiers::NONE);
+        screen(&app, 80, 24);
+        assert!(app.view_sizes().overlay_lines.get() > usize::from(u16::MAX));
+        app.handle_key_for_test(KeyCode::End, KeyModifiers::NONE);
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("S01E7000"), "the last entry:\n{text}");
+        assert!(text.lines().any(|line| line.contains("│  ]")), "{text}");
     }
 }

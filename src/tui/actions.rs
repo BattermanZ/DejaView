@@ -79,7 +79,7 @@ fn check_hello(event: &TuiEvent, exe: &Path) -> Result<()> {
 fn stream_subcommand_events(
     subcommand: &str,
     strict: bool,
-    extra_args: &[String],
+    extra_args: &[std::ffi::OsString],
     tx: Sender<Result<TuiEvent>>,
     cancel_rx: Receiver<()>,
 ) -> Result<()> {
@@ -225,7 +225,9 @@ pub fn run_link_pairs(
     let result = stream_subcommand_events(
         "link",
         strict,
-        &[String::from("--plan"), plan.display().to_string()],
+        // The path as it is, not as a string: a downloads folder whose name
+        // is not UTF-8 must still be found.
+        &["--plan".into(), plan.clone().into_os_string()],
         tx,
         cancel_rx,
     );

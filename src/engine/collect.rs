@@ -442,7 +442,7 @@ impl<'a> Walk<'a> {
                 logger::warn(
                     "scan",
                     format!(
-                        "cannot read the metadata of {}: {err}; it is left out of this run",
+                        "cannot read the metadata of {}: {err}; it is left out of this run. Make it readable, or add its name to the exclude list (`dejaview config set-exclude`)",
                         path.display()
                     ),
                 );

@@ -233,15 +233,36 @@ fn exit_code_of(end: engine::RunEnd) -> ExitCode {
     }
 }
 
+/// The command line, or the exit code for one that cannot run. clap would
+/// exit 2 on a usage error, which ADR 0003 keeps for a run that finished
+/// with failures: a script must not take a typo for a run that wrote its
+/// report. A usage error exits 1, as any run that could not start; help and
+/// version exit 0.
+fn parse_cli() -> std::result::Result<Cli, ExitCode> {
+    Cli::try_parse().map_err(|err| {
+        let _ = err.print();
+        if err.use_stderr() {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        }
+    })
+}
+
 fn run_cli() -> Result<ExitCode> {
-    let cli = Cli::parse();
+    let cli = match parse_cli() {
+        Ok(cli) => cli,
+        Err(code) => return Ok(code),
+    };
     let command_name = command_name(&cli.command);
     let (_log_session, log_place) = logger::init(command_name);
     match &log_place {
         Ok(place) => logger::info("main", format!("logger initialized at {place}")),
         Err(warning) => eprintln!("{} {warning}", "⚠".yellow()),
     }
-    let mut config = load_config()?;
+    // Loaded inside each command, so that for a dashboard's scan or link a
+    // broken config file ends the event stream like any other error.
+    let loaded = load_config();
 
     match cli.command {
         Commands::Scan {
@@ -251,6 +272,7 @@ fn run_cli() -> Result<ExitCode> {
             output,
         } => {
             let end = tui_stream(output.tui_events, || {
+                let mut config = loaded?;
                 ensure_required_paths(&config)?;
                 if min_size.is_some() {
                     config.min_size = min_size;
@@ -285,6 +307,7 @@ fn run_cli() -> Result<ExitCode> {
             output,
         } => {
             let end = tui_stream(output.tui_events, || {
+                let mut config = loaded?;
                 ensure_required_paths(&config)?;
                 let only_pairs = match &plan {
                     Some(path) => read_plan(path)?,
@@ -318,103 +341,109 @@ fn run_cli() -> Result<ExitCode> {
             })?;
             return Ok(exit_code_of(end));
         }
-        Commands::Config(args) => match args.command {
-            ConfigCommands::SetDownloads { path } => {
-                config.downloads = Some(normalize_runtime_dir(&path)?);
-                save_config(&config)?;
-                println!("{} Downloads path set.", "✔".green());
-            }
-            ConfigCommands::SetMedia { path } => {
-                config.media = Some(normalize_runtime_dir(&path)?);
-                save_config(&config)?;
-                println!("{} Media path set.", "✔".green());
-            }
-            ConfigCommands::Show => {
-                println!("{}", serde_json::to_string_pretty(&config)?);
-            }
-            ConfigCommands::SetMinAge { seconds } => {
-                config.min_age = Some(seconds);
-                save_config(&config)?;
-                println!("{} min_age set to {} seconds.", "✔".green(), seconds);
-            }
-            ConfigCommands::SetMinSize { bytes } => {
-                config.min_size = Some(bytes);
-                save_config(&config)?;
-                println!("{} min_size set to {} bytes.", "✔".green(), bytes);
-            }
-            ConfigCommands::SetThreads { count } => {
-                if count == 0 {
-                    return Err(anyhow::anyhow!(
-                        "threads must be at least 1: it is how many files are walked and quick-hashed at once; 16 suits a network drive"
-                    ));
+        Commands::Config(args) => {
+            let mut config = loaded?;
+            match args.command {
+                ConfigCommands::SetDownloads { path } => {
+                    config.downloads = Some(normalize_runtime_dir(&path)?);
+                    save_config(&config)?;
+                    println!("{} Downloads path set.", "✔".green());
                 }
-                config.threads = Some(count);
-                save_config(&config)?;
-                println!("{} threads set to {}.", "✔".green(), count);
-            }
-            ConfigCommands::SetFullThreads { count } => {
-                if count == 0 {
-                    return Err(anyhow::anyhow!(
-                        "full threads must be at least 1: it is how many files are read in full at once; use 2, or 1 for a single spinning disk"
-                    ));
+                ConfigCommands::SetMedia { path } => {
+                    config.media = Some(normalize_runtime_dir(&path)?);
+                    save_config(&config)?;
+                    println!("{} Media path set.", "✔".green());
                 }
-                config.full_threads = Some(count);
-                save_config(&config)?;
-                println!("{} full_threads set to {}.", "✔".green(), count);
-            }
-            ConfigCommands::SetExclude { patterns, default } => {
-                if default {
-                    config.exclude = None;
-                } else {
-                    config::check_exclude_patterns(&patterns)?;
-                    config.exclude = Some(patterns);
+                ConfigCommands::Show => {
+                    println!("{}", serde_json::to_string_pretty(&config)?);
                 }
-                save_config(&config)?;
-                let effective = config.effective_exclude();
-                if effective.is_empty() {
-                    println!("{} Walks now leave nothing out.", "✔".green());
-                } else {
-                    println!(
-                        "{} Walks now leave out: {}",
-                        "✔".green(),
-                        effective.join("  ")
-                    );
+                ConfigCommands::SetMinAge { seconds } => {
+                    config.min_age = Some(seconds);
+                    save_config(&config)?;
+                    println!("{} min_age set to {} seconds.", "✔".green(), seconds);
+                }
+                ConfigCommands::SetMinSize { bytes } => {
+                    config.min_size = Some(bytes);
+                    save_config(&config)?;
+                    println!("{} min_size set to {} bytes.", "✔".green(), bytes);
+                }
+                ConfigCommands::SetThreads { count } => {
+                    if count == 0 {
+                        return Err(anyhow::anyhow!(
+                            "threads must be at least 1: it is how many files are walked and quick-hashed at once; 16 suits a network drive"
+                        ));
+                    }
+                    config.threads = Some(count);
+                    save_config(&config)?;
+                    println!("{} threads set to {}.", "✔".green(), count);
+                }
+                ConfigCommands::SetFullThreads { count } => {
+                    if count == 0 {
+                        return Err(anyhow::anyhow!(
+                            "full threads must be at least 1: it is how many files are read in full at once; use 2, or 1 for a single spinning disk"
+                        ));
+                    }
+                    config.full_threads = Some(count);
+                    save_config(&config)?;
+                    println!("{} full_threads set to {}.", "✔".green(), count);
+                }
+                ConfigCommands::SetExclude { patterns, default } => {
+                    if default {
+                        config.exclude = None;
+                    } else {
+                        config::check_exclude_patterns(&patterns)?;
+                        config.exclude = Some(patterns);
+                    }
+                    save_config(&config)?;
+                    let effective = config.effective_exclude();
+                    if effective.is_empty() {
+                        println!("{} Walks now leave nothing out.", "✔".green());
+                    } else {
+                        println!(
+                            "{} Walks now leave out: {}",
+                            "✔".green(),
+                            effective.join("  ")
+                        );
+                    }
+                }
+                ConfigCommands::SetLinkMode { mode } => {
+                    config.link_mode = Some(mode.into());
+                    save_config(&config)?;
+                    println!("{} link mode set.", "✔".green());
+                }
+                ConfigCommands::Validate => validate_config(&config)?,
+            }
+        }
+        Commands::Cache(args) => {
+            let config = loaded?;
+            match args.command {
+                CacheCommands::Clear => {
+                    engine::clear_cache(&config)?;
+                    println!("{} Cache cleared.", "✔".green());
+                }
+                CacheCommands::Info => {
+                    let (path, entries) = engine::cache_info(&config)?;
+                    println!("Cache location: {}", path.display());
+                    println!("Cached entries: {}", entries);
+                }
+                CacheCommands::AuditTemp => {
+                    let paths = engine::audit_temp_artifacts(&config)?;
+                    println!("Temp artifacts: {}", paths.len());
+                    for path in paths {
+                        println!("{}", path.display());
+                    }
+                }
+                CacheCommands::CleanupTemp => {
+                    let paths = engine::cleanup_temp_artifacts(&config)?;
+                    println!("Removed temp artifacts: {}", paths.len());
+                    for path in paths {
+                        println!("{}", path.display());
+                    }
                 }
             }
-            ConfigCommands::SetLinkMode { mode } => {
-                config.link_mode = Some(mode.into());
-                save_config(&config)?;
-                println!("{} link mode set.", "✔".green());
-            }
-            ConfigCommands::Validate => validate_config(&config)?,
-        },
-        Commands::Cache(args) => match args.command {
-            CacheCommands::Clear => {
-                engine::clear_cache(&config)?;
-                println!("{} Cache cleared.", "✔".green());
-            }
-            CacheCommands::Info => {
-                let (path, entries) = engine::cache_info(&config)?;
-                println!("Cache location: {}", path.display());
-                println!("Cached entries: {}", entries);
-            }
-            CacheCommands::AuditTemp => {
-                let paths = engine::audit_temp_artifacts(&config)?;
-                println!("Temp artifacts: {}", paths.len());
-                for path in paths {
-                    println!("{}", path.display());
-                }
-            }
-            CacheCommands::CleanupTemp => {
-                let paths = engine::cleanup_temp_artifacts(&config)?;
-                println!("Removed temp artifacts: {}", paths.len());
-                for path in paths {
-                    println!("{}", path.display());
-                }
-            }
-        },
+        }
         Commands::Tui { strict } => {
-            tui::run(&config, strict)?;
+            tui::run(&loaded?, strict)?;
         }
         Commands::TuiLogoPreview => {
             tui::run_logo_preview()?;

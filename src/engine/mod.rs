@@ -256,7 +256,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         mut actions,
     } = match from_cache {
         Some(planned) => planned,
-        None => plan_by_walking(
+        None => match plan_by_walking(
             config,
             &options,
             &roots,
@@ -268,7 +268,19 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
             },
             &mut warnings,
             &mut metrics,
-        )?,
+        ) {
+            Ok(planned) => planned,
+            Err(err) => {
+                return Err(stopped_before_planning(
+                    err,
+                    &options,
+                    started_at,
+                    (downloads, media),
+                    metrics,
+                    warnings,
+                ));
+            }
+        },
     };
     linking::sort_actions(&mut actions);
     if actions.len() < options.only_pairs.len() {
@@ -284,13 +296,13 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
             eprintln!("{} {message}", "⚠".yellow());
         }
     }
-    let total_saved_space = planned_bytes(&actions);
+    let bytes_to_free = planned_bytes(&actions);
     let planned_actions = actions.len();
     logger::info(
         "run",
         format!(
             "planned {} action(s), potential_saved_bytes={}",
-            planned_actions, total_saved_space
+            planned_actions, bytes_to_free
         ),
     );
     if options.tui_events {
@@ -311,7 +323,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
     }
 
     if human {
-        report::print_plan(&actions, downloads, media, total_saved_space);
+        report::print_plan(&actions, downloads, media, bytes_to_free);
     }
     let out_path = resolve_report_path(downloads, &options, planned_actions);
     let mut report_entries = build_report_entries(&actions, options.link_mode);
@@ -421,7 +433,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
             applied_actions,
             already_linked,
             already_linked_bytes,
-            planned_bytes: total_saved_space,
+            planned_bytes: bytes_to_free,
             freed_bytes,
             metrics: metrics.clone(),
             warnings: warnings.clone(),
@@ -444,6 +456,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
             failed: warnings.link_errors,
             freed_bytes,
             cancelled: apply_cancelled,
+            symlinked: report.symlinked,
             report: out_path.as_deref(),
         }
         .print(options.quiet);
@@ -484,6 +497,55 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         RunEnd::WithFailures
     } else {
         RunEnd::Clean
+    })
+}
+
+/// A run `--strict` stopped while walking or hashing still answers a script
+/// with a report (ADR 0003): outcome `failed`, what the walk counted, no
+/// entries. It goes to `--report` when one was given, as `--json` when
+/// asked, and rides on the error to the dashboard. Any other error, a
+/// cancel or a refusal, is returned as it is.
+fn stopped_before_planning(
+    err: anyhow::Error,
+    options: &ScanRunOptions<'_>,
+    started_at: std::time::SystemTime,
+    (downloads, media): (&std::path::Path, &std::path::Path),
+    metrics: RunMetrics,
+    warnings: RunWarnings,
+) -> anyhow::Error {
+    if !options.strict || err.is::<Cancelled>() || report::warning_total(&warnings) == 0 {
+        return err;
+    }
+    let report = build_run_report(
+        options,
+        RunReportInput {
+            outcome: Outcome::Failed,
+            started_at,
+            downloads,
+            media,
+            files_seen: metrics.files_seen,
+            planned_actions: 0,
+            applied_actions: 0,
+            already_linked: 0,
+            already_linked_bytes: 0,
+            planned_bytes: 0,
+            freed_bytes: 0,
+            metrics,
+            warnings,
+            entries: Vec::new(),
+        },
+    );
+    if let Some(path) = resolve_report_path(downloads, options, 0) {
+        try_write_run_report(&path, &report);
+    }
+    if options.json_output
+        && let Ok(json) = serde_json::to_string_pretty(&report)
+    {
+        println!("{json}");
+    }
+    anyhow::Error::new(StoppedWithReport {
+        report: Box::new(report),
+        error: err,
     })
 }
 
@@ -608,6 +670,7 @@ fn plan_by_walking(
         metrics,
     )?;
     let files_seen = files.len();
+    metrics.files_seen = files_seen;
     logger::info("run", format!("collected {} candidate files", files_seen));
     for path in &metrics.dangling_symlinks {
         logger::warn(

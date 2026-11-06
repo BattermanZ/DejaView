@@ -658,6 +658,9 @@ pub(super) fn hash_groups_and_update_cache(
         progress_bar.set_message("Verifying duplicates".bold().to_string());
     }
     let bytes_done = AtomicU64::new(0);
+    // Each chunk read may take the progress slot; when it does, the count
+    // of files verified goes with it, which would otherwise rarely get the
+    // slot: a file's last chunk takes it just before the file is counted.
     let on_chunk = |n: u64| {
         let done = bytes_done.fetch_add(n, Ordering::Relaxed) + n;
         if let Some(progress_bar) = &bar {
@@ -667,6 +670,14 @@ pub(super) fn hash_groups_and_update_cache(
             let _ = emit_tui_event(&TuiEvent::HashBytes {
                 done,
                 total: total_full_bytes,
+            });
+            let _ = emit_tui_event(&TuiEvent::Count {
+                files_seen: None,
+                groups_found: None,
+                planned_actions: None,
+                applied_actions: None,
+                hash_progress_done: Some(full_done.load(Ordering::Relaxed) as usize),
+                hash_progress_total: Some(total_full_files),
             });
         }
     };
@@ -701,16 +712,11 @@ pub(super) fn hash_groups_and_update_cache(
                         );
                         let digest_result =
                             full_digest(path, file.size, options.cancel, &on_chunk);
-                        // A read a cancel stopped did not verify anything.
-                        if !matches!(&digest_result, Err(err) if err.is::<Cancelled>()) {
+                        // Only a file read to its end is verified: one that
+                        // failed or that a cancel stopped is not.
+                        if digest_result.is_ok() {
                             let done = full_done.fetch_add(1, Ordering::Relaxed) + 1;
                             emit_hash_progress(done as usize, total_full_files, tui_events);
-                            if tui_events && done as usize == total_full_files {
-                                let _ = emit_tui_event(&TuiEvent::HashBytes {
-                                    done: bytes_done.load(Ordering::Relaxed),
-                                    total: total_full_bytes,
-                                });
-                            }
                         }
                         emit_worker_activity("hashing_full", worker, None, tui_events);
                         match digest_result {
@@ -750,6 +756,14 @@ pub(super) fn hash_groups_and_update_cache(
                 }
             });
     });
+
+    // Where the full pass ended, whatever paced events said before.
+    if tui_events && total_full_files > 0 {
+        let _ = emit_tui_event(&TuiEvent::HashBytes {
+            done: bytes_done.load(Ordering::Relaxed),
+            total: total_full_bytes,
+        });
+    }
 
     // Hashes finished before a cancel or a strict failure are still valid.
     let mut cache_writes = live.into_writes();

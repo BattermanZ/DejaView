@@ -118,6 +118,8 @@ pub(super) struct Verdict<'a> {
     pub(super) already_linked: usize,
     pub(super) skipped: usize,
     pub(super) failed: u64,
+    /// Downloads that became symlinks: a quiet run says so too.
+    pub(super) symlinked: usize,
     pub(super) freed_bytes: u64,
     pub(super) cancelled: bool,
     pub(super) report: Option<&'a Path>,
@@ -132,6 +134,9 @@ impl Verdict<'_> {
             self.planned,
             format_size(self.freed_bytes)
         )];
+        if self.symlinked > 0 {
+            parts.push(format!("{} as symlinks", self.symlinked));
+        }
         if self.already_linked > 0 {
             parts.push(format!("{} already linked", self.already_linked));
         }
@@ -145,7 +150,7 @@ impl Verdict<'_> {
         if self.cancelled {
             line.push_str("; stopped on request, the rest stay planned");
         }
-        if (self.failed > 0 || self.skipped > 0)
+        if (self.failed > 0 || self.skipped > 0 || self.symlinked > 0)
             && let Some(report) = self.report
         {
             line.push_str(&format!(": see {}", report.display()));
@@ -292,8 +297,8 @@ pub(super) fn rfc3339_utc(time: std::time::SystemTime) -> String {
         .unwrap_or(0);
     let (days, rest) = (secs / 86_400, secs % 86_400);
     let (hour, minute, second) = (rest / 3600, rest % 3600 / 60, rest % 60);
-    // Days since 1970-01-01 to a civil date, after Howard Hinnant's
-    // days_from_civil inverse; every value here is non-negative.
+    // Days since 1970-01-01 to a civil date, by the well-known
+    // civil-from-days algorithm; every value here is non-negative.
     let z = days + 719_468;
     let era = z / 146_097;
     let doe = z - era * 146_097;
@@ -444,7 +449,7 @@ pub(super) fn strict_failure(
     }
     if strict && warning_total(warnings) > 0 {
         return Some(anyhow!(
-            "--strict stopped the run: {} file(s) could not be read, hashed or linked; the log names each",
+            "--strict stopped the run: {} file(s) could not be read, hashed or linked; the log names each. Make them readable, leave their folder out with `dejaview config set-exclude`, or run without --strict",
             warning_total(warnings)
         ));
     }

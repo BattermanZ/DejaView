@@ -22,7 +22,8 @@ pub fn path_from(text: &str, raw: Option<&str>) -> Result<PathBuf, String> {
         return Ok(PathBuf::from(text));
     };
     let digits = raw.as_bytes();
-    if digits.len() % 2 != 0 {
+    // from_str_radix alone would take "+f" as 0x0f.
+    if digits.len() % 2 != 0 || !digits.iter().all(u8::is_ascii_hexdigit) {
         return Err(format!("the raw bytes of {text} are not hex: {raw}"));
     }
     digits
@@ -91,6 +92,18 @@ impl PlannedPair {
 }
 
 impl LinkReportEntry {
+    /// Where the row sorts: by download path, then library path, compared
+    /// as paths, as the engine orders every plan.
+    pub fn row_order(&self) -> (PathBuf, PathBuf) {
+        let path = |text: &str, raw: Option<&str>| {
+            path_from(text, raw).unwrap_or_else(|_| PathBuf::from(text))
+        };
+        (
+            path(&self.source, self.source_raw.as_deref()),
+            path(&self.target, self.target_raw.as_deref()),
+        )
+    }
+
     /// Whether two rows are about the same pair, bytes and all: two paths
     /// that differ only in bytes that are not UTF-8 share their strings.
     pub fn same_pair(&self, other: &Self) -> bool {
@@ -275,5 +288,6 @@ mod tests {
         assert_eq!(path_from("/dl/é.mkv", None), Ok(PathBuf::from("/dl/é.mkv")));
         assert!(path_from("/dl/a", Some("2f6")).is_err());
         assert!(path_from("/dl/a", Some("zz")).is_err());
+        assert!(path_from("/dl/a", Some("+f")).is_err());
     }
 }

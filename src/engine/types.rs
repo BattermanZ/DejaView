@@ -133,6 +133,8 @@ pub(super) struct RunWarnings {
 
 #[derive(Default, Clone)]
 pub(super) struct RunMetrics {
+    /// Files the walk found and kept, before hashing.
+    pub(super) files_seen: usize,
     pub(super) skipped_by_min_age: u64,
     pub(super) skipped_by_min_size: u64,
     /// Files and folders left out by name; a folder counts once.

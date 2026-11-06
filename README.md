@@ -137,7 +137,7 @@ Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder.
 | Exit code | Meaning |
 |---|---|
 | 0 | The run finished and nothing failed, including a run with nothing to do. |
-| 1 | The run could not start, stopped on an error, was stopped on request, or `--strict` stopped it on a failure. |
+| 1 | The run could not start (the command line or the config is wrong, a folder is missing), stopped on an error, was stopped on request, or `--strict` stopped it on a failure. |
 | 2 | The run finished, but a file could not be read, hashed or linked: what `--strict` would have stopped on. The report and the log say which. |
 | 3 | Another run holds the lock on the downloads folder, so this one did nothing. |
 

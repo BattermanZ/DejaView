@@ -535,7 +535,7 @@ impl App {
                         ConfirmLinkMode::All => self.start_link_job(),
                         ConfirmLinkMode::Selected => {
                             if let Err(err) = self.start_selected_link_job() {
-                                self.push_log(format!("Selected link failed: {err}"));
+                                self.push_log(format!("Selected link failed: {err:#}"));
                             }
                         }
                     }
@@ -622,12 +622,12 @@ impl App {
             }
             KeyCode::Char('R') | KeyCode::Char('r') => {
                 if let Err(err) = self.save_report() {
-                    self.push_log(format!("Save report failed: {err}"));
+                    self.push_log(format!("Save report failed: {err:#}"));
                 }
             }
             KeyCode::Char('J') => {
                 if let Err(err) = self.open_json_overlay() {
-                    self.push_log(format!("Open JSON preview failed: {err}"));
+                    self.push_log(format!("Open JSON preview failed: {err:#}"));
                 }
             }
             _ => {}
@@ -1021,7 +1021,7 @@ impl App {
                     }
                 }
                 Err(err) => {
-                    self.fail_running_job(kind, err.to_string());
+                    self.fail_running_job(kind, format!("{err:#}"));
                     return;
                 }
             }
@@ -1161,11 +1161,11 @@ impl App {
                     self.live_entries.extend(entries);
                     // Groups finish in any order; keep the rows in the order
                     // the finished report lists them, so they do not jump.
-                    self.live_entries.sort_by(|a, b| {
-                        a.source
-                            .cmp(&b.source)
-                            .then_with(|| a.target.cmp(&b.target))
-                    });
+                    // That order compares paths folder by folder, which a
+                    // string compare does not: `Show.S01/` sorts after
+                    // `Show/` as a path and before it as a string.
+                    self.live_entries
+                        .sort_by_cached_key(LinkReportEntry::row_order);
                     self.live_planned_actions = Some(self.live_entries.len());
                     self.latest_activity_message = Some(format!(
                         "Planning actions: {} queued",
@@ -1791,6 +1791,42 @@ mod tests {
         }
         let sources: Vec<_> = app.rows().iter().map(|row| row.source.as_str()).collect();
         assert_eq!(sources, ["/dl/a.mkv", "/dl/b.mkv", "/dl/c.mkv"]);
+    }
+
+    #[test]
+    fn live_rows_keep_the_order_the_engine_gives_the_plan() {
+        let mut app = App::new(&Config::default(), false);
+        let entry = |source: &str| LinkReportEntry {
+            source: source.to_string(),
+            target: "/media/a.mkv".to_string(),
+            size: 10,
+            status: "planned".to_string(),
+            ..Default::default()
+        };
+        // As paths, Show/ sorts before Show.S01/; as strings, after.
+        for source in [
+            "/dl/Show.S01/e01.mkv",
+            "/dl/Show/e01.mkv",
+            "/dl/a/b.mkv",
+            "/dl/a.mkv",
+        ] {
+            app.apply_tui_event(
+                JobKind::Scan,
+                TuiEvent::PlannedEntries {
+                    entries: vec![entry(source)],
+                },
+            );
+        }
+        let mut paths: Vec<_> = app
+            .rows()
+            .iter()
+            .map(|row| PathBuf::from(&row.source))
+            .collect();
+        let shown = paths.clone();
+        paths.sort();
+        assert_eq!(shown, paths, "the engine's order, path by path");
+        assert_eq!(shown[0], PathBuf::from("/dl/Show/e01.mkv"));
+        assert_eq!(shown[2], PathBuf::from("/dl/a/b.mkv"));
     }
 
     #[test]
