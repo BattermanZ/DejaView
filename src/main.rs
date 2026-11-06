@@ -80,7 +80,7 @@ enum Commands {
         #[arg(long)]
         strict: bool,
     },
-    /// Preview alternative terminal logo directions
+    /// Preview the dashboard's logo
     TuiLogoPreview,
 }
 

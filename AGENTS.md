@@ -168,10 +168,14 @@ terminal; say so in the pull request when you could not.
   first and last MiB, a full hash only when quick hashes collide), `cache.rs`
   keeps hashes between runs, `linking.rs` plans and applies, `report.rs`
   writes the report.
-- `src/tui/` never calls the engine directly. It starts `dejaview scan` or
-  `dejaview link` with `--tui-events` as a child process, reads the event
+- `src/tui/` never runs a scan or a link itself. It starts `dejaview scan`
+  or `dejaview link` with `--tui-events` as a child process, reads the event
   stream (`src/tui/actions.rs`), and stops it by writing `cancel` to the
-  child's stdin. `src/protocol.rs` holds the stream's types.
+  child's stdin. `src/protocol.rs` holds the stream's types. Two short calls
+  into the engine run in the dashboard's process, both from `actions.rs`:
+  clearing the cache, and the path editor's test hardlink, which runs on a
+  thread of its own and only after the same second-mount check `config
+  validate` makes.
 - `docs/HOW_IT_WORKS.md` explains the flow for a reader.
   `docs/TUI_BLUEPRINT.md` and `docs/TUI_REDESIGN_PLAN.md` are historical: they
   say why the TUI looks as it does, and the code says what it does now.
