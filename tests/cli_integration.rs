@@ -702,3 +702,31 @@ fn linking_one_source_hashes_only_its_size_group() {
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+#[test]
+fn broken_config_file_error_names_the_file_and_the_fix() {
+    let root = unique_temp_dir("broken_config");
+    let config_path = root.join("xdg").join("dejaview").join("config.json");
+    fs::create_dir_all(config_path.parent().expect("config dir")).expect("create config dir");
+    fs::write(&config_path, b"{\"downloads\": \"/srv\",, }").expect("write broken config");
+
+    let out = run_cmd(&root, &["config", "set-media", "/tmp"]);
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&config_path.display().to_string()),
+        "names the file: {stderr}"
+    );
+    assert!(
+        stderr.contains("delete it"),
+        "says how to recover: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&config_path).expect("read config"),
+        b"{\"downloads\": \"/srv\",, }",
+        "a broken config is left for the user to fix"
+    );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}

@@ -35,9 +35,16 @@ fn load_config_from_path(path: &Path) -> Result<Config> {
     if !path.exists() {
         return Ok(Config::default());
     }
-    let s = fs::read_to_string(path)?;
-    let config = serde_json::from_str(&s)?;
-    Ok(config)
+    let s = fs::read_to_string(path)
+        .map_err(|err| anyhow!("cannot read config file {}: {err}", path.display()))?;
+    // Every command loads the config first, so a broken file would otherwise
+    // block the very commands that set it. Name the file and the way out.
+    serde_json::from_str(&s).map_err(|err| {
+        anyhow!(
+            "config file {} is not valid JSON ({err}); fix it, or delete it and set the paths again with `dejaview config set-downloads` and `dejaview config set-media`",
+            path.display()
+        )
+    })
 }
 
 fn save_config_to_path(path: &Path, config: &Config) -> Result<()> {
@@ -190,8 +197,16 @@ mod tests {
         fs::create_dir_all(path.parent().expect("parent")).expect("create config dir");
         fs::write(&path, b"{not-valid-json").expect("write invalid config");
 
-        let result = load_config_from_path(&path);
-        assert!(result.is_err());
+        let err = load_config_from_path(&path).expect_err("invalid config must fail");
+        let message = err.to_string();
+        assert!(
+            message.contains(&path.display().to_string()),
+            "names the file: {message}"
+        );
+        assert!(
+            message.contains("delete it"),
+            "says how to recover: {message}"
+        );
 
         fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
