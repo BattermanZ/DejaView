@@ -132,7 +132,9 @@ For a cron job, give the binary's absolute path (cron's `PATH` is short), drop s
 
 The line keeps what DejaView writes to stderr, which is warnings and errors, and prints it unless the run exited with 3; cron mails whatever is printed.
 
-Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder. A run that finds another one going does nothing and exits with code 3, so a cron run that overlaps a long first run, or a run from the dashboard, skips its turn. Exit code 0 means the run finished, and 1 that it could not start or stopped on an error (with `--strict`, on the first failure).
+Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder. A run that finds another one going does nothing and exits with code 3, so a cron run that overlaps a long first run, or a run from the dashboard, skips its turn. Exit code 0 means the run finished, and 1 that it could not start or stopped on an error (with `--strict`, on the first failure) or on request.
+
+Ctrl+C, SIGTERM (a cron timeout, `docker stop`) or SIGHUP stops a scan or link before its next file, or partway through a large one, keeps every hash already finished in the cache and changes nothing more; a second Ctrl+C stops at once. While hashing, the cache is also saved every five minutes, so even a run killed outright loses at most that much work. A link run stopped this way keeps the files it already linked and writes its report.
 
 ### Terminal dashboard
 

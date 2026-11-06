@@ -19,7 +19,7 @@ pub use types::ScanRunOptions;
 use crate::protocol::TuiEvent;
 use cache::{CacheKeys, load_cache, prune_cache, save_cache};
 use collect::{CollectOptions, collect_run_files, group_files_by_size};
-use hashing::{HashOptions, Hashed, hash_groups_and_update_cache};
+use hashing::{CHECKPOINT_EVERY, Checkpoint, HashOptions, Hashed, hash_groups_and_update_cache};
 use linking::{ApplyOptions, ApplyOutcome, apply_actions, plan_actions_and_table};
 use report::{
     RunReportInput, build_report_entries, build_run_report, maybe_confirm_apply,
@@ -282,6 +282,10 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
                 cancel: &options.cancel,
                 full_pool: &full_pool,
                 keys: &keys,
+                checkpoint: Checkpoint {
+                    path: &cache_path,
+                    every: CHECKPOINT_EVERY,
+                },
             },
             &mut warnings,
         )

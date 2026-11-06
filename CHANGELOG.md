@@ -33,6 +33,7 @@
 
 ### Fixed
 
+- Ctrl+C, SIGTERM (a cron timeout, `docker stop`) or SIGHUP stops a scan or link before its next file and keeps the hashes it finished; a second Ctrl+C stops at once. Before, it ended the process on the spot and every hash of the run was lost, so a first run over a network drive that was interrupted started over from nothing. While hashing, the cache is also saved every five minutes.
 - A cache file that cannot be read or parsed is named in the log with the reason before DejaView starts over with an empty one. Before, it was replaced silently, and the next run hashed the whole library again with no explanation.
 - The dashboard's Run Log shows its newest lines, and the activity line says how the last run ended. Before, the log stayed on its first few lines, so "Scan finished", a failed link and the reason for it (such as another run holding the lock) showed nowhere. The link confirmations show `y link` and `n cancel` on their border, so a small terminal no longer cuts the prompt off. [#3]
 - Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder. Before, two link runs failed each other's pairs, the later one overwrote the other's report and cache, and `cache cleanup-temp` could delete a link another run was about to rename into place. [#3]

@@ -1217,3 +1217,82 @@ fn link_with_a_plan_links_only_the_reviewed_pairs() {
     assert_ne!(ino(downloads.join("new.mkv")), ino(media.join("new.mkv")));
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+/// Point the config at `downloads` and `media` with no age or size floor.
+fn configure(root: &Path, downloads: &Path, media: &Path) {
+    run_ok(
+        root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+    set_min_age_zero(root);
+}
+
+#[test]
+fn a_signal_stops_a_scan_and_keeps_the_hashes_it_finished() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let root = unique_temp_dir("signal");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    // A small pair is hashed whole by its quick hash, before the full pass.
+    write_seeded(&media.join("small.mkv"), 300_000, 1);
+    write_seeded(&downloads.join("small.mkv"), 300_000, 1);
+    // A pair of sparse files: they take no disk, and their full hashes take
+    // long enough that the signal lands while they are being read.
+    for path in [media.join("big.mkv"), downloads.join("big.mkv")] {
+        let file = fs::File::create(&path).expect("create sparse file");
+        file.set_len(4 << 30).expect("size sparse file");
+    }
+    configure(&root, &downloads, &media);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dejaview"))
+        .args(["scan", "--tui-events", "--no-progress"])
+        .env("XDG_CONFIG_HOME", root.join("xdg"))
+        .env("HOME", root.join("home"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start scan");
+    let mut events = Vec::new();
+    let mut signalled = false;
+    for line in BufReader::new(child.stdout.take().expect("stdout")).lines() {
+        let line = line.expect("read event");
+        let event: serde_json::Value = serde_json::from_str(&line).expect("parse event");
+        if !signalled && event["type"] == "phase" && event["phase"] == "hashing_full" {
+            let status = Command::new("kill")
+                .args(["-INT", &child.id().to_string()])
+                .status()
+                .expect("send SIGINT");
+            assert!(status.success());
+            signalled = true;
+        }
+        events.push(event);
+    }
+    let out = child.wait_with_output().expect("wait for scan");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(signalled, "the scan reached its full pass: {events:?}");
+    assert_eq!(out.status.code(), Some(1), "stderr={stderr}");
+    assert_eq!(events.last().expect("events")["type"], "cancelled");
+    assert!(stderr.contains("Stopping before the next file"), "{stderr}");
+    let cache: serde_json::Value = serde_json::from_slice(
+        &fs::read(downloads.join(".dejaview_cache.json")).expect("cache saved"),
+    )
+    .expect("parse cache");
+    assert!(
+        cache.get("downloads/small.mkv").is_some() && cache.get("media/small.mkv").is_some(),
+        "the hashes finished before the signal are kept: {cache}"
+    );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}

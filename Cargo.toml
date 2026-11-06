@@ -22,3 +22,4 @@ comfy-table = "8.0"
 dirs = "7.0"
 ratatui = "0.30"
 crossterm = "0.29"
+ctrlc = { version = "3.5.2", features = ["termination"] }

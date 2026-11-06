@@ -199,6 +199,13 @@ impl From<LinkModeArg> for LinkMode {
 fn main() -> ExitCode {
     match run_cli() {
         Ok(()) => ExitCode::SUCCESS,
+        Err(err) if err.is::<engine::Cancelled>() => {
+            eprintln!(
+                "{} Stopped before changing anything. The hashes finished so far are saved in the cache, so the next run starts from there.",
+                "⚠".yellow()
+            );
+            ExitCode::FAILURE
+        }
         Err(err) => {
             eprintln!("Error: {err:?}");
             // ADR 0003: 3 tells a script that another run had the lock and
@@ -411,10 +418,37 @@ fn command_name(command: &Commands) -> &'static str {
     }
 }
 
-/// A run driven by the TUI can be cancelled by a `cancel` line on stdin; any
-/// other run ignores stdin.
+/// The cancel token of a scan or link. Ctrl+C, SIGTERM (a cron timeout,
+/// `docker stop`) and SIGHUP cancel it: the run stops before its next file,
+/// or between chunks of a large one, saves the hashes it has finished and
+/// changes nothing more. A second signal ends the process at once, for a run
+/// stuck on a read from a mount that stopped answering. A run driven by the
+/// TUI is also cancelled by a `cancel` line on stdin; any other run ignores
+/// stdin.
 fn run_cancel_token(tui_events: bool) -> engine::CancelToken {
     let token = engine::CancelToken::default();
+    let on_signal = token.clone();
+    let handled = ctrlc::set_handler(move || {
+        if on_signal.is_cancelled() {
+            // The conventional status of a process ended by SIGINT.
+            std::process::exit(130);
+        }
+        on_signal.cancel();
+        logger::warn("run", "stop requested by a signal");
+        // stderr, so a TUI-driven run's stdout stays pure NDJSON.
+        eprintln!(
+            "{} Stopping before the next file, keeping the hashes finished so far. Press Ctrl+C again to stop at once.",
+            "⚠".yellow()
+        );
+    });
+    if let Err(err) = handled {
+        logger::warn(
+            "run",
+            format!(
+                "cannot catch Ctrl+C or SIGTERM ({err}); stopping a run that way loses the hashes it has not saved"
+            ),
+        );
+    }
     if tui_events {
         token.watch(std::io::stdin());
     }

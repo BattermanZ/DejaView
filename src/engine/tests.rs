@@ -2323,3 +2323,77 @@ fn cache_keys_name_the_root_so_two_mounts_of_one_share_agree() {
         ]
     );
 }
+
+#[test]
+fn hashing_saves_the_cache_as_it_goes() {
+    use super::hashing::{Checkpoint, HashOptions, hash_groups_and_update_cache};
+    let root = unique_temp_dir("checkpoint");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_file(&downloads.join("movie.mkv"), b"same-content");
+    write_file(&media.join("movie.mkv"), b"same-content");
+    let exclude = Exclude::default();
+    let mut warnings = RunWarnings::default();
+    let files = collect_run_files(
+        &downloads,
+        &media,
+        Duration::ZERO,
+        CollectOptions {
+            min_size: 1,
+            exclude: &exclude,
+            strict: true,
+            show_progress: false,
+            tui_events: false,
+            cancel: &CancelToken::default(),
+        },
+        &test_pool(),
+        &mut warnings,
+        &mut RunMetrics::default(),
+    )
+    .expect("collect");
+    let mut groups = group_files_by_size(files);
+    let cache_file = root.join("checkpoint.json");
+    let selection = ScanRunOptions {
+        dry_run: true,
+        strict: true,
+        report_path: None,
+        json_output: false,
+        show_progress: false,
+        require_confirm: false,
+        tui_events: false,
+        link_mode: LinkMode::Best,
+        only_sources: &[],
+        only_pairs: &[],
+        cancel: CancelToken::default(),
+    };
+    let keys = super::cache::CacheKeys::new(&downloads, &media);
+    let mut cache = Cache::new();
+
+    let hashed = hash_groups_and_update_cache(
+        &mut groups,
+        &mut cache,
+        &HashOptions {
+            strict: true,
+            show_progress: false,
+            tui_events: false,
+            link_mode: LinkMode::Best,
+            selection: &selection,
+            cancel: &selection.cancel,
+            full_pool: &test_pool(),
+            keys: &keys,
+            checkpoint: Checkpoint {
+                path: &cache_file,
+                every: Duration::ZERO,
+            },
+        },
+        &mut warnings,
+    );
+    hashed.result.expect("hash");
+
+    // The caller saves at the end; this file is the checkpoint's.
+    let saved = load_cache(&cache_file);
+    assert_eq!(saved.len(), 2, "{saved:?}");
+    assert_eq!(hashed.cache_writes, 2);
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}

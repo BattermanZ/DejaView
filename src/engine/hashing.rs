@@ -9,7 +9,8 @@ use std::collections::hash_map::Entry;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use super::cache::CacheKeys;
 use super::cancel::{CancelToken, Cancelled};
@@ -17,6 +18,7 @@ use super::linking::plan_hashed_group_actions;
 use super::report::build_report_entries;
 use super::types::emit_tui_event;
 use super::types::{Cache, CacheEntry, FileInfo, LinkMode, RunWarnings};
+use crate::logger;
 use crate::protocol::TuiEvent;
 
 /// Every path a hash opened, so a test can count reads under its own folder.
@@ -143,6 +145,7 @@ pub(super) struct HashOptions<'a> {
     /// latency, so each kind gets its own number of workers.
     pub(super) full_pool: &'a rayon::ThreadPool,
     pub(super) keys: &'a CacheKeys,
+    pub(super) checkpoint: Checkpoint<'a>,
 }
 
 /// One physical file in a size group: every path of it, and what is known of
@@ -299,41 +302,127 @@ fn plan_group_work(group: &[FileInfo], cache: &Cache, keys: &CacheKeys) -> Optio
     Some(GroupWork { files, small })
 }
 
+/// Write what is known of `file` to its cache entry, keeping what a still
+/// valid entry knows that this run did not learn. Returns whether the entry
+/// changed.
+fn upsert_entry(
+    cache: &mut Cache,
+    keys: &CacheKeys,
+    file: &FileInfo,
+    hash: Option<&String>,
+    sample: Option<&String>,
+) -> bool {
+    if hash.is_none() && sample.is_none() {
+        return false;
+    }
+    let key = keys.key(&file.path, file.in_downloads);
+    let valid = cache
+        .get(&key)
+        .filter(|entry| cache_entry_matches(entry, file));
+    let entry = CacheEntry {
+        size: file.size,
+        mtime_ns: file.mtime_ns,
+        ctime_ns: file.ctime_ns,
+        dev: file.dev,
+        inode: file.inode,
+        hash: hash
+            .cloned()
+            .or_else(|| valid.and_then(|entry| entry.hash.clone())),
+        sample: sample
+            .cloned()
+            .or_else(|| valid.and_then(|entry| entry.sample.clone())),
+    };
+    if valid == Some(&entry) {
+        return false;
+    }
+    cache.insert(key, entry);
+    true
+}
+
 /// Write a cache entry for every path whose full or quick hash is known and
 /// whose entry is missing, stale or knows less, so every path of a hardlinked
 /// file is served from cache next run, not only the path that was read.
 /// Returns how many entries were written.
 fn sync_cache(cache: &mut Cache, keys: &CacheKeys, groups: &[Vec<FileInfo>]) -> usize {
-    let mut written = 0;
-    for file in groups.iter().flatten() {
-        if file.hash.is_none() && file.sample.is_none() {
-            continue;
-        }
-        let key = keys.key(&file.path, file.in_downloads);
-        let valid = cache
-            .get(&key)
-            .filter(|entry| cache_entry_matches(entry, file));
-        let entry = CacheEntry {
-            size: file.size,
-            mtime_ns: file.mtime_ns,
-            ctime_ns: file.ctime_ns,
-            dev: file.dev,
-            inode: file.inode,
-            hash: file
-                .hash
-                .clone()
-                .or_else(|| valid.and_then(|entry| entry.hash.clone())),
-            sample: file
-                .sample
-                .clone()
-                .or_else(|| valid.and_then(|entry| entry.sample.clone())),
-        };
-        if valid != Some(&entry) {
-            cache.insert(key, entry);
-            written += 1;
+    groups
+        .iter()
+        .flatten()
+        .filter(|file| upsert_entry(cache, keys, file, file.hash.as_ref(), file.sample.as_ref()))
+        .count()
+}
+
+/// How often hashing saves the cache while it runs.
+pub(super) const CHECKPOINT_EVERY: Duration = Duration::from_secs(5 * 60);
+
+/// Where and how often to save the cache while hashing runs.
+pub(super) struct Checkpoint<'a> {
+    pub(super) path: &'a Path,
+    pub(super) every: Duration,
+}
+
+/// The cache while hashing runs: each hash goes in as it finishes, and the
+/// cache is saved every [`Checkpoint::every`], so a run that is killed
+/// outright (SIGKILL, a power cut, a container stopped without grace) loses
+/// at most that much hashing. A run that is asked to stop saves at its end
+/// as usual.
+struct LiveCache<'c> {
+    cache: Mutex<&'c mut Cache>,
+    keys: &'c CacheKeys,
+    checkpoint: &'c Checkpoint<'c>,
+    last_save: Mutex<Instant>,
+    writes: AtomicUsize,
+}
+
+impl<'c> LiveCache<'c> {
+    fn new(cache: &'c mut Cache, keys: &'c CacheKeys, checkpoint: &'c Checkpoint<'c>) -> Self {
+        LiveCache {
+            cache: Mutex::new(cache),
+            keys,
+            checkpoint,
+            last_save: Mutex::new(Instant::now()),
+            writes: AtomicUsize::new(0),
         }
     }
-    written
+
+    /// Record one physical file's hashes for every path of it, and save the
+    /// cache if a checkpoint is due.
+    fn record(
+        &self,
+        group: &[FileInfo],
+        members: &[usize],
+        hash: Option<&String>,
+        sample: Option<&String>,
+    ) {
+        let Ok(mut cache) = self.cache.lock() else {
+            return;
+        };
+        for &idx in members {
+            if upsert_entry(&mut cache, self.keys, &group[idx], hash, sample) {
+                self.writes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let Ok(mut last_save) = self.last_save.lock() else {
+            return;
+        };
+        if last_save.elapsed() < self.checkpoint.every {
+            return;
+        }
+        *last_save = Instant::now();
+        logger::info("cache", "saving the cache while hashing runs");
+        if let Err(err) = super::cache::save_cache(self.checkpoint.path, &cache) {
+            logger::warn(
+                "cache",
+                format!(
+                    "cannot save the cache to {} while hashing ({err:#}); it is saved again when the run ends",
+                    self.checkpoint.path.display()
+                ),
+            );
+        }
+    }
+
+    fn into_writes(self) -> usize {
+        self.writes.into_inner()
+    }
 }
 
 fn emit_planned_entries(group: &[FileInfo], options: &HashOptions<'_>) {
@@ -455,6 +544,7 @@ pub(super) fn hash_groups_and_update_cache(
     let sample_done = AtomicU64::new(0);
     let full_done = AtomicU64::new(0);
     let stop = Stop::default();
+    let live = LiveCache::new(cache, options.keys, &options.checkpoint);
 
     // Phase 1: the quick hash of each physical file that has none yet. Work is
     // split per file, not per group, so one large group of same-size files
@@ -491,7 +581,16 @@ pub(super) fn hash_groups_and_update_cache(
                     }
                     emit_worker_activity("hashing_sample", worker, None, tui_events);
                     match digest_result {
-                        Ok(digest) => Some((idx, blake3::Hash::from(digest).to_hex().to_string())),
+                        Ok(digest) => {
+                            let sample = blake3::Hash::from(digest).to_hex().to_string();
+                            let (hash, kept_sample) = if work.small {
+                                (Some(&sample), None)
+                            } else {
+                                (physical.full.as_ref(), Some(&sample))
+                            };
+                            live.record(group, &physical.members, hash, kept_sample);
+                            Some((idx, sample))
+                        }
                         Err(err) => {
                             sample_hash_errors.fetch_add(1, Ordering::Relaxed);
                             if strict {
@@ -576,7 +675,16 @@ pub(super) fn hash_groups_and_update_cache(
                         }
                         emit_worker_activity("hashing_full", worker, None, tui_events);
                         match digest_result {
-                            Ok(hash) => Some((idx, hash)),
+                            Ok(hash) => {
+                                let physical = &work.files[idx];
+                                live.record(
+                                    group,
+                                    &physical.members,
+                                    Some(&hash),
+                                    physical.sample.as_ref(),
+                                );
+                                Some((idx, hash))
+                            }
                             Err(err) if err.is::<Cancelled>() => {
                                 stop.set(err);
                                 None
@@ -605,7 +713,8 @@ pub(super) fn hash_groups_and_update_cache(
     });
 
     // Hashes finished before a cancel or a strict failure are still valid.
-    let cache_writes = sync_cache(cache, options.keys, groups);
+    let mut cache_writes = live.into_writes();
+    cache_writes += sync_cache(cache, options.keys, groups);
 
     warnings.sample_hash_errors += sample_hash_errors.load(Ordering::Relaxed);
     warnings.full_hash_errors += full_hash_errors.load(Ordering::Relaxed);
