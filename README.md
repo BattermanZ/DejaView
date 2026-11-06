@@ -162,7 +162,7 @@ Ctrl+C, SIGTERM (a cron timeout, `docker stop`) or SIGHUP stops a scan or link b
 | `files_considered`, `skipped_by_min_age`, `skipped_by_min_size`, `skipped_by_exclude`, `skipped_as_library_file` | Files the run looked at, and those it left out and why. |
 | `dangling_symlinks` | Symlinks in downloads that point into the library and no longer resolve. |
 | `warnings` | Counts of files that could not be walked, read, hashed or linked. |
-| `entries` | One per planned pair, in download path order: `source`, `target`, `size`, `status` (`planned`, `applied`, `already-linked`, `skipped` or `failed`), `method`, `fallback_reason` and `error`, which keeps the OS error. |
+| `entries` | One per planned pair, in download path order: `source`, `target`, `size`, `status` (`planned`, `applied`, `already-linked`, `skipped` or `failed`), `method`, `fallback_reason` and `error`, which keeps the OS error. A path that is not valid UTF-8 shows U+FFFD for the bytes that are not, and its bytes in hex in `source_raw` or `target_raw`. |
 
 ### Terminal dashboard
 

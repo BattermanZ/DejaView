@@ -1,4 +1,41 @@
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// A path's bytes in hex when they are not valid UTF-8, for the `*_raw`
+/// fields beside a path's string, which then stands in U+FFFD for each
+/// byte that is not. None for a path whose string is exact.
+pub fn raw_path_hex(path: &Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    if std::str::from_utf8(bytes).is_ok() {
+        return None;
+    }
+    Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// The path a string field and its `*_raw` field name: the raw bytes when
+/// there are any, else the string. Raw bytes that are not hex are an error,
+/// never a fall back to the string, which names another path.
+pub fn path_from(text: &str, raw: Option<&str>) -> Result<PathBuf, String> {
+    use std::os::unix::ffi::OsStringExt;
+    let Some(raw) = raw else {
+        return Ok(PathBuf::from(text));
+    };
+    let digits = raw.as_bytes();
+    if digits.len() % 2 != 0 {
+        return Err(format!("the raw bytes of {text} are not hex: {raw}"));
+    }
+    digits
+        .chunks(2)
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+        })
+        .collect::<Option<Vec<u8>>>()
+        .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+        .ok_or_else(|| format!("the raw bytes of {text} are not hex: {raw}"))
+}
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct WarningSummary {
@@ -9,10 +46,17 @@ pub struct WarningSummary {
     pub link_errors: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct LinkReportEntry {
     pub source: String,
     pub target: String,
+    /// The download's and the library file's bytes in hex, present only for
+    /// a path that is not valid UTF-8, where `source` or `target` stands in
+    /// U+FFFD for the bytes that are not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_raw: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_raw: Option<String>,
     #[serde(default)]
     pub size: u64,
     pub status: String,
@@ -27,9 +71,35 @@ pub struct LinkReportEntry {
 pub struct PlannedPair {
     pub source: String,
     pub target: String,
+    /// As in [`LinkReportEntry`]: the bytes of a path that is not UTF-8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_raw: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_raw: Option<String>,
+}
+
+impl PlannedPair {
+    /// The pair a report row names, bytes and all.
+    pub fn of(entry: &LinkReportEntry) -> Self {
+        PlannedPair {
+            source: entry.source.clone(),
+            target: entry.target.clone(),
+            source_raw: entry.source_raw.clone(),
+            target_raw: entry.target_raw.clone(),
+        }
+    }
 }
 
 impl LinkReportEntry {
+    /// Whether two rows are about the same pair, bytes and all: two paths
+    /// that differ only in bytes that are not UTF-8 share their strings.
+    pub fn same_pair(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.target == other.target
+            && self.source_raw == other.source_raw
+            && self.target_raw == other.target_raw
+    }
+
     /// This run turned the download into a symlink, which breaks if its
     /// library file is upgraded, renamed or deleted (ADR 0001).
     pub fn is_applied_symlink(&self) -> bool {
@@ -184,5 +254,26 @@ impl RunReport {
             + self.warnings.sample_hash_errors
             + self.warnings.full_hash_errors
             + self.warnings.link_errors
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn a_path_that_is_not_utf8_comes_back_whole_from_its_raw_bytes() {
+        let path = PathBuf::from(OsStr::from_bytes(b"/dl/a\xff.mkv"));
+        let raw = raw_path_hex(&path).expect("not UTF-8");
+        assert_eq!(raw, "2f646c2f61ff2e6d6b76");
+        let text = path.display().to_string();
+        assert_eq!(path_from(&text, Some(&raw)), Ok(path));
+        // A UTF-8 path needs none, and its string is the path.
+        assert_eq!(raw_path_hex(Path::new("/dl/é.mkv")), None);
+        assert_eq!(path_from("/dl/é.mkv", None), Ok(PathBuf::from("/dl/é.mkv")));
+        assert!(path_from("/dl/a", Some("2f6")).is_err());
+        assert!(path_from("/dl/a", Some("zz")).is_err());
     }
 }

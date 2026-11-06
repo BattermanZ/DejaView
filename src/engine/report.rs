@@ -315,6 +315,8 @@ pub(super) fn build_report_entries(
         .map(|action| LinkReportEntry {
             source: action.src.display().to_string(),
             target: action.tgt.display().to_string(),
+            source_raw: crate::protocol::raw_path_hex(&action.src),
+            target_raw: crate::protocol::raw_path_hex(&action.tgt),
             size: action.size,
             status: "planned".to_string(),
             method: Some(

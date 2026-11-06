@@ -44,6 +44,7 @@
 
 ### Fixed
 
+- A file whose name is not valid UTF-8 can be linked from the dashboard, and two names that differ only in such bytes are told apart: a report entry gives such a path's bytes in hex in `source_raw` or `target_raw`, and the cache keys each name apart. Before, `l` and `L` linked nothing for such a file, its report rows could not be told apart, and the cache kept one entry for both names, so both were hashed again on every run. [#5]
 - `cache audit-temp` and `cache cleanup-temp` find a temporary symlink left beside a download by a run stopped partway, and remove the link without touching the library file it points at. Before, they listed and removed only temporary files. [#5]
 - A folder DejaView cannot read, such as a NAS's recycle bin, no longer stops the cache from forgetting files that are gone: entries under that folder are kept and the rest are dropped as usual. Before, one unreadable folder kept every stale entry for good. The log now names each path a walk could not read, and why. [#5]
 - Verifying large files shows progress in bytes, with the speed and the time left, in the dashboard (`12.3 GiB of 40.0 GiB  |  150.0 MiB/s  |  ETA 03:05`) and on the CLI's progress bar. Before, both counted whole files, so a 60 GB remux sat at "0 / 8" for minutes, and a read stopped by a cancel was counted as verified. [#5]

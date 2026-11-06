@@ -1208,6 +1208,7 @@ mod tests {
             method: Some("symlink".to_string()),
             fallback_reason: Some("cross-device".to_string()),
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(status_chip_style(&row, false), Theme::chip_success_alt());
@@ -1223,6 +1224,7 @@ mod tests {
             method: Some("try-hardlink".to_string()),
             fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(outcome_label(&row), "TRY HARDLINK");
@@ -1239,6 +1241,7 @@ mod tests {
             method: Some("try-hardlink".to_string()),
             fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(row_style(&row, false), Theme::muted());
@@ -1254,6 +1257,7 @@ mod tests {
             method: Some("hardlink".to_string()),
             fallback_reason: None,
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(row_style(&row, true).bg, Theme::result_row_selected().bg);
@@ -1402,6 +1406,7 @@ mod tests {
                     method: Some("hardlink".to_string()),
                     fallback_reason: None,
                     error: None,
+                    ..Default::default()
                 },
                 LinkReportEntry {
                     source: "c".to_string(),
@@ -1411,6 +1416,7 @@ mod tests {
                     method: None,
                     fallback_reason: None,
                     error: None,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -1431,6 +1437,7 @@ mod tests {
             method: Some("try-hardlink".to_string()),
             fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
             error: None,
+            ..Default::default()
         };
         app.set_report_for_test(crate::protocol::RunReport {
             mode: "scan".to_string(),
@@ -1503,6 +1510,7 @@ mod tests {
                 method: Some("try-hardlink".to_string()),
                 fallback_reason: None,
                 error: None,
+                ..Default::default()
             }],
             ..Default::default()
         });
@@ -1653,6 +1661,7 @@ mod row_tests {
                 method: Some("try-hardlink".to_string()),
                 fallback_reason: None,
                 error: None,
+                ..Default::default()
             })
             .collect();
         app.set_report_for_test(RunReport {

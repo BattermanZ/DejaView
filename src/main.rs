@@ -514,11 +514,19 @@ fn read_plan(path: &std::path::Path) -> Result<Vec<(PathBuf, PathBuf)>> {
     }
     // A row given twice is linked once: the second would fail as changed.
     let mut seen = std::collections::HashSet::new();
-    Ok(pairs
-        .into_iter()
-        .map(|pair| (PathBuf::from(pair.source), PathBuf::from(pair.target)))
-        .filter(|pair| seen.insert(pair.clone()))
-        .collect())
+    let mut rows = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        let invalid =
+            |err: String| anyhow::anyhow!("the plan {} is not valid: {err}", path.display());
+        let row = (
+            protocol::path_from(&pair.source, pair.source_raw.as_deref()).map_err(invalid)?,
+            protocol::path_from(&pair.target, pair.target_raw.as_deref()).map_err(invalid)?,
+        );
+        if seen.insert(row.clone()) {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
 }
 
 fn effective_link_mode(config: &config::Config, symlink_only: bool) -> LinkMode {

@@ -1976,3 +1976,100 @@ fn a_leftover_temp_symlink_is_listed_and_removed_without_touching_its_target() {
     );
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+/// Downloads `a\xff.mkv` and `a\xfe.mkv`, whose names differ only in a byte
+/// that is not UTF-8, each a copy of its own library file.
+fn tree_with_names_that_are_not_utf8(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let ff = downloads.join(OsStr::from_bytes(b"a\xff.mkv"));
+    let fe = downloads.join(OsStr::from_bytes(b"a\xfe.mkv"));
+    write_seeded(&ff, 3000, 1);
+    write_seeded(&media.join("x.mkv"), 3000, 1);
+    write_seeded(&fe, 3000, 2);
+    write_seeded(&media.join("y.mkv"), 3000, 2);
+    configure_small_files(root, &downloads, &media);
+    (media, ff, fe)
+}
+
+#[test]
+fn names_that_differ_only_in_bytes_that_are_not_utf8_stay_apart() {
+    let root = unique_temp_dir("not_utf8");
+    let (_media, _ff, _fe) = tree_with_names_that_are_not_utf8(&root);
+
+    let out = run_cmd(&root, &["scan", "--json", "--no-progress"]);
+
+    assert!(out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse report");
+    let raws: Vec<_> = report["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|entry| entry["source_raw"].as_str().expect("raw bytes").to_string())
+        .collect();
+    assert_eq!(raws.len(), 2);
+    assert_ne!(raws[0], raws[1], "{report}");
+    let cache: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.join("downloads").join(".dejaview_cache.json")).expect("cache"),
+    )
+    .expect("parse cache");
+    assert_eq!(
+        cache.as_object().expect("cache entries").len(),
+        4,
+        "{cache}"
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_plan_row_whose_path_is_not_utf8_links_that_file() {
+    let root = unique_temp_dir("not_utf8_plan");
+    let (media, ff, fe) = tree_with_names_that_are_not_utf8(&root);
+    let out = run_cmd(&root, &["scan", "--json", "--no-progress"]);
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse report");
+    // The row for a\xfe.mkv, as the dashboard writes it to a plan.
+    let row = report["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| {
+            entry["source_raw"]
+                .as_str()
+                .is_some_and(|raw| raw.ends_with("61fe2e6d6b76"))
+        })
+        .expect("the a\\xfe.mkv row")
+        .clone();
+    let plan = root.join("plan.json");
+    fs::write(
+        &plan,
+        serde_json::to_vec(&serde_json::json!([{
+            "source": row["source"],
+            "target": row["target"],
+            "source_raw": row["source_raw"],
+            "target_raw": row["target_raw"],
+        }]))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+
+    run_ok(
+        &root,
+        &[
+            "link",
+            "--plan",
+            plan.to_str().expect("plan path"),
+            "--no-progress",
+        ],
+    );
+
+    let inode = |path: &Path| fs::metadata(path).expect("metadata").ino();
+    assert_eq!(
+        inode(&fe),
+        inode(&media.join("y.mkv")),
+        "the reviewed row is linked"
+    );
+    assert_ne!(inode(&ff), inode(&media.join("x.mkv")), "and nothing else");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}

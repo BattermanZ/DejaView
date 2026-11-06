@@ -356,6 +356,7 @@ fn planned_entry_for(action: &super::types::LinkAction) -> LinkReportEntry {
         method: None,
         fallback_reason: None,
         error: None,
+        ..Default::default()
     }
 }
 
@@ -2841,4 +2842,22 @@ fn the_plan_table_lines_up_with_colours_on() {
         "paths are below their folder:\n{table}"
     );
     assert!(table.contains("3.0 MiB"), "{table}");
+}
+
+#[test]
+fn cache_keys_keep_bytes_that_are_not_utf8() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let keys = super::cache::CacheKeys::new(Path::new("/dl"), Path::new("/media"));
+    let path = |bytes: &[u8]| PathBuf::from(OsStr::from_bytes(bytes));
+
+    let ff = keys.key(&path(b"/dl/a\xff.mkv"), true);
+    let fe = keys.key(&path(b"/dl/a\xfe.mkv"), true);
+    assert_ne!(ff, fe, "names differing only in such bytes keep apart");
+    assert_eq!(ff, "downloads/a\u{0}ff.mkv");
+    // A UTF-8 path's key is what it always was.
+    assert_eq!(
+        keys.key(Path::new("/dl/Show/é.mkv"), true),
+        "downloads/Show/é.mkv"
+    );
 }

@@ -92,8 +92,8 @@ impl CacheKeys {
             (MEDIA_KEY_ROOT, &self.media)
         };
         match path.strip_prefix(root) {
-            Ok(rel) => format!("{name}/{}", rel.to_string_lossy()),
-            Err(_) => path.to_string_lossy().into_owned(),
+            Ok(rel) => format!("{name}/{}", lossless(rel)),
+            Err(_) => lossless(path),
         }
     }
 
@@ -125,6 +125,23 @@ impl CacheKeys {
         }
         migrated
     }
+}
+
+/// A path as a string that loses nothing: UTF-8 as it is, and each byte
+/// that is not as a NUL and two hex digits. No path holds a NUL, so two
+/// names that differ only in such bytes get different keys, where a lossy
+/// string gave them one; a UTF-8 path's key is what it always was.
+fn lossless(path: &Path) -> String {
+    use std::fmt::Write;
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = String::new();
+    for chunk in path.as_os_str().as_bytes().utf8_chunks() {
+        out.push_str(chunk.valid());
+        for byte in chunk.invalid() {
+            let _ = write!(out, "\0{byte:02x}");
+        }
+    }
+    out
 }
 
 /// Drop entries for paths this run did not see, so the cache follows the trees

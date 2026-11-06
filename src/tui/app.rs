@@ -335,10 +335,7 @@ impl App {
             .iter()
             .flat_map(|report| &report.entries)
             .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
-            .map(|entry| PlannedPair {
-                source: entry.source.clone(),
-                target: entry.target.clone(),
-            })
+            .map(PlannedPair::of)
             .collect()
     }
 
@@ -784,10 +781,7 @@ impl App {
         let Some(pair) = self
             .selected_entry()
             .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
-            .map(|entry| PlannedPair {
-                source: entry.source.clone(),
-                target: entry.target.clone(),
-            })
+            .map(PlannedPair::of)
         else {
             self.push_log("Select a planned row before running a single-item link.".to_string());
             return Ok(());
@@ -1381,9 +1375,11 @@ impl App {
                         0
                     };
                     for entry in &report.entries {
-                        if let Some(current) = existing.entries.iter_mut().find(|current| {
-                            current.source == entry.source && current.target == entry.target
-                        }) {
+                        if let Some(current) = existing
+                            .entries
+                            .iter_mut()
+                            .find(|current| current.same_pair(entry))
+                        {
                             *current = entry.clone();
                         } else {
                             existing.entries.push(entry.clone());
@@ -1593,6 +1589,7 @@ mod tests {
                     method: Some("hardlink".to_string()),
                     fallback_reason: None,
                     error: None,
+                    ..Default::default()
                 },
                 LinkReportEntry {
                     source: "c".to_string(),
@@ -1602,6 +1599,7 @@ mod tests {
                     method: None,
                     fallback_reason: None,
                     error: Some("boom".to_string()),
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -1753,6 +1751,7 @@ mod tests {
                 method: Some("try-hardlink".to_string()),
                 fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
                 error: None,
+                ..Default::default()
             }],
         }))
         .expect("send planned entry");
@@ -1780,6 +1779,7 @@ mod tests {
             method: None,
             fallback_reason: None,
             error: None,
+            ..Default::default()
         };
         for source in ["/dl/c.mkv", "/dl/a.mkv", "/dl/b.mkv"] {
             app.apply_tui_event(
@@ -1804,6 +1804,7 @@ mod tests {
             method: None,
             fallback_reason: None,
             error: None,
+            ..Default::default()
         };
         let mut scanned = sample_report();
         scanned.entries = vec![
@@ -1848,6 +1849,7 @@ mod tests {
             method: None,
             fallback_reason: None,
             error: None,
+            ..Default::default()
         };
         let mut scanned = sample_report();
         scanned.entries = vec![row("/dl/a.mkv", "planned"), row("/dl/b.mkv", "planned")];
@@ -1887,6 +1889,7 @@ mod tests {
             method: Some("try-hardlink".to_string()),
             fallback_reason: None,
             error: None,
+            ..Default::default()
         }];
         // What start_link_job leaves behind: the reviewed report put aside
         // while the child runs.
@@ -1981,6 +1984,7 @@ mod tests {
                 method: Some("try-hardlink".to_string()),
                 fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
                 error: None,
+                ..Default::default()
             }],
         }))
         .expect("send planned entry");
@@ -2318,6 +2322,7 @@ mod tests {
             method: None,
             fallback_reason: None,
             error: None,
+            ..Default::default()
         }
     }
 
@@ -2407,6 +2412,7 @@ mod tests {
             method: None,
             fallback_reason: None,
             error: None,
+            ..Default::default()
         };
         report.entries = vec![
             row("/downloads/a.mkv", "planned"),
@@ -2441,6 +2447,7 @@ mod tests {
             method: Some("try-hardlink".to_string()),
             fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
             error: None,
+            ..Default::default()
         }];
         app.report = Some(report);
 
@@ -2467,6 +2474,7 @@ mod tests {
             method: Some("try-hardlink".to_string()),
             fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
             error: None,
+            ..Default::default()
         }];
         report.planned_actions = 1;
         app.report = Some(report);
@@ -2516,6 +2524,7 @@ mod tests {
                         "tries hardlink first; may fall back to symlink".to_string(),
                     ),
                     error: None,
+                    ..Default::default()
                 },
                 LinkReportEntry {
                     source: "/downloads/b.mkv".to_string(),
@@ -2527,6 +2536,7 @@ mod tests {
                         "tries hardlink first; may fall back to symlink".to_string(),
                     ),
                     error: None,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -2567,6 +2577,7 @@ mod tests {
                     method: Some("hardlink".to_string()),
                     fallback_reason: None,
                     error: None,
+                    ..Default::default()
                 }],
                 ..Default::default()
             }),
