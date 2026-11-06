@@ -4,6 +4,7 @@
 
 ### After upgrading
 
+- Each log line is stamped with its time in UTC, to the millisecond (`ts=2026-11-06T03:17:00.123Z`), where it gave seconds since 1970, so anything that parses the log's `ts` needs to read the new form; and a message's line breaks, quotes and backslashes are written escaped (`\n`, `\"`, `\\`), so every entry is one line. Before, an error with a line break in it split its entry, and quotes became apostrophes. [#7]
 - A scan or link that finishes with a file it could not read, hash or link now exits with code 2, where it exited 0, a link run stopped partway by Ctrl+C, SIGTERM or the dashboard's cancel exits 1, and a command line DejaView cannot read, such as an unknown option, exits 1 where it exited 2. A cron line that alerts on any non-zero code now alerts on those runs; the report and the log say which file failed and why. [#5]
 - `total_saved_bytes` in a link run's report is what the run freed, where it was every planned path's size, failed ones included; in a scan's it counts a cross-seeded download once. `planned_bytes` and `freed_bytes` give both. [#5]
 - Files whose names are not valid UTF-8 are hashed once more on the first run, since their cache entries are now keyed by their exact bytes; every other entry is kept as it is. [#5]
@@ -33,7 +34,6 @@
 
 ### Changed
 
-- Each log line is stamped with its time in UTC, to the millisecond (`ts=2026-11-06T03:17:00.123Z`), where it gave seconds since 1970, and a message's line breaks, quotes and backslashes are written escaped (`\n`, `\"`, `\\`), so every entry is one line. Before, an error with a line break in it split its entry, and quotes became apostrophes. [#7]
 - `scan` and `link` print the downloads and media folders once and each path below its folder, with a size column, where every row repeated both absolute paths. A link run ends with one line saying what it did, such as `Linked 7 of 8, 8.0 MiB freed, 1 failed: see <report>`, naming any downloads that became symlinks, and a run that finds nothing says `No duplicates found.` over no table. Before, a run with failed links still ended with "Potential space saved" and "Done", and none said how much space it freed. Sizes are in KiB, MiB and GiB. [#5]
 - A scan or link run from the dashboard reports which file it is on and how many it has found or hashed up to ten times a second, instead of once for every file, which on a large library sent the dashboard hundreds of thousands of updates. [#4]
 - Hashing makes fewer round trips to a network drive: quick and full hashes read exactly the bytes they hash, where each spent one or two more reads finding the end of the file, and a full hash reads 8 MiB at a time instead of 1 MiB. [#4]

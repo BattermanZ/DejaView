@@ -67,7 +67,7 @@ tar -xzf dejaview-v0.1.0-x86_64-unknown-linux-musl.tar.gz
 sudo install dejaview-v0.1.0-x86_64-unknown-linux-musl/dejaview /usr/local/bin/
 ```
 
-To build it instead, you need Rust 1.89 or newer ([rustup](https://rustup.rs/)). From a clone of this repository:
+To build it instead, you need Rust 1.89 or newer ([rustup](https://rustup.rs/)); with rustup, the first build in a clone fetches the version `rust-toolchain.toml` pins. From a clone of this repository:
 
 ```bash
 cargo install --locked --path .
