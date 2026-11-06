@@ -4,7 +4,7 @@ Written for the next session that works on this repo. It holds every open findin
 
 ## Where things stand
 
-- Repo: `BattermanZ/DejaView`. The review was written against `a3959f9`. The safety group of the suggested order (S1 to S6, C1, C2, C4, C5, C6, with P1's size floor) is done and merged; the NAS speed group (P2 to P11) is done on `claude/happy-fermat-r9d08c`. Each of those findings ends with a Done line saying what was built and where it differs from the fix proposed.
+- Repo: `BattermanZ/DejaView`. The review was written against `a3959f9`. The safety group of the suggested order (S1 to S6, C1, C2, C4, C5, C6, with P1's size floor) and the NAS speed group (P2 to P11) are done and merged; the reports and UI group (C3, C7 to C10, U1 to U9) is done on `claude/happy-fermat-r9d08c`. Each of those findings ends with a Done line saying what was built and where it differs from the fix proposed.
 - All line numbers below refer to `a3959f9`, and the safety fixes moved many of them. Re-check them before editing.
 - State at `a3959f9`: 134 unit tests and 14 CLI tests pass as root and as non-root; `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean; CI (`.github/workflows/ci.yml`) passed on GitHub.
 - The reviewers' scratch files lived in the old container and are gone. Each finding below says how to reproduce it.
@@ -91,7 +91,7 @@ Severity: High, Medium, Low. Evidence tags: **[verified]** reproduced in the mai
 - Fix (small): a non-blocking exclusive lock (`File::try_lock`, decision 3) on `<downloads>/.dejaview.lock` for scan, link and cleanup-temp; exit with a clear message and code 3 when held (ADR 0003). Fix the README cron line too (absolute binary path, `flock -n`, stdout to /dev/null, dated `--report`).
 - Done: scan, link and `cache cleanup-temp` take a non-blocking lock on `<downloads>/.dejaview_lock` (the `.dejaview_` prefix keeps it out of scans), retrying for about 200 ms because a forked child can hold a just-released lock until its exec, and exit 3 when it is held. An existing lock file is opened read-only, so one root created on an earlier run still works for a run as another user. A filesystem that cannot lock at all runs unlocked with a warning. `rust-version = "1.89"`. The README cron line uses the absolute path, drops stdout and stays silent on exit 3; ADR 0003 keeps one report, so no dated `--report` and, with the built-in lock, no `flock -n`.
 
-**C3. Medium. Reports and errors don't match what happened.** **[reproduced]**
+**C3. Done. Medium. Reports and errors don't match what happened.** **[reproduced]**
 - Where: `src/engine/mod.rs:186` (total computed before apply), `report.rs:117` (one fixed path), `report.rs:130-160`, `linking.rs:252, 306, 476-479, 500-505`, `mod.rs:297-312`, `hashing.rs:316, 400`.
 - `total_saved_bytes` in link mode is the planned sum, counted per path, not per inode, and includes failed entries (one 2 MB failure: reported 10488723, applied entries sum to 8391566).
 - Failed entries keep the plan's `method: try-hardlink` and its `fallback_reason`.
@@ -100,7 +100,8 @@ Severity: High, Medium, Low. Evidence tags: **[verified]** reproduced in the mai
 - `--json --strict` prints nothing on stdout when it fails.
 - Non-strict runs with failed links exit 0.
 - Fix (small to medium): format errors with `{:#}` everywhere an anyhow error becomes a string; clear method and reason on failure; compute freed bytes from applied actions per inode (add `nlink` to FileInfo); add optional report fields `version`, `started_at`, `finished_at`, `downloads`, `media`, `link_mode`, `outcome` (complete, cancelled, failed), `symlinked` count, `already_linked` pairs/bytes, and split `planned_bytes` / `freed_bytes`; skip writing the report when nothing was planned; emit JSON before returning a strict error; exit codes as ADR 0003 sets them.
-- Partly done with the safety group: `fallback_reason` names the cause and the OS error (S3), a pair found to be one file already is `already-linked` (C5), and exit code 3 exists (C2). Still open: `{:#}` for `error` and the strict error, clearing a failed entry's planned method and reason, freed bytes per inode, the other report fields, skipping the report when nothing was planned, JSON before a strict error, and exit code 2.
+- Partly done with the safety group: `fallback_reason` names the cause and the OS error (S3), a pair found to be one file already is `already-linked` (C5), and exit code 3 exists (C2).
+- Done: errors keep their chain (`{:#}`) in `error`, the log, the dashboard and the strict error, and a failed pair's planned `method` and `fallback_reason` are cleared. Freed bytes come from the download's link count read right before each link, not from `nlink` in FileInfo: a download's bytes count once its last path is replaced, so cross-seeded paths count once. The report gains `outcome`, `version`, `started_at`, `finished_at` (RFC 3339, UTC, without a date crate), `downloads`, `media`, `link_mode`, `symlinked`, `already_linked`, `already_linked_bytes`, `planned_bytes` and `freed_bytes`; `total_saved_bytes` is `planned_bytes` for a scan and `freed_bytes` for a link run. A link run that planned nothing leaves the default report alone, `--json` prints the report before a strict error, and a run returns how it ended, which main turns into 0, 2, or 1 for a link cancelled partway (P5 had left that one exiting 0).
 
 **C4. Done. High (blocks Docker and hardened systemd). Logger setup is fatal and paths can't be overridden.** **[verified]**
 - Where: `src/main.rs:169`, `src/logger.rs:35-40, 66, 70`, `src/config.rs:18-22`.
@@ -119,24 +120,28 @@ Severity: High, Medium, Low. Evidence tags: **[verified]** reproduced in the mai
 - Fix (tiny): skip a download whose (dev, ino) matches any media file in its hash group, or choose that file as its target.
 - Done: a download sharing an inode with any library file in its hash group is skipped.
 
-**C7. Low. A permanent walk error disables cache pruning and makes `--strict` fail every run.** **[reproduced]**
+**C7. Done. Low. A permanent walk error disables cache pruning and makes `--strict` fail every run.** **[reproduced]**
 - Where: `mod.rs:159-172`, `collect.rs:53-58`.
 - An unreadable folder in the library (`#recycle`, `@eaDir`, `lost+found`) keeps stale cache entries forever and fails every strict run.
 - Fix (small): prune entries not under a folder that failed to walk instead of skipping the prune; add exclude patterns (P8).
+- Done: the walk records each path it could not read, a folder or a file whose metadata failed, and logs it with the error; pruning keeps entries at and under those paths and drops the rest. Only a hash pass that stopped early still skips the prune. The exclude list (P8) is the way out for `--strict`, which the walk error names.
 
-**C8. Low. `cache audit-temp` and `cleanup-temp` miss leftover symlink temp files.** **[reproduced]**
+**C8. Done. Low. `cache audit-temp` and `cleanup-temp` miss leftover symlink temp files.** **[reproduced]**
 - Where: `src/engine/cache.rs:87` (`file_type().is_file()` is false for symlinks).
 - A leftover `.dejaview_link.tmp.123.456` symlink is neither listed nor removed; the README says both are handled.
 - Fix (tiny): accept `is_symlink()` too.
+- Done: both take temp-named symlinks, and removing one leaves the library file it points at alone.
 
-**C9. Low. Non-UTF-8 paths.** **[reproduced]**
+**C9. Done. Low. Non-UTF-8 paths.** **[reproduced]**
 - TUI `l` passes the lossy `display()` string as `--only-source`, so a non-UTF-8 source links nothing and reports no error; two names differing only in invalid bytes show identical sources in reports. Cache keys use `to_string_lossy` and collide (2 entries for 3 files), costing rehashes only (inode and ctime checks keep it safe).
 - Fix: pass OS-string paths to the child (plan file); encode non-UTF-8 names losslessly in cache keys and reports.
+- Done: a report entry and a plan row carry `source_raw` and `target_raw`, the path's bytes in hex, only for a path that is not UTF-8, so the string fields and every UTF-8 report stay as they were. A cache key writes each byte that is not UTF-8 as a NUL and two hex digits, which no path can hold, so keys of UTF-8 paths are unchanged and prefixes still nest for C7.
 
-**C10. Medium. Row order is random on every run (CLI table, JSON, TUI).** **[reproduced]**
+**C10. Done. Medium. Row order is random on every run (CLI table, JSON, TUI).** **[reproduced]**
 - Where: `collect.rs:163` (`size_map.into_values()`), `linking.rs:373` (`hash_map.values()`).
 - Three `scan --json` runs gave three orders; the TUI list reshuffles when the scan completes; reports can't be diffed.
 - Fix (tiny): sort actions by source path (or size descending) once before building the table, report and events.
+- Done: actions are sorted by download path, then library path, wherever they are planned, and the dashboard keeps its live rows in that order as groups finish.
 
 ### Speed on a NAS
 
@@ -211,44 +216,53 @@ Measured by the reviewer on a 93,730-file library shaped like a Jellyfin/Kodi li
 
 All reproduced by rendering the TUI in a pty with pyte at 60x20, 80x24, 100x30, 120x40, 200x50 unless marked.
 
-**U1. High. Status feedback is invisible.** **[reproduced; confirmed in code]**
+**U1. Done. High. Status feedback is invisible.** **[reproduced; confirmed in code]**
 - Where: `src/tui/view/mod.rs:474` (a Paragraph over up to 64 log lines with no scroll: it shows the oldest lines); `app.rs:977`, `app.rs:853` (Cancelled and `fail_running_job` don't update `latest_activity_message`).
 - After the first scan the Run Log is stuck on "TUI started... Running scan... Phase: COLLECTING FILES". "Scan finished", "Saved report to...", "Link run had 1 failure(s)", "Scan cancelled" never show. Progress lines logged every 10 files fill the ring. After cancelling: "IDLE READY TO SCAN ... 0 planned ... Verifying duplicate files: 2 / 8", which reads as "no duplicates". First run with no config: S gives "Scan failed: scan failed: Error: downloads path not set" (doubled prefix, no hint to press e).
 - Fix (small): render the last N lines; set the activity line on Done, Cancelled and Error; keep per-file progress out of the log ring; open the path editor when paths are unset. Add 3-4 TestBackend render tests (view coverage is 49%, layout 0%).
 - Partly done with the safety group, whose lock and `L` messages went unseen without it: the Run Log renders its newest lines (one row each, cut with an ellipsis), the activity line is set on Done, Cancelled and Error, the doubled "Link failed: link failed: Error:" prefix is gone, and two TestBackend render tests cover it. Still open: per-file progress in the log ring, the path editor when paths are unset, the stale "Working on" line during a run.
+- Done: count events update the counters and the activity line, never the log; a file event sets the current-file line, not the activity line; S or X with a path unset opens the path editor saying what to do. The editor opens on a scan, not at start-up, so a dashboard opened only to look is not interrupted.
 
-**U2. High. Result rows can't be told apart.**
+**U2. Done. High. Result rows can't be told apart.**
 - Where: `view/mod.rs:639` (`trim_to_width(&row.source...)` ignores `expand_paths`).
 - 350 episode rows all render as `/tmp/claude-0/-h....H.264-GROUP.mkv`; at 60 columns the SOURCE column shows just `/`. No SIZE or TARGET column. `p` only affects the sidebar and activity lines.
 - Fix (small-medium): show source relative to the downloads root, trim keeping the file name, add SIZE and (when wide) TARGET relative to media, make `p` apply to the table.
+- Done as proposed, TARGET from a 110-column table. A file name too long for its column keeps its start rather than its ends: in scene names the title and episode lead and the release group the rows share trails.
 
-**U3. Medium-High. At 80x24 the confirm dialogs clip their own y/n prompt.**
+**U3. Done. Medium-High. At 80x24 the confirm dialogs clip their own y/n prompt.**
 - Where: `src/tui/layout.rs:16-19` (fixed rows 9 + min 10 + 6 + 2 = 27 > 24), dialogs sized by percentage (`centered_rect`).
 - LINK ALL / LINK SELECTED lose "Press y to continue or n/q to cancel."; Help stops at "R save report"; Run Log is 1 line; footer loses "? help"; metric titles truncate to "PLANN"/"APPL". At 60x20 the wordmark is cut and footer and log vanish.
 - Fix (medium): collapse the wordmark below about 30 rows, hide the sidebar below about 100 columns, size dialogs to content, put "y link / n cancel" in the dialog border title.
 - Partly done with the safety group: both link confirmations carry "y link" and "n cancel" on their bottom border, tested at 80x24. Still open: the wordmark, the sidebar, dialogs sized to content, Help and the footer.
+- Done: below 30 rows or 100 columns the header is one block with the counts on a line; the sidebar goes below 100 columns and the Inspector below 70; dialogs are as tall as their wrapped text (Help scrolls, U4); metric cards are at least as wide as their titles; the footer drops its least needed keys first and keeps `q` and `?`. The table also narrows STATE and SIZE and leaves OUTCOME to the Inspector under 66 columns.
 
-**U4. Medium. Selection and navigation.**
+**U4. Done. Medium. Selection and navigation.**
 - Where: `app.rs:1005` (`selected_row = 0` on Done), `app.rs:477` (only j/k/arrows), `app.rs:436` (j closes the JSON preview), `view/mod.rs:691` (JSON overlay has no scroll).
 - The selected row differs only by background `#1c1f31` vs `#0b0d18`. Linking one row jumps back to row 0. No PgUp/PgDn/Home/End/g/G. JSON preview of a 350-entry report shows one entry and can't scroll; Help can't scroll either.
 - Fix (small): highlight symbol plus reverse video; after a single link select the next planned row; paging keys; scrollable JSON/help overlays that close only on Esc/q/J.
+- Done as proposed. Paging goes by the rows the last frame showed, and overlays scroll within the lines they drew, which the view hands back to the app through `ViewSizes`. Help closes on `?` too.
 
-**U5. High. The TUI's subprocess protocol has no structured error path.** **[reproduced]**
+**U5. Done. High. The TUI's subprocess protocol has no structured error path.** **[reproduced]**
 - Where: `src/engine/mod.rs:48-60`, `297-304`; `src/tui/actions.rs:34`, `100-116`; `src/tui/app.rs:991-1000` (compare `853-864`).
 - Strict failures during scan/hash send no `error` event; the TUI shows raw stderr (116 lines with `RUST_BACKTRACE=1`). A strict link failure after some files were linked leaves both rows "PLANNED", header planned=2 applied=1, and no report in the TUI although the report on disk is correct. After the binary is replaced on disk (`cargo install`, package upgrade), `current_exe()` returns `<path> (deleted)` and an open TUI can't start any run. The protocol has no version.
 - Fix (medium): keep the subprocess (kill-safe cancel, crash isolation). In tui-events mode emit `Error { message: format!("{err:#}"), report: Option<RunReport> }` for every error except Cancelled and have the TUI adopt the partial report; first event `hello { protocol, version }` checked by the parent; spawn `/proc/self/exe` on Linux; set `RUST_BACKTRACE=0` for the child; CLI tests that the stream ends in exactly one done/error/cancelled event for strict hash failure, strict link failure, cancel and config error.
+- Done as proposed. main frames every scan and link, so a config error before the run starts ends the stream too; the strict failure carries its report as a `StoppedWithReport` error. `RUST_LIB_BACKTRACE=0` is set with `RUST_BACKTRACE`, since anyhow reads it first. The strict hash failure test runs the child as `nobody` under root.
 
-**U6. Medium. CLI output.**
+**U6. Done. Medium. CLI output.**
 - Link with a failure prints "Potential space saved", warnings, "Done" and exits 0; with 0 applied there is no "Applied" line; a successful link never states space actually freed. Nothing found prints "Found duplicates:" over an empty table. The table header is misaligned because the coloured header cells count escape bytes (`linking.rs:384`). Each row repeats both absolute roots (350 rows is about 1,750 lines at 80 columns). No quiet mode for cron; `--json` mails the whole report.
 - Fix (small): "Linked 7 of 8, 8.0 MiB freed, 1 failed: see <report>" and "No duplicates found."; uncoloured header; print roots once and paths relative; `--quiet` (print only when something was linked or failed); exit code 2 for completed-with-failures (ADR 0003).
+- Done as proposed, with exit code 2 in C3. The table gains a size column, the summary folds the skip counts into one line, and sizes for a person are in KiB, MiB and GiB. `--quiet` also leaves out warnings that repeat every run (dangling symlinks, pairs left alone, second-mount skips), which the report and the log keep, so a cron mail means a link or a failure.
 
-**U7. Low-Medium. `x` clears the cache with no confirmation.** Lowercase x (next to c, not documented) wipes the cache, which costs a full library rehash. Confirm X/x. Where: `app.rs:483`.
+**U7. Done. Low-Medium. `x` clears the cache with no confirmation.** Lowercase x (next to c, not documented) wipes the cache, which costs a full library rehash. Confirm X/x. Where: `app.rs:483`.
+- Done: `x` and `X` open a confirmation that says what clearing costs; Help names both.
 
-**U8. Medium. Error messages and the path editor.**
+**U8. Done. Medium. Error messages and the path editor.**
 - `config set-downloads /srv/nope` gives "No such file or directory (os error 2)" without the path (`normalize_runtime_dir`). The TUI editor does not expand `~`, doesn't name the failing field, and clips long errors ("media path is inside the downloads path (/tmp/claude-0/-home-user/fd53d022-d"). The editor tip says "saving to the repo config file" (`view/mod.rs:785`) but the file is `~/.config/dejaview/config.json`.
 - Fix (small): path context in `normalize_runtime_dir`, `~` expansion, wrapped status text, correct the tip.
+- Done as proposed: the editor's errors also say which field, and its tip names the config file it saves to.
 
-**U9. Medium. Progress for large files.** The TUI sits on "0 / 8 duplicate files verified" for each large file (a 60 GB remux at 150 MB/s is about 7 minutes with no movement); the CLI bar counts files only. The counter also counts cancelled reads as done (`hashing.rs:387` increments before checking the result). Fix: bytes done of total, MB/s, ETA; count only successful hashes.
+**U9. Done. Medium. Progress for large files.** The TUI sits on "0 / 8 duplicate files verified" for each large file (a 60 GB remux at 150 MB/s is about 7 minutes with no movement); the CLI bar counts files only. The counter also counts cancelled reads as done (`hashing.rs:387` increments before checking the result). Fix: bytes done of total, MB/s, ETA; count only successful hashes.
+- Done: a `hash_bytes` event, paced like the others, carries bytes read of the full pass's total; the dashboard shows them with the speed and time left, and the CLI bar switches to bytes for the full pass. A read stopped by a cancel is not counted; one that failed still is, since it is finished.
 
 **Feature ideas worth building:** hardlink-only mode and dangling-symlink check (S3); `min_size` and per-root exclude globs (P1, P8); mark rows with space and link the marked set with L, plus a persistent skip list such as `.dejaview_skip.json`, since each `l` currently re-walks both trees (U2, P6).
 
@@ -291,7 +305,7 @@ All reproduced by rendering the TUI in a pty with pyte at 60x20, 80x24, 100x30, 
 
 ## Suggested order
 
-1. Safety, done on `claude/happy-fermat-r9d08c`: S1, S2 (empty files, with P1's floor), S3, S4, S5, C1, C6, C2 (lock), C4 (logging), C5, then S6.
-2. NAS speed, done on `claude/happy-fermat-r9d08c`: P1 (with S2), P2, P8, P3, P4, P7, then P5 and P6, then P9, P10, P11.
-3. Reports and UI: C3, C10, U1, U5, U2, U3, U4, U6, U7, U8, U9, C7, C8, C9.
+1. Safety, done and merged: S1, S2 (empty files, with P1's floor), S3, S4, S5, C1, C6, C2 (lock), C4 (logging), C5, then S6.
+2. NAS speed, done and merged: P1 (with S2), P2, P8, P3, P4, P7, then P5 and P6, then P9, P10, P11.
+3. Reports and UI, done on `claude/happy-fermat-r9d08c`: C3, C10, U1, U5, U2, U3, U4, U6, U7, U8, U9, C7, C8, C9.
 4. Maintenance and release: M1, M5, M6, M3, M2, M4, M7, M9, M8, docs.
