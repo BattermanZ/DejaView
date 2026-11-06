@@ -128,7 +128,7 @@ pub(super) fn maybe_confirm_apply(require_confirm: bool, planned_actions: usize)
 pub(super) fn symlinked_count(entries: &[LinkReportEntry]) -> usize {
     entries
         .iter()
-        .filter(|entry| entry.status == "applied" && entry.method.as_deref() == Some("symlink"))
+        .filter(|entry| entry.is_applied_symlink())
         .count()
 }
 

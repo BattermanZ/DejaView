@@ -498,11 +498,16 @@ fn report_hardlink_probe(downloads: &std::path::Path, media: &std::path::Path) {
         engine::HardlinkProbe::NoFile => {
             println!("{} No library file to try a hardlink with yet.", "ℹ".cyan())
         }
-        engine::HardlinkProbe::Works { file } => println!(
-            "{} A test hardlink of {} into downloads worked: hardlinks work, so link runs free space. On a mergerfs pool this tried one disk; files on others can still fall back to symlinks.",
-            "✔".green(),
-            file.display()
-        ),
+        engine::HardlinkProbe::Works { file, leftover } => {
+            println!(
+                "{} A test hardlink of {} into downloads worked: hardlinks work, so link runs free space. On a mergerfs pool this tried one disk; files on others can still fall back to symlinks.",
+                "✔".green(),
+                file.display()
+            );
+            if let Some(leftover) = leftover {
+                eprintln!("{} {leftover}", "⚠".yellow());
+            }
+        }
         engine::HardlinkProbe::Fails { file, cause, error } => eprintln!(
             "{} A test hardlink of {} into downloads failed: {cause} ({error}). Link runs will make symlinks instead, and each breaks if Sonarr or Radarr upgrades, renames or deletes its library file.",
             "⚠".yellow(),

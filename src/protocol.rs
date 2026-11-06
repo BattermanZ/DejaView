@@ -29,6 +29,14 @@ pub struct PlannedPair {
     pub target: String,
 }
 
+impl LinkReportEntry {
+    /// This run turned the download into a symlink, which breaks if its
+    /// library file is upgraded, renamed or deleted (ADR 0001).
+    pub fn is_applied_symlink(&self) -> bool {
+        self.status == "applied" && self.method.as_deref() == Some("symlink")
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RunReport {
     pub mode: String,

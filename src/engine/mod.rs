@@ -70,6 +70,8 @@ pub enum HardlinkProbe {
     NoFile,
     Works {
         file: std::path::PathBuf,
+        /// Why the probe link could not be removed again, if it could not.
+        leftover: Option<String>,
     },
     Fails {
         file: std::path::PathBuf,
@@ -109,8 +111,13 @@ pub fn probe_hardlink(downloads: &std::path::Path, media: &std::path::Path) -> H
     ));
     match std::fs::hard_link(&file, &probe) {
         Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
-            HardlinkProbe::Works { file }
+            let leftover = std::fs::remove_file(&probe).err().map(|err| {
+                format!(
+                    "the test link {} could not be removed ({err}); `dejaview cache cleanup-temp` removes it",
+                    probe.display()
+                )
+            });
+            HardlinkProbe::Works { file, leftover }
         }
         Err(err) => {
             let error = err.to_string();
@@ -332,6 +339,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     let ApplyOutcome {
         applied: applied_actions,
         already_linked,
+        skipped,
         strict_error: strict_link_error,
         cancelled: apply_cancelled,
     } = if options.dry_run {
@@ -381,6 +389,12 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         }
     }
 
+    if skipped > 0 && !machine_output {
+        println!(
+            "{} Left alone {skipped} pair(s) on purpose; each entry's `error` in the report says why.",
+            "ℹ".cyan()
+        );
+    }
     if already_linked > 0 && !machine_output {
         println!(
             "{} {already_linked} pair(s) already were one file; nothing changed. The filesystem gives one file different inode numbers: on mergerfs, mount with inodecalc=hybrid-hash, or use_ino on older versions.",

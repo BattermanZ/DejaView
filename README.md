@@ -121,12 +121,14 @@ dejaview link --confirm
 | `--min-size BYTES` | Skip files smaller than this for this run, in place of the configured floor. |
 | `--confirm` | `link` only. Ask before changing anything. Needs a terminal and cannot be combined with `--json`. |
 
-For a cron job, give the binary's absolute path (cron's `PATH` is short), send stdout to `/dev/null` so cron mails only warnings and errors, and treat exit code 3 as nothing to report:
+For a cron job, give the binary's absolute path (cron's `PATH` is short), drop stdout so cron mails only warnings and errors, and treat exit code 3 as nothing to report:
 
 ```bash
 # Every night at 03:17. The report stays at <downloads>/.dejaview_link_report.json.
-17 3 * * * /home/me/.cargo/bin/dejaview link --no-progress >/dev/null; rc=$?; [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || echo "dejaview link exited $rc"
+17 3 * * * out=$(/home/me/.cargo/bin/dejaview link --no-progress 2>&1 >/dev/null); [ "$?" -ne 3 ] && [ -n "$out" ] && echo "$out"
 ```
+
+The line keeps what DejaView writes to stderr, which is warnings and errors, and prints it unless the run exited with 3; cron mails whatever is printed.
 
 Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder. A run that finds another one going does nothing and exits with code 3, so a cron run that overlaps a long first run, or a run from the dashboard, skips its turn. Exit code 0 means the run finished, and 1 that it could not start or stopped on an error (with `--strict`, on the first failure).
 

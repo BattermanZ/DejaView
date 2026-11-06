@@ -246,6 +246,12 @@ fn cache_audit_and_cleanup_temp_commands_work() {
     fs::write(downloads.join(".dejaview_hardlink.tmp.1"), b"temp-artifact")
         .expect("write temp artifact");
     fs::write(nested.join(".dejaview_link.tmp.2"), b"temp-artifact").expect("write nested temp");
+    // A `config validate` test link that could not be removed.
+    fs::write(
+        downloads.join(".dejaview_validate_link.3.4"),
+        b"temp-artifact",
+    )
+    .expect("write probe leftover");
 
     run_ok(
         &root,
@@ -267,7 +273,7 @@ fn cache_audit_and_cleanup_temp_commands_work() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Temp artifacts: 2"));
+    assert!(stdout.contains("Temp artifacts: 3"));
 
     let out = run_cmd(&root, &["cache", "cleanup-temp"]);
     assert!(
@@ -276,7 +282,7 @@ fn cache_audit_and_cleanup_temp_commands_work() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Removed temp artifacts: 2"));
+    assert!(stdout.contains("Removed temp artifacts: 3"));
     assert!(!downloads.join(".dejaview_hardlink.tmp.1").exists());
     assert!(!nested.join(".dejaview_link.tmp.2").exists());
 

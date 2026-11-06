@@ -48,7 +48,7 @@ fn status_chip_style(row: &LinkReportEntry, _is_selected: bool) -> Style {
     if row.status.eq_ignore_ascii_case("failed") {
         return Theme::chip_danger();
     }
-    if row.status.eq_ignore_ascii_case("planned") {
+    if row.status.eq_ignore_ascii_case("planned") || row.status.eq_ignore_ascii_case("skipped") {
         return Theme::chip_pending();
     }
     if row
@@ -69,7 +69,7 @@ fn row_style(row: &LinkReportEntry, is_selected: bool) -> Style {
             Theme::danger()
         };
     }
-    if row.status.eq_ignore_ascii_case("planned") {
+    if row.status.eq_ignore_ascii_case("planned") || row.status.eq_ignore_ascii_case("skipped") {
         return if is_selected {
             Theme::result_row_selected().fg(Theme::muted().fg.unwrap_or(Color::Reset))
         } else {

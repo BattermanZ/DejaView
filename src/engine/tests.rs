@@ -116,10 +116,12 @@ where
     G: Fn(&Path, &Path) -> std::io::Result<()>,
 {
     let roots = CanonicalRoots::new(downloads, media).expect("resolve roots");
+    let src_snapshot = snapshot_of(src);
     let tgt_snapshot = snapshot_of(tgt);
     replace_file_with_best_link_with(
         &LinkRequest {
             src,
+            src_snapshot: &src_snapshot,
             tgt,
             tgt_snapshot: &tgt_snapshot,
             roots: &roots,
@@ -1639,7 +1641,7 @@ fn link_that_would_lock_out_the_download_owner_is_refused() {
     let report: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&report).expect("read report"))
             .expect("parse report");
-    assert_eq!(report["entries"][0]["status"], "failed");
+    assert_eq!(report["entries"][0]["status"], "skipped");
     let error = report["entries"][0]["error"].as_str().expect("error");
     assert!(error.contains("could no longer read"), "{error}");
     assert!(
@@ -1768,9 +1770,51 @@ fn a_symlink_the_filesystem_made_for_a_hardlink_is_reported_as_a_symlink() {
 }
 
 #[test]
+fn a_library_file_replaced_while_linking_leaves_the_download_alone() {
+    // Sonarr renames an upgrade over the library file between the pre-link
+    // checks and the hardlink. The download must not end up a link to the new
+    // file, hard or symbolic: its own bytes would be gone.
+    let root = unique_temp_dir("replaced_target");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let upgrade = root.join("upgrade.mkv");
+    let src = downloads.join("movie.mkv");
+    let tgt = media.join("movie.mkv");
+    write_file(&src, b"same-bytes");
+    write_file(&tgt, b"same-bytes");
+    write_file(&upgrade, b"a different, longer upgrade");
+    let (from_upgrade, library) = (upgrade.clone(), tgt.clone());
+
+    let result = link_with(
+        &src,
+        &tgt,
+        &downloads,
+        &media,
+        LinkMode::Best,
+        move |from, to| {
+            fs::rename(&from_upgrade, &library)?;
+            fs::hard_link(from, to)
+        },
+        |from, to| fs::rename(from, to),
+    );
+
+    let err = result.expect_err("the pair fails; no fallback");
+    assert!(
+        err.to_string()
+            .contains("changed while it was being linked"),
+        "{err}"
+    );
+    let meta = fs::symlink_metadata(&src).expect("src");
+    assert!(meta.file_type().is_file(), "the download is still a file");
+    assert_eq!(fs::read(&src).expect("read src"), b"same-bytes");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
 fn a_library_path_swapped_for_a_symlink_while_linking_is_refused() {
     // link(2) does not follow a symlink: a library path swapped for one after
-    // the checks would leave the download a symlink to wherever it points.
+    // the checks leaves a symlink to wherever it points at the temp name. No
+    // link of any kind may then replace the download.
     let root = unique_temp_dir("swapped_target");
     let downloads = root.join("downloads");
     let media = root.join("media");
@@ -1780,7 +1824,7 @@ fn a_library_path_swapped_for_a_symlink_while_linking_is_refused() {
     write_file(&src, b"same-bytes");
     write_file(&tgt, b"same-bytes");
     write_file(&elsewhere, b"not for the download");
-    let victim = elsewhere.clone();
+    let (victim, library) = (elsewhere.clone(), tgt.clone());
 
     let result = link_with(
         &src,
@@ -1788,26 +1832,57 @@ fn a_library_path_swapped_for_a_symlink_while_linking_is_refused() {
         &downloads,
         &media,
         LinkMode::Best,
-        move |_from, to| std::os::unix::fs::symlink(&victim, to),
+        move |from, to| {
+            fs::remove_file(&library)?;
+            std::os::unix::fs::symlink(&victim, &library)?;
+            fs::hard_link(from, to)
+        },
         |from, to| fs::rename(from, to),
     );
 
-    // The hardlink step fails its check, and the symlink fallback then links
-    // to the real library file, never to the swapped-in path.
-    let linked = result.expect("falls back to a symlink to the planned target");
-    assert_eq!(linked.method, "symlink");
-    assert!(
-        linked
-            .fallback_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("changed while it was being linked")),
-        "{:?}",
-        linked.fallback_reason
+    assert!(result.is_err(), "{result:?}");
+    let meta = fs::symlink_metadata(&src).expect("src");
+    assert!(meta.file_type().is_file(), "the download is still a file");
+    assert_eq!(fs::read(&src).expect("read src"), b"same-bytes");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_download_replaced_while_linking_is_not_overwritten() {
+    // The torrent client re-creates the download after the checks: the rename
+    // must not replace a file the plan never saw.
+    let root = unique_temp_dir("replaced_source");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let fresh = root.join("fresh.mkv");
+    let src = downloads.join("movie.mkv");
+    let tgt = media.join("movie.mkv");
+    write_file(&src, b"same-bytes");
+    write_file(&tgt, b"same-bytes");
+    write_file(&fresh, b"the client's new file");
+    let (from_fresh, download) = (fresh.clone(), src.clone());
+
+    let result = link_with(
+        &src,
+        &tgt,
+        &downloads,
+        &media,
+        LinkMode::Best,
+        move |from, to| {
+            fs::rename(&from_fresh, &download)?;
+            fs::hard_link(from, to)
+        },
+        |from, to| fs::rename(from, to),
     );
-    assert_eq!(
-        fs::canonicalize(&src).expect("resolve src"),
-        fs::canonicalize(&tgt).expect("resolve tgt")
-    );
+
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(fs::read(&src).expect("read src"), b"the client's new file");
+    let leftovers = fs::read_dir(&downloads)
+        .expect("read downloads")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+        .count();
+    assert_eq!(leftovers, 0);
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
@@ -1895,5 +1970,71 @@ fn a_download_whose_folder_resolves_outside_downloads_is_refused() {
             .ino(),
         before
     );
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_pair_left_alone_for_access_does_not_stop_a_strict_run() {
+    if !running_as_root() {
+        eprintln!("skipped: changing file owners needs root");
+        return;
+    }
+    let root = unique_temp_dir("access_skip_strict");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    // Sorts first: its library copy is closed to the download's owner.
+    let locked = downloads.join("a-locked.mkv");
+    let locked_lib = media.join("a-locked.mkv");
+    let clean = downloads.join("b-clean.mkv");
+    let clean_lib = media.join("b-clean.mkv");
+    write_file(&locked, b"locked-bytes");
+    write_file(&locked_lib, b"locked-bytes");
+    write_file(&clean, b"clean-bytes");
+    write_file(&clean_lib, b"clean-bytes");
+    std::os::unix::fs::chown(&locked, Some(1001), Some(1001)).expect("chown download");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o664)).expect("chmod download");
+    std::os::unix::fs::chown(&locked_lib, Some(1002), Some(1002)).expect("chown library");
+    fs::set_permissions(&locked_lib, fs::Permissions::from_mode(0o640)).expect("chmod library");
+    let report = root.join("report.json");
+    let config = make_config(&downloads, &media, 0);
+
+    run_scan_with_options(
+        &config,
+        ScanRunOptions {
+            dry_run: false,
+            strict: true,
+            report_path: Some(&report),
+            json_output: false,
+            show_progress: false,
+            require_confirm: false,
+            tui_events: false,
+            link_mode: LinkMode::Best,
+            only_sources: &[],
+            only_pairs: &[],
+            cancel: CancelToken::default(),
+        },
+    )
+    .expect("a deliberate skip is not a failure");
+
+    assert_eq!(
+        fs::metadata(&clean).expect("clean").ino(),
+        fs::metadata(&clean_lib).expect("clean lib").ino(),
+        "the pair after the skipped one is linked"
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report).expect("read report"))
+            .expect("parse report");
+    let locked_entry = report["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| {
+            entry["source"]
+                .as_str()
+                .is_some_and(|s| s.ends_with("a-locked.mkv"))
+        })
+        .expect("locked entry");
+    assert_eq!(locked_entry["status"], "skipped");
+    assert_eq!(report["warnings"]["link_errors"], 0);
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

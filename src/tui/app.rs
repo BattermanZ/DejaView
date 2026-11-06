@@ -76,6 +76,9 @@ pub struct App {
     selected_row: usize,
     pub overlay: Overlay,
     report: Option<RunReport>,
+    /// The reviewed report, put aside while a link runs: restored if the run
+    /// ends without a report of its own, so the rows are not lost.
+    report_before_link: Option<RunReport>,
     live_entries: Vec<LinkReportEntry>,
     logs: VecDeque<String>,
     downloads: Option<PathBuf>,
@@ -110,6 +113,7 @@ impl App {
             selected_row: 0,
             overlay: Overlay::None,
             report: None,
+            report_before_link: None,
             live_entries: Vec::new(),
             logs,
             downloads: config.downloads.clone(),
@@ -616,7 +620,7 @@ impl App {
             return;
         };
         self.reset_live_run_state();
-        self.report = None;
+        self.report_before_link = self.report.take();
         self.live_entries.clear();
         self.selected_row = 0;
         self.push_log("Running link...".to_string());
@@ -892,6 +896,21 @@ impl App {
         }
     }
 
+    /// A link run that ended without a report of its own (it failed, could not
+    /// start, or was cancelled before changing anything) gives the reviewed
+    /// rows back, so they can be linked again without a new scan.
+    fn restore_reviewed_rows(&mut self) {
+        if let Some(previous) = self.report_before_link.take()
+            && self.report.is_none()
+        {
+            self.report = Some(previous);
+            self.push_log(
+                "The rows shown are from before the link run; scan again to see what it changed."
+                    .to_string(),
+            );
+        }
+    }
+
     fn fail_running_job(&mut self, kind: JobKind, message: String) {
         self.running_job = None;
         self.live_entries.clear();
@@ -903,6 +922,7 @@ impl App {
             JobKind::LinkAll | JobKind::LinkSelected(_) => "Link",
         };
         self.push_log(format!("{label} failed: {message}"));
+        self.restore_reviewed_rows();
     }
 
     fn apply_tui_event(&mut self, kind: JobKind, event: TuiEvent) -> bool {
@@ -1028,6 +1048,7 @@ impl App {
                         "Link cancelled before any file was changed.".to_string()
                     }
                 });
+                self.restore_reviewed_rows();
                 true
             }
             TuiEvent::Error { message } => {
@@ -1038,6 +1059,7 @@ impl App {
                     JobKind::LinkAll | JobKind::LinkSelected(_) => "Link",
                 };
                 self.push_log(format!("{label} failed: {message}"));
+                self.restore_reviewed_rows();
                 true
             }
             TuiEvent::Done { report } => {
@@ -1047,15 +1069,14 @@ impl App {
                 let symlinked = report
                     .entries
                     .iter()
-                    .filter(|entry| {
-                        entry.status == "applied" && entry.method.as_deref() == Some("symlink")
-                    })
+                    .filter(|entry| entry.is_applied_symlink())
                     .count();
                 self.selected_row = 0;
                 self.current_path = None;
                 self.active_workers.clear();
                 self.hash_progress_done = None;
                 self.hash_progress_total = None;
+                self.report_before_link = None;
                 self.merge_report(kind.clone(), report);
                 self.live_entries.clear();
                 self.running_job = None;
@@ -1500,6 +1521,42 @@ mod tests {
                 .and_then(|entry| entry.method.as_deref()),
             Some("try-hardlink")
         );
+    }
+
+    #[test]
+    fn a_link_that_fails_to_run_keeps_the_reviewed_rows() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        let mut report = sample_report();
+        report.entries = vec![LinkReportEntry {
+            source: "/downloads/a.mkv".to_string(),
+            target: "/media/a.mkv".to_string(),
+            size: 10,
+            status: "planned".to_string(),
+            method: Some("try-hardlink".to_string()),
+            fallback_reason: None,
+            error: None,
+        }];
+        // What start_link_job leaves behind: the reviewed report put aside
+        // while the child runs.
+        app.report_before_link = Some(report);
+        let (tx, rx) = mpsc::channel();
+        app.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, mpsc::channel().0));
+        tx.send(Err(anyhow!(
+            "link failed: Error: another DejaView run holds the lock"
+        )))
+        .expect("send error");
+
+        app.poll_running_job();
+
+        assert!(app.running_job.is_none());
+        assert_eq!(app.reviewed_planned_pairs().len(), 1, "the rows come back");
+        app.handle_main_key(KeyCode::Char('L'))
+            .expect("key handling should not fail");
+        assert!(matches!(
+            app.overlay,
+            Overlay::ConfirmLink(ConfirmLinkMode::All)
+        ));
     }
 
     #[test]

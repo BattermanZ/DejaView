@@ -203,21 +203,31 @@ pub(super) fn read_access_lost(download: Access, library: Access) -> Option<Stri
     None
 }
 
-fn ensure_link_keeps_read_access(src: &Path, tgt: &Path) -> Result<()> {
+/// Why this pair must be left alone for access, or None to go ahead. A skip is
+/// a decision, not a failure: the run carries on, `--strict` included.
+fn read_access_refusal(src: &Path, tgt: &Path) -> Result<Option<String>> {
     let download =
         Access::of(&fs::metadata(src).with_context(|| format!("metadata {}", src.display()))?);
     let library =
         Access::of(&fs::metadata(tgt).with_context(|| format!("metadata {}", tgt.display()))?);
-    if let Some(who) = read_access_lost(download, library) {
-        return Err(anyhow!(
+    Ok(read_access_lost(download, library).map(|who| {
+        format!(
             "left alone: once linked, {who} could no longer read {}, so the torrent client would stop seeding it. The download is {}; the library file {} is {}. Let that user or group read the library file (a shared group for the torrent client and Sonarr or Radarr, files 0664 or 0644), then run again.",
             src.display(),
             download.describe(),
             tgt.display(),
             library.describe()
-        ));
-    }
-    Ok(())
+        )
+    }))
+}
+
+/// What became of a planned pair that did not fail.
+enum PairOutcome {
+    Applied,
+    /// The download already was the library file; nothing changed.
+    AlreadyLinked,
+    /// Left alone on purpose, with the reason in the report.
+    Skipped(String),
 }
 
 /// What a person reads when the download and the library file are on
@@ -267,6 +277,7 @@ impl CanonicalRoots {
 /// what the plan saw of that library file.
 pub(super) struct LinkRequest<'a> {
     pub(super) src: &'a Path,
+    pub(super) src_snapshot: &'a FileSnapshot,
     pub(super) tgt: &'a Path,
     pub(super) tgt_snapshot: &'a FileSnapshot,
     pub(super) roots: &'a CanonicalRoots,
@@ -290,6 +301,8 @@ pub(super) struct Linked {
 /// /proc, the steps fall back to the path.
 struct PinnedDir {
     path: PathBuf,
+    /// Where the folder really is, for working out a relative symlink.
+    real: PathBuf,
     _handle: Option<fs::File>,
 }
 
@@ -302,7 +315,7 @@ impl PinnedDir {
 fn ensure_dir_inside_downloads(real_dir: &Path, src: &Path, roots: &CanonicalRoots) -> Result<()> {
     if real_dir.starts_with(&roots.media) || !real_dir.starts_with(&roots.downloads) {
         return Err(anyhow!(
-            "refusing to replace {}: its folder is {}, which is not inside the downloads folder {}",
+            "refusing to replace {}: its folder is {}, which is not inside the downloads folder {}. A folder in downloads may be a symlink to somewhere else; remove the symlink or scan again",
             src.display(),
             real_dir.display(),
             roots.downloads.display()
@@ -326,6 +339,7 @@ fn pin_download_dir(src: &Path, roots: &CanonicalRoots) -> Result<PinnedDir> {
                 ensure_dir_inside_downloads(&real_dir, src, roots)?;
                 return Ok(PinnedDir {
                     path: fd_path,
+                    real: real_dir,
                     _handle: Some(handle),
                 });
             }
@@ -343,6 +357,7 @@ fn pin_download_dir(src: &Path, roots: &CanonicalRoots) -> Result<PinnedDir> {
     ensure_dir_inside_downloads(&real_dir, src, roots)?;
     Ok(PinnedDir {
         path: parent.to_path_buf(),
+        real: real_dir,
         _handle: None,
     })
 }
@@ -403,6 +418,28 @@ fn check_temp_link(tmp: &Path, req: &LinkRequest<'_>) -> Result<TempLink> {
     ))
 }
 
+/// Check, in the pinned folder and right before the rename, that the download
+/// is still the file the plan saw: same device, inode, size and mtime. The
+/// earlier checks went by path; this one is what the rename will replace. The
+/// ctime may differ when this run replaced a hardlinked sibling (C1).
+fn ensure_pinned_source_unchanged(dir: &PinnedDir, req: &LinkRequest<'_>) -> Result<()> {
+    let meta = fs::symlink_metadata(dir.join(file_name_of(req.src)?))
+        .with_context(|| format!("metadata {}", req.src.display()))?;
+    let expected = req.src_snapshot;
+    let unchanged = meta.file_type().is_file()
+        && meta.dev() == expected.dev
+        && meta.ino() == expected.inode
+        && meta.len() == expected.size
+        && mtime_ns(&meta) == expected.mtime_ns;
+    if !unchanged {
+        return Err(anyhow!(
+            "the download {} changed while it was being linked; nothing was replaced, rerun scan",
+            req.src.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Rename the temp link over the download. Returns true when the temp name is
 /// still there afterwards: rename(2) does nothing when both names are already
 /// one file, which means the download already was the library file.
@@ -455,11 +492,9 @@ fn replace_with_symlink<G>(dir: &PinnedDir, req: &LinkRequest<'_>, rename_fn: &G
 where
     G: Fn(&Path, &Path) -> std::io::Result<()>,
 {
-    let parent = req
-        .src
-        .parent()
-        .ok_or_else(|| anyhow!("source path has no parent: {}", req.src.display()))?;
-    let rel = diff_paths(req.tgt, parent).context("failed to compute relative path")?;
+    let target = fs::canonicalize(req.tgt)
+        .with_context(|| format!("resolve the library file {}", req.tgt.display()))?;
+    let rel = diff_paths(&target, &dir.real).context("failed to compute relative path")?;
     let tmp = dir.join(temp_name("link"));
     logger::info(
         "link",
@@ -472,6 +507,7 @@ where
     let result = (|| -> Result<()> {
         symlink(&rel, &tmp)
             .with_context(|| format!("ln -s {} beside {}", rel.display(), req.src.display()))?;
+        ensure_pinned_source_unchanged(dir, req)?;
         swap_into_place(&tmp, &dir.join(file_name_of(req.src)?), req.src, rename_fn)?;
         Ok(())
     })();
@@ -482,14 +518,25 @@ where
     Ok(())
 }
 
-/// Hardlink the library file to a temp name beside the download, check it, and
-/// rename it over the download.
+/// Why the hardlink step did not replace the download.
+enum HardlinkError {
+    /// The filesystem would not make the hardlink or rename it into place; a
+    /// symlink may still do.
+    Failed(anyhow::Error),
+    /// The library file or the download changed under the run. Nothing may
+    /// replace the download, a symlink included: it would point at a file the
+    /// plan never compared.
+    Refused(anyhow::Error),
+}
+
+/// Hardlink the library file to a temp name beside the download, check it and
+/// the download, and rename it over the download.
 fn replace_with_hardlink<F, G>(
     dir: &PinnedDir,
     req: &LinkRequest<'_>,
     hard_link_fn: &F,
     rename_fn: &G,
-) -> Result<Linked>
+) -> std::result::Result<Linked, HardlinkError>
 where
     F: Fn(&Path, &Path) -> std::io::Result<()>,
     G: Fn(&Path, &Path) -> std::io::Result<()>,
@@ -503,34 +550,44 @@ where
             req.tgt.display()
         ),
     );
-    let result = (|| -> Result<Linked> {
-        hard_link_fn(req.tgt, &tmp)
-            .with_context(|| format!("ln {} beside {}", req.tgt.display(), req.src.display()))?;
-        let made = check_temp_link(&tmp, req)?;
-        let already_linked =
-            swap_into_place(&tmp, &dir.join(file_name_of(req.src)?), req.src, rename_fn)?;
-        Ok(match made {
-            TempLink::Hardlink => Linked {
-                method: "hardlink",
-                fallback_reason: None,
-                already_linked,
-            },
-            TempLink::FilesystemSymlink => Linked {
-                method: "symlink",
-                fallback_reason: Some(
-                    "the filesystem made a symlink when asked for a hardlink (mergerfs link-exdev, the two files are on different disks)"
-                        .to_string(),
-                ),
-                already_linked,
-            },
-        })
-    })();
-    result.map_err(|err| {
+    let with_note = |err: anyhow::Error| {
         let note = clean_up_temp(&tmp, "hardlink", req.src);
         match hardlink_failure_cause(&err) {
             Some(cause) => anyhow!("{cause}. {err:#}; {note}"),
             None => anyhow!("{err:#}; {note}"),
         }
+    };
+
+    if let Err(err) = hard_link_fn(req.tgt, &tmp) {
+        let err = anyhow::Error::new(err).context(format!(
+            "ln {} beside {}",
+            req.tgt.display(),
+            req.src.display()
+        ));
+        return Err(HardlinkError::Failed(with_note(err)));
+    }
+    let made = check_temp_link(&tmp, req)
+        .and_then(|made| ensure_pinned_source_unchanged(dir, req).map(|()| made))
+        .map_err(|err| HardlinkError::Refused(with_note(err)))?;
+    let dest = file_name_of(req.src)
+        .map(|name| dir.join(name))
+        .map_err(|err| HardlinkError::Failed(with_note(err)))?;
+    let already_linked = swap_into_place(&tmp, &dest, req.src, rename_fn)
+        .map_err(|err| HardlinkError::Failed(with_note(err)))?;
+    Ok(match made {
+        TempLink::Hardlink => Linked {
+            method: "hardlink",
+            fallback_reason: None,
+            already_linked,
+        },
+        TempLink::FilesystemSymlink => Linked {
+            method: "symlink",
+            fallback_reason: Some(
+                "the filesystem made a symlink when asked for a hardlink (mergerfs link-exdev, the two files are on different disks)"
+                    .to_string(),
+            ),
+            already_linked,
+        },
     })
 }
 
@@ -571,7 +628,8 @@ where
     let fallback_reason = if src_dev == tgt_dev {
         match replace_with_hardlink(&dir, req, &hard_link_fn, &rename_fn) {
             Ok(linked) => return Ok(linked),
-            Err(err) => {
+            Err(HardlinkError::Refused(err)) => return Err(err),
+            Err(HardlinkError::Failed(err)) => {
                 logger::warn(
                     "link",
                     format!(
@@ -756,6 +814,8 @@ pub(super) struct ApplyOutcome {
     pub(super) applied: usize,
     /// Pairs found at link time to be one file already; nothing changed.
     pub(super) already_linked: usize,
+    /// Pairs left alone on purpose, such as for access; not failures.
+    pub(super) skipped: usize,
     pub(super) strict_error: Option<anyhow::Error>,
     /// Stopped between actions on request; actions not reached stay planned.
     pub(super) cancelled: bool,
@@ -778,6 +838,7 @@ pub(super) fn apply_actions(
     } = *options;
     let mut applied_actions = 0usize;
     let mut already_linked = 0usize;
+    let mut skipped = 0usize;
     let mut strict_link_error: Option<anyhow::Error> = None;
     let mut cancelled = false;
     // Source inodes this run replaced a path of; see ensure_source_snapshot_matches.
@@ -803,7 +864,7 @@ pub(super) fn apply_actions(
                 path: action.src.display().to_string(),
             });
         }
-        let apply_result = (|| -> Result<bool> {
+        let apply_result = (|| -> Result<PairOutcome> {
             logger::info(
                 "link",
                 format!(
@@ -816,10 +877,18 @@ pub(super) fn apply_actions(
             ensure_source_snapshot_matches(&action.src, &action.src_snapshot, &replaced_inodes)?;
             ensure_target_within_media_root(media, &action.tgt)?;
             ensure_target_snapshot_matches(&action.tgt, &action.tgt_snapshot)?;
-            ensure_link_keeps_read_access(&action.src, &action.tgt)?;
+            if let Some(reason) = read_access_refusal(&action.src, &action.tgt)? {
+                let entry = &mut report_entries[index];
+                entry.status = "skipped".to_string();
+                entry.method = None;
+                entry.fallback_reason = None;
+                entry.error = Some(reason.clone());
+                return Ok(PairOutcome::Skipped(reason));
+            }
             let roots = roots.as_ref().map_err(|err| anyhow!("{err:#}"))?;
             let linked = replace_file_with_best_link(&LinkRequest {
                 src: &action.src,
+                src_snapshot: &action.src_snapshot,
                 tgt: &action.tgt,
                 tgt_snapshot: &action.tgt_snapshot,
                 roots,
@@ -835,10 +904,14 @@ pub(super) fn apply_actions(
                 report_entries[index].status = "applied".to_string();
                 report_entries[index].fallback_reason = linked.fallback_reason;
             }
-            Ok(linked.already_linked)
+            Ok(if linked.already_linked {
+                PairOutcome::AlreadyLinked
+            } else {
+                PairOutcome::Applied
+            })
         })();
-        let was_already_linked = match apply_result {
-            Ok(was_already_linked) => was_already_linked,
+        let outcome = match apply_result {
+            Ok(outcome) => outcome,
             Err(err) => {
                 warnings.link_errors += 1;
                 report_entries[index].status = "failed".to_string();
@@ -882,7 +955,19 @@ pub(super) fn apply_actions(
                 }
             }
         };
-        if was_already_linked {
+        if let PairOutcome::Skipped(reason) = &outcome {
+            skipped += 1;
+            logger::warn("link", reason);
+            if tui_events {
+                let _ = emit_tui_event(&TuiEvent::Log {
+                    message: reason.clone(),
+                });
+            } else if !json_output {
+                eprintln!("{} {reason}", "⚠".yellow());
+            }
+            continue;
+        }
+        if matches!(outcome, PairOutcome::AlreadyLinked) {
             already_linked += 1;
             logger::warn(
                 "link",
@@ -920,6 +1005,7 @@ pub(super) fn apply_actions(
     ApplyOutcome {
         applied: applied_actions,
         already_linked,
+        skipped,
         strict_error: strict_link_error,
         cancelled,
     }
