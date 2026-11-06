@@ -1,8 +1,9 @@
 [package]
-name = "DejaView"
+name = "dejaview"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "GPL-3.0-only"
+description = "Replace downloads that duplicate files in your media library with hardlinks"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }

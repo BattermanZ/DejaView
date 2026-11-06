@@ -349,7 +349,7 @@ fn validate_config(config: &config::Config) -> Result<()> {
             }
         }
         None => failures.push(
-            "downloads path not set; run: DejaView config set-downloads /path/to/downloads"
+            "downloads path not set; run: dejaview config set-downloads /path/to/downloads"
                 .to_string(),
         ),
     }
@@ -368,7 +368,7 @@ fn validate_config(config: &config::Config) -> Result<()> {
             }
         }
         None => failures
-            .push("media path not set; run: DejaView config set-media /path/to/media".to_string()),
+            .push("media path not set; run: dejaview config set-media /path/to/media".to_string()),
     }
 
     if let (Some(downloads), Some(media)) = (&config.downloads, &config.media)

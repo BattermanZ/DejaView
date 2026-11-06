@@ -17,7 +17,7 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
 
 fn run_cmd(root: &Path, args: &[&str]) -> (std::process::Output, Duration) {
     let start = Instant::now();
-    let output = Command::new(env!("CARGO_BIN_EXE_DejaView"))
+    let output = Command::new(env!("CARGO_BIN_EXE_dejaview"))
         .args(args)
         .env("XDG_CONFIG_HOME", root.join("xdg"))
         .env("HOME", root.join("home"))
