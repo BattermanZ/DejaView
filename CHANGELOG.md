@@ -19,7 +19,7 @@
 
 ### Added
 
-- Saving the folders in the dashboard's path editor tries one hardlink between them, as `dejaview config validate` does and after the same check that neither folder reaches the other through a second mount, and the dashboard says whether link runs will make hardlinks or symlinks, and why. In symlink-only mode it makes no test.
+- Saving the folders in the dashboard's path editor tries one hardlink between them, as `dejaview config validate` does and after the same check that neither folder reaches the other through a second mount, and the dashboard says whether link runs will make hardlinks or symlinks, and why. In symlink-only mode it makes no test. [#6]
 - `--quiet` (`-q`) on `scan` and `link` prints nothing unless the run linked something or something failed, so a cron job mails only when something happened. The README's cron example uses it. [#5]
 - The report says how its run ended (`outcome`: `complete`, `cancelled` or `failed`), when (`started_at`, `finished_at`), with what (`version`, `downloads`, `media`, `link_mode`), how many downloads became symlinks (`symlinked`) and how many pairs already were one file (`already_linked`, `already_linked_bytes`). [#5]
 - `dejaview config set-full-threads N` sets how many files are read in full at once. [#4]
@@ -43,8 +43,8 @@
 - A repeat scan reads only files it has not hashed before: the cache now keeps each file's quick hash too, so a file whose quick hash matched no other is not read again. Before, every file sharing its size with a new or changed one was read again on every run. [#4]
 - A file of 1 MiB or less is read once, not twice: its quick hash reads it whole and stands as its full hash. [#4]
 - Files of a size that no download shares with a library file are no longer read, nor are those where every download already is a library file: no link can come of them. [#4]
-- The dashboard's logo is "déjàview" in lowercase pixel letters with depth, teal with two orange accents, and shows whenever the full header does, from 100 columns. Before, it was block capitals, and below 119 columns the header showed the name as plain text instead. `dejaview tui-logo-preview` shows the logo on its own.
-- The dashboard shows each download beside its library file with the link between them drawn in the middle: a green line for a hardlink, an amber arrow for a symlink, a dashed orange line for a pair not linked yet (ending in an arrow when the plan makes it a symlink), a red ✗ for a failure. A season's episodes sit under their release folder, the space to free (or freed) is drawn big above them with the count of each kind of link, and the selected pair is told in full below, with why it is a symlink or why it failed. While a scan runs it shows its steps and the files it reads. The keys at the foot are the ones that work on the screen shown, the next step first. Before, every row showed the same "PLANNED" and "TRY HARDLINK" chips, a symlink wore the same APPLIED chip as a hardlink, told apart by a lighter shade and the OUTCOME column, which a narrow terminal hid, the counts were repeated in four places, and a running scan's results pane said no duplicates were loaded. The settings the sidebar listed are in Help.
+- The dashboard's logo is "déjàview" in lowercase pixel letters with depth, teal with two orange accents, and shows whenever the full header does, from 100 columns. Before, it was block capitals, and below 119 columns the header showed the name as plain text instead. `dejaview tui-logo-preview` shows the logo on its own. [#6]
+- The dashboard shows each download beside its library file with the link between them drawn in the middle: a green line for a hardlink, an amber arrow for a symlink, a dashed orange line for a pair not linked yet (ending in an arrow when the plan makes it a symlink), a red ✗ for a failure. A season's episodes sit under their release folder, the space to free (or freed) is drawn big above them with the count of each kind of link, and the selected pair is told in full below, with why it is a symlink or why it failed. While a scan runs it shows its steps and the files it reads. The keys at the foot are the ones that work on the screen shown, the next step first. Before, every row showed the same "PLANNED" and "TRY HARDLINK" chips, a symlink wore the same APPLIED chip as a hardlink, told apart by a lighter shade and the OUTCOME column, which a narrow terminal hid, the counts were repeated in four places, and a running scan's results pane said no duplicates were loaded. The settings the sidebar listed are in Help. [#6]
 
 ### Fixed
 
@@ -83,3 +83,4 @@
 [#3]: https://github.com/BattermanZ/DejaView/pull/3
 [#4]: https://github.com/BattermanZ/DejaView/pull/4
 [#5]: https://github.com/BattermanZ/DejaView/pull/5
+[#6]: https://github.com/BattermanZ/DejaView/pull/6
