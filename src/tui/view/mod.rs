@@ -622,18 +622,31 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 /// The counts the header's cards show, as one line for a short terminal.
-fn metrics_line(app: &App) -> Line<'static> {
+/// Too narrow for every count, the line drops FILES first, which the
+/// activity line repeats, then APPLIED, so the space counts stay whole.
+fn metrics_line(app: &App, width: u16) -> Line<'static> {
+    let counts = [
+        ("FILES", app.files_considered().to_string(), 2),
+        ("PLANNED", app.planned_actions().to_string(), 0),
+        ("APPLIED", app.applied_actions().to_string(), 1),
+        ("SAVED", format_bytes(app.saved_bytes()), 0),
+        ("TO SAVE", format_bytes(app.potential_saved_bytes()), 0),
+    ];
+    let separator = "  ";
+    let fits = |most: u8| {
+        let shown = counts.iter().filter(|(_, _, drop)| *drop <= most);
+        let text: usize = shown
+            .clone()
+            .map(|(label, value, _)| label.chars().count() + 1 + value.chars().count())
+            .sum();
+        text + separator.len() * shown.count().saturating_sub(1) <= usize::from(width)
+    };
+    let most = (0..=2).rev().find(|&most| fits(most)).unwrap_or(0);
     let mut spans = Vec::new();
-    for (label, value) in [
-        ("FILES", app.files_considered().to_string()),
-        ("PLANNED", app.planned_actions().to_string()),
-        ("APPLIED", app.applied_actions().to_string()),
-        ("SAVED", format_bytes(app.saved_bytes())),
-        ("TO SAVE", format_bytes(app.potential_saved_bytes())),
-    ] {
+    for (label, value, _) in counts.into_iter().filter(|(_, _, drop)| *drop <= most) {
         spans.push(Span::styled(format!("{label} "), Theme::dim()));
         spans.push(Span::styled(value, Theme::metric_number()));
-        spans.push(Span::raw("   "));
+        spans.push(Span::raw(separator));
     }
     spans.pop();
     Line::from(spans)
@@ -644,7 +657,7 @@ fn metrics_line(app: &App) -> Line<'static> {
 fn render_compact_header(frame: &mut Frame, area: Rect, app: &App) {
     let block = card_block("DejaView", true);
     let inner = block.inner(area);
-    let mut lines = vec![metrics_line(app)];
+    let mut lines = vec![metrics_line(app, inner.width)];
     lines.extend(header_activity_lines(app, area.width));
     lines.truncate(usize::from(inner.height));
     frame.render_widget(
@@ -744,17 +757,26 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Length(2), Constraint::Min(1)])
         .split(inner);
 
+    // The counts after the row count repeat the header's, so a narrow pane
+    // leaves them out rather than cutting them mid-word.
+    let phase = app.activity_phase();
+    let rows = format!("{} rows", app.rows().len());
+    let counts = format!(
+        "{rows}  |  {} files  |  {} planned  |  {} applied",
+        app.files_considered(),
+        app.planned_actions(),
+        app.applied_actions()
+    );
+    let room = usize::from(content[0].width).saturating_sub(phase.chars().count() + 2);
     let summary = Paragraph::new(Line::from(vec![
-        Span::styled(app.activity_phase(), Theme::title(true)),
+        Span::styled(phase, Theme::title(true)),
         Span::raw("  "),
         Span::styled(
-            format!(
-                "{} rows  |  {} files  |  {} planned  |  {} applied",
-                app.rows().len(),
-                app.files_considered(),
-                app.planned_actions(),
-                app.applied_actions()
-            ),
+            if counts.chars().count() <= room {
+                counts
+            } else {
+                rows
+            },
             Theme::muted(),
         ),
     ]))
@@ -942,8 +964,8 @@ fn render_config_overlay(frame: &mut Frame, editor: &ConfigEditor) {
     let width = 90u16
         .min(screen.width.saturating_sub(4))
         .max(screen.width.min(20));
-    // Inside the dialog's border and its one-column margin.
-    let inner_width = usize::from(width.saturating_sub(4));
+    // The fields sit just inside the dialog's border.
+    let inner_width = usize::from(width.saturating_sub(2));
     let status = editor
         .error
         .clone()
@@ -961,7 +983,7 @@ fn render_config_overlay(frame: &mut Frame, editor: &ConfigEditor) {
         .unwrap_or(u16::MAX)
         .saturating_add(2);
     let tips_height = u16::try_from(tips.len()).unwrap_or(u16::MAX);
-    let height = (4 + 3 + 3 + status_height + tips_height).min(screen.height);
+    let height = (2 + 3 + 3 + status_height + tips_height).min(screen.height);
     let area = Rect {
         x: screen.x + (screen.width - width) / 2,
         y: screen.y + (screen.height - height) / 2,
@@ -1970,5 +1992,70 @@ mod long_overlay_tests {
         let text = screen(&app, 80, 24);
         assert!(text.contains("S01E7000"), "the last entry:\n{text}");
         assert!(text.lines().any(|line| line.contains("│  ]")), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod real_terminal_tests {
+    use super::row_tests::{app_with_episodes, screen};
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn a_narrow_header_keeps_the_space_counts_whole() {
+        let mut app = app_with_episodes(3);
+        app.set_report_for_test(crate::protocol::RunReport {
+            mode: "scan".to_string(),
+            files_considered: 123_456,
+            planned_actions: 3,
+            total_saved_bytes: 4_500_000_000,
+            ..Default::default()
+        });
+        let text = screen(&app, 60, 20);
+        let counts = text.lines().nth(1).expect("the counts line");
+        assert!(counts.contains("TO SAVE 4.2 GiB"), "{text}");
+        assert!(counts.contains("PLANNED 3"), "{text}");
+        assert!(!counts.contains("FILES"), "FILES gives way first: {counts}");
+        let wide = screen(&app, 80, 24);
+        assert!(
+            wide.lines()
+                .nth(1)
+                .is_some_and(|line| line.contains("FILES")),
+            "{wide}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_results_line_drops_the_repeated_counts_rather_than_cut_them() {
+        let app = app_with_episodes(3);
+        let text = screen(&app, 60, 20);
+        let line = text
+            .lines()
+            .find(|line| line.contains("READY TO REVIEW") && line.contains("rows"))
+            .expect("the results line");
+        assert!(!line.contains("files"), "{line}");
+        let wide = screen(&app, 200, 50);
+        assert!(
+            wide.contains("3 rows  |  0 files  |  3 planned  |  0 applied"),
+            "{wide}"
+        );
+    }
+
+    #[test]
+    fn the_path_editor_has_no_blank_rows_under_its_tip() {
+        let mut app = App::new(&crate::config::Config::default(), false);
+        app.handle_key_for_test(KeyCode::Char('e'), KeyModifiers::NONE);
+        let text = screen(&app, 80, 24);
+        let lines: Vec<&str> = text.lines().collect();
+        let tip_end = lines
+            .iter()
+            .position(|line| line.contains("config.json"))
+            .expect("the tip's last line");
+        // The editor's bottom-left corner, in its own column, right below.
+        assert_eq!(
+            lines[tip_end + 1].chars().nth(2),
+            Some('└'),
+            "the tip's last line sits on the border:\n{text}"
+        );
     }
 }
