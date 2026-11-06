@@ -794,3 +794,92 @@ fn files_under_one_mib_are_left_alone_by_default() {
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+/// A bind mount that the test removes again, even when an assertion fails.
+struct BindMount(PathBuf);
+
+impl BindMount {
+    /// None where this process may not mount (not root, or no CAP_SYS_ADMIN),
+    /// as on a CI runner: the caller skips the test.
+    fn new(source: &Path, target: &Path) -> Option<Self> {
+        let status = Command::new("mount")
+            .arg("--bind")
+            .arg(source)
+            .arg(target)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        status.success().then(|| BindMount(target.to_path_buf()))
+    }
+}
+
+impl Drop for BindMount {
+    fn drop(&mut self) {
+        let _ = Command::new("umount").arg(&self.0).status();
+    }
+}
+
+#[test]
+fn library_bind_mounted_inside_downloads_is_refused() {
+    let root = unique_temp_dir("bind_mount");
+    // On the host, the library sits inside the data folder. A container sees
+    // the data folder as downloads and the library as media.
+    let data = root.join("data");
+    let copy_a = data.join("media").join("A Movies").join("m.mkv");
+    let copy_b = data.join("media").join("B Movies").join("m.mkv");
+    write_seeded(&copy_a, 4096, 9);
+    write_seeded(&copy_b, 4096, 9);
+    let downloads = root.join("c").join("downloads");
+    let media = root.join("c").join("media");
+    fs::create_dir_all(&downloads).expect("create downloads mount point");
+    fs::create_dir_all(&media).expect("create media mount point");
+    let Some(_downloads_mount) = BindMount::new(&data, &downloads) else {
+        eprintln!("skipped: bind mounts need root");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    };
+    let Some(_media_mount) = BindMount::new(&data.join("media"), &media) else {
+        eprintln!("skipped: bind mounts need root");
+        return;
+    };
+    run_ok(
+        &root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        &root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+    set_min_age_zero(&root);
+
+    let out = run_cmd(&root, &["config", "validate"]);
+    assert!(!out.status.success(), "validate must see the overlap");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("second mount"), "stderr={stderr}");
+
+    let out = run_cmd(&root, &["link", "--no-progress"]);
+    assert!(!out.status.success(), "link must refuse to run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("second mount"), "stderr={stderr}");
+    for copy in [&copy_a, &copy_b] {
+        let meta = fs::symlink_metadata(copy).expect("library copy");
+        assert!(
+            meta.file_type().is_file(),
+            "{} stays a file",
+            copy.display()
+        );
+    }
+    assert_ne!(
+        fs::metadata(&copy_a).expect("a").ino(),
+        fs::metadata(&copy_b).expect("b").ino(),
+        "the library copies stay separate files"
+    );
+
+    drop(_media_mount);
+    drop(_downloads_mount);
+    let _ = fs::remove_dir_all(&root);
+}

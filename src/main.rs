@@ -412,9 +412,12 @@ fn validate_config(config: &config::Config) -> Result<()> {
             normalize_runtime_dir(downloads),
             normalize_runtime_dir(media),
         )
-        && let Err(err) = config::ensure_roots_disjoint(&downloads, &media)
     {
-        failures.push(err.to_string());
+        if let Err(err) = config::ensure_roots_disjoint(&downloads, &media) {
+            failures.push(err.to_string());
+        } else if let Err(err) = engine::ensure_roots_not_mounted_inside(&downloads, &media) {
+            failures.push(format!("{err:#}"));
+        }
     }
 
     if failures.is_empty() {

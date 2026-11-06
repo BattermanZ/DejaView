@@ -45,6 +45,18 @@ pub fn cleanup_temp_artifacts(config: &Config) -> Result<Vec<std::path::PathBuf>
     cache::cleanup_temp_artifacts(config)
 }
 
+/// Refuse downloads and media that reach each other through a second mount,
+/// which a comparison of their paths cannot see. Walks the directories of both.
+pub fn ensure_roots_not_mounted_inside(
+    downloads: &std::path::Path,
+    media: &std::path::Path,
+) -> Result<()> {
+    let downloads = collect::RootId::of("downloads", downloads)?;
+    let media = collect::RootId::of("media", media)?;
+    collect::ensure_root_not_reached(&downloads, &media)?;
+    collect::ensure_root_not_reached(&media, &downloads)
+}
+
 pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     let tui_events = options.tui_events;
     let result = run(config, options);

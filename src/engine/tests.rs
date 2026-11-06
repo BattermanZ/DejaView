@@ -8,7 +8,9 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::cache::{clear_cache_file, load_cache, save_cache};
-use super::collect::{CollectOptions, collect_files, collect_run_files, group_files_by_size};
+use super::collect::{
+    CollectOptions, RootId, collect_files, collect_run_files, group_files_by_size,
+};
 use super::linking::{
     ApplyOptions, ApplyOutcome, apply_actions, ensure_target_within_media_root, plan_group_actions,
     replace_file_with_best_link_with, replace_file_with_hardlink_and_rename_with,
@@ -74,6 +76,27 @@ fn run_scan(config: &Config, dry_run: bool, strict: bool, report_path: Option<&P
         },
     )
     .expect("run scan");
+}
+
+/// The downloads root for a direct collect_files call. A missing path gets
+/// placeholder ids, since the walk reports it as an error anyway.
+fn test_root(path: &Path) -> RootId {
+    RootId::of("downloads", path).unwrap_or(RootId {
+        name: "downloads",
+        path: path.to_path_buf(),
+        dev: u64::MAX,
+        ino: u64::MAX,
+    })
+}
+
+/// A media root no directory in a test tree can match.
+fn unrelated_root() -> RootId {
+    RootId {
+        name: "media",
+        path: PathBuf::from("/nonexistent/media"),
+        dev: u64::MAX - 1,
+        ino: u64::MAX - 1,
+    }
 }
 
 fn running_as_root() -> bool {
@@ -402,7 +425,8 @@ fn collect_files_strict_fails_on_walk_error() {
     let mut warnings = RunWarnings::default();
     let mut metrics = RunMetrics::default();
     let result = collect_files(
-        &missing,
+        &test_root(&missing),
+        &unrelated_root(),
         true,
         Duration::from_secs(0),
         &CollectOptions {
@@ -1195,6 +1219,51 @@ fn apply_actions_refuses_to_replace_a_file_inside_the_media_root() {
 }
 
 #[test]
+fn collect_refuses_a_directory_that_is_the_other_root() {
+    // Without mount rights, stand in for a bind mount: the other root's device
+    // and inode are those of a folder inside the tree being walked.
+    let root = unique_temp_dir("other_root_inside");
+    let downloads = root.join("downloads");
+    let library_view = downloads.join("data").join("media");
+    write_file(&library_view.join("m.mkv"), b"library bytes");
+    let mut media = RootId::of("media", &library_view).expect("media id");
+    media.path = root.join("media");
+
+    let mut warnings = RunWarnings::default();
+    let mut metrics = RunMetrics::default();
+    let err = collect_files(
+        &test_root(&downloads),
+        &media,
+        true,
+        Duration::from_secs(0),
+        &CollectOptions {
+            min_size: 1,
+            strict: false,
+            show_progress: false,
+            tui_events: false,
+            cancel: &CancelToken::default(),
+        },
+        &mut warnings,
+        &mut metrics,
+    )
+    .expect_err("the walk must refuse, strict or not");
+    let message = err.to_string();
+    assert!(message.contains("second mount"), "{message}");
+    assert!(
+        message.contains(&library_view.display().to_string()),
+        "names where: {message}"
+    );
+
+    // The same root reached at the top, as when both are one folder.
+    let same = RootId::of("media", &downloads).expect("same id");
+    assert!(super::collect::ensure_root_not_reached(&test_root(&downloads), &same).is_err());
+    assert!(
+        super::collect::ensure_root_not_reached(&test_root(&downloads), &unrelated_root()).is_ok()
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
 fn collect_files_skips_dejaview_own_files() {
     let root = unique_temp_dir("own_files");
     write_file(&root.join("movie.mkv"), b"content");
@@ -1210,7 +1279,8 @@ fn collect_files_skips_dejaview_own_files() {
     let mut warnings = RunWarnings::default();
     let mut metrics = RunMetrics::default();
     let files = collect_files(
-        &root,
+        &test_root(&root),
+        &unrelated_root(),
         true,
         Duration::from_secs(0),
         &CollectOptions {
