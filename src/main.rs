@@ -4,6 +4,7 @@ use colored::*;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod config;
@@ -32,6 +33,9 @@ enum Commands {
         /// Fail if any scan/hash/link errors occur
         #[arg(long)]
         strict: bool,
+        /// Skip files smaller than this many bytes for this run (default: the config's, else 1 MiB)
+        #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
+        min_size: Option<u64>,
         /// Force symlink creation and never attempt hardlinks
         #[arg(long)]
         symlink_only: bool,
@@ -46,12 +50,23 @@ enum Commands {
         /// Ask for confirmation before applying changes (interactive terminals only)
         #[arg(long)]
         confirm: bool,
+        /// Skip files smaller than this many bytes for this run (default: the config's, else 1 MiB)
+        #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
+        min_size: Option<u64>,
         /// Force symlink creation and never attempt hardlinks
         #[arg(long)]
         symlink_only: bool,
         /// Internal filter for linking only specific source paths
         #[arg(long = "only-source", hide = true)]
         only_sources: Vec<PathBuf>,
+        /// Internal: a JSON list of reviewed {source, target} rows; link only those
+        #[arg(
+            long,
+            hide = true,
+            value_name = "FILE",
+            conflicts_with = "only_sources"
+        )]
+        plan: Option<PathBuf>,
         #[command(flatten)]
         output: RunOutputArgs,
     },
@@ -122,6 +137,11 @@ enum ConfigCommands {
     Show,
     /// Set the minimum file age in seconds before considering files
     SetMinAge { seconds: u64 },
+    /// Set the smallest file size in bytes to consider (default 1 MiB; empty files are always skipped)
+    SetMinSize {
+        #[arg(value_parser = clap::value_parser!(u64).range(1..))]
+        bytes: u64,
+    },
     /// Set worker thread count for hashing
     SetThreads { count: usize },
     /// Set link mode
@@ -163,15 +183,31 @@ impl From<LinkModeArg> for LinkMode {
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+    match run_cli() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            // ADR 0003: 3 tells a script that another run had the lock and
+            // this one did nothing, which is not a failure to alert on.
+            if err.is::<engine::LockHeld>() {
+                ExitCode::from(3)
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     let command_name = command_name(&cli.command);
-    let (_log_session, log_path) = logger::init(command_name)?;
+    let (_log_session, log_place) = logger::init(command_name);
+    match &log_place {
+        Ok(place) => logger::info("main", format!("logger initialized at {place}")),
+        Err(warning) => eprintln!("{} {warning}", "⚠".yellow()),
+    }
     let mut config = load_config()?;
-    logger::info(
-        "main",
-        format!("logger initialized at {}", log_path.display()),
-    );
 
     if let Some(threads) = config.threads {
         rayon::ThreadPoolBuilder::new()
@@ -182,10 +218,14 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Scan {
             strict,
+            min_size,
             symlink_only,
             output,
         } => {
             ensure_required_paths(&config)?;
+            if min_size.is_some() {
+                config.min_size = min_size;
+            }
             engine::run_scan_with_options(
                 &config,
                 engine::ScanRunOptions {
@@ -203,6 +243,7 @@ fn main() -> Result<()> {
                     tui_events: output.tui_events,
                     link_mode: effective_link_mode(&config, symlink_only),
                     only_sources: &[],
+                    only_pairs: &[],
                     cancel: run_cancel_token(output.tui_events),
                 },
             )?
@@ -210,11 +251,25 @@ fn main() -> Result<()> {
         Commands::Link {
             strict,
             confirm,
+            min_size,
             symlink_only,
             only_sources,
+            plan,
             output,
         } => {
             ensure_required_paths(&config)?;
+            let only_pairs = match &plan {
+                Some(path) => read_plan(path)?,
+                None => Vec::new(),
+            };
+            let only_sources: Vec<PathBuf> = if only_pairs.is_empty() {
+                only_sources
+            } else {
+                only_pairs.iter().map(|(src, _)| src.clone()).collect()
+            };
+            if min_size.is_some() {
+                config.min_size = min_size;
+            }
             engine::run_scan_with_options(
                 &config,
                 engine::ScanRunOptions {
@@ -232,6 +287,7 @@ fn main() -> Result<()> {
                     tui_events: output.tui_events,
                     link_mode: effective_link_mode(&config, symlink_only),
                     only_sources: &only_sources,
+                    only_pairs: &only_pairs,
                     cancel: run_cancel_token(output.tui_events),
                 },
             )?
@@ -254,6 +310,11 @@ fn main() -> Result<()> {
                 config.min_age = Some(seconds);
                 save_config(&config)?;
                 println!("{} min_age set to {} seconds.", "✔".green(), seconds);
+            }
+            ConfigCommands::SetMinSize { bytes } => {
+                config.min_size = Some(bytes);
+                save_config(&config)?;
+                println!("{} min_size set to {} bytes.", "✔".green(), bytes);
             }
             ConfigCommands::SetThreads { count } => {
                 if count == 0 {
@@ -326,6 +387,25 @@ fn run_cancel_token(tui_events: bool) -> engine::CancelToken {
     token
 }
 
+/// The rows a person reviewed, as written by the TUI. An empty plan is an
+/// error: an empty filter would mean "link everything".
+fn read_plan(path: &std::path::Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let bytes = fs::read(path)
+        .map_err(|err| anyhow::anyhow!("cannot read the plan {}: {err}", path.display()))?;
+    let pairs: Vec<protocol::PlannedPair> = serde_json::from_slice(&bytes)
+        .map_err(|err| anyhow::anyhow!("the plan {} is not valid: {err}", path.display()))?;
+    if pairs.is_empty() {
+        return Err(anyhow::anyhow!(
+            "the plan {} holds no rows, so there is nothing to link",
+            path.display()
+        ));
+    }
+    Ok(pairs
+        .into_iter()
+        .map(|pair| (PathBuf::from(pair.source), PathBuf::from(pair.target)))
+        .collect())
+}
+
 fn effective_link_mode(config: &config::Config, symlink_only: bool) -> LinkMode {
     if symlink_only {
         LinkMode::SymlinkOnly
@@ -388,12 +468,18 @@ fn validate_config(config: &config::Config) -> Result<()> {
             normalize_runtime_dir(downloads),
             normalize_runtime_dir(media),
         )
-        && let Err(err) = config::ensure_roots_disjoint(&downloads, &media)
     {
-        failures.push(err.to_string());
+        if let Err(err) = config::ensure_roots_disjoint(&downloads, &media) {
+            failures.push(err.to_string());
+        } else if let Err(err) = engine::ensure_roots_not_mounted_inside(&downloads, &media) {
+            failures.push(format!("{err:#}"));
+        }
     }
 
     if failures.is_empty() {
+        if let (Some(downloads), Some(media)) = (&config.downloads, &config.media) {
+            report_hardlink_probe(downloads, media);
+        }
         println!("{} Configuration is valid.", "✔".green());
         Ok(())
     } else {
@@ -401,6 +487,32 @@ fn validate_config(config: &config::Config) -> Result<()> {
             eprintln!("{} {}", "✖".red(), failure);
         }
         Err(anyhow::anyhow!("configuration validation failed"))
+    }
+}
+
+/// Try one real hardlink and say what link runs will do. A failure is not a
+/// validation failure: the symlink fallback is the default (ADR 0001), but the
+/// person should know which cause applies and whether they can fix it.
+fn report_hardlink_probe(downloads: &std::path::Path, media: &std::path::Path) {
+    match engine::probe_hardlink(downloads, media) {
+        engine::HardlinkProbe::NoFile => {
+            println!("{} No library file to try a hardlink with yet.", "ℹ".cyan())
+        }
+        engine::HardlinkProbe::Works { file, leftover } => {
+            println!(
+                "{} A test hardlink of {} into downloads worked: hardlinks work, so link runs free space. On a mergerfs pool this tried one disk; files on others can still fall back to symlinks.",
+                "✔".green(),
+                file.display()
+            );
+            if let Some(leftover) = leftover {
+                eprintln!("{} {leftover}", "⚠".yellow());
+            }
+        }
+        engine::HardlinkProbe::Fails { file, cause, error } => eprintln!(
+            "{} A test hardlink of {} into downloads failed: {cause} ({error}). Link runs will make symlinks instead, and each breaks if Sonarr or Radarr upgrades, renames or deletes its library file.",
+            "⚠".yellow(),
+            file.display()
+        ),
     }
 }
 
@@ -450,10 +562,12 @@ mod tests {
         match cli.command {
             Commands::Scan {
                 strict,
+                min_size,
                 symlink_only,
                 output,
             } => {
                 assert!(strict);
+                assert_eq!(min_size, None);
                 assert!(!symlink_only);
                 assert!(!output.json);
                 assert_eq!(output.report, None);
@@ -480,11 +594,15 @@ mod tests {
             Commands::Link {
                 strict,
                 confirm,
+                min_size,
                 symlink_only,
                 only_sources,
+                plan,
                 output,
             } => {
                 assert!(!strict);
+                assert_eq!(plan, None);
+                assert_eq!(min_size, None);
                 assert!(!confirm);
                 assert!(!symlink_only);
                 assert!(only_sources.is_empty());
@@ -528,6 +646,18 @@ mod tests {
                 command: ConfigCommands::SetMinAge { seconds },
             }) => assert_eq!(seconds, 120),
             _ => panic!("expected config set-min-age command"),
+        }
+    }
+
+    #[test]
+    fn min_size_of_zero_is_refused() {
+        assert!(Cli::try_parse_from(["dejaview", "scan", "--min-size", "0"]).is_err());
+        assert!(Cli::try_parse_from(["dejaview", "config", "set-min-size", "0"]).is_err());
+        let cli = Cli::try_parse_from(["dejaview", "link", "--min-size", "4096"])
+            .expect("parse link --min-size");
+        match cli.command {
+            Commands::Link { min_size, .. } => assert_eq!(min_size, Some(4096)),
+            _ => panic!("expected link command"),
         }
     }
 

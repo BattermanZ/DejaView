@@ -19,9 +19,12 @@ change that breaks one is wrong whatever else it fixes.
   or deleted. `ensure_roots_disjoint` in `src/config.rs` and
   `ensure_source_outside_media_root` in `src/engine/linking.rs` guard it, and
   `nested_media_root_is_rejected_and_library_is_untouched` in
-  `tests/cli_integration.rs` holds it. Both guards compare paths, so the same
-  directory seen through a bind mount or a mergerfs branch still gets past
-  them (`docs/FINDINGS.md`, S1).
+  `tests/cli_integration.rs` holds it. Both guards compare paths, so the walk
+  in `src/engine/collect.rs` also refuses a directory with the other root's
+  device and inode (a bind mount), and planning in `linking.rs` skips a
+  download that is a library file seen through a second mount (a mergerfs
+  branch). `library_bind_mounted_inside_downloads_is_refused` holds the first
+  where the test may mount.
 - **A download is replaced in one step.** The link is made under a
   `.dejaview_*.tmp.*` name beside the download and renamed over it, so a crash
   leaves the old file or the new link, and at worst a leftover temp file
@@ -176,9 +179,10 @@ terminal; say so in the pull request when you could not.
 ## Tickets and decisions
 
 Work is tracked as GitHub issues on `BattermanZ/DejaView`. `docs/FINDINGS.md`
-is a review's backlog not yet filed as issues: a finding is built once it is
-an issue labelled `ready-for-agent`, and its four open decisions are the
-maintainer's to make first.
+is a review's backlog not yet filed as issues. Its four decisions are settled,
+and its first round is worked straight from that file, as its "Rules for
+working in this repo" say; after that, a finding is built once it is an issue
+labelled `ready-for-agent`.
 
 A decision that is hard to reverse (a default, a format, a refusal) is
 recorded as an ADR under `docs/adr/` once made, and the words DejaView uses

@@ -10,6 +10,7 @@ use crate::engine;
 use crate::fsutil::safe_write_bytes;
 
 use super::model::{RunReport, TuiEvent};
+use crate::protocol::PlannedPair;
 
 fn should_forward_terminal_error(status_success: bool, saw_error_event: bool) -> bool {
     !status_success && !saw_error_event
@@ -21,6 +22,22 @@ fn forward_cancel<W: Write>(cancel_rx: Receiver<()>, mut stdin: W) {
     if cancel_rx.recv().is_ok() {
         let _ = stdin.write_all(b"cancel\n");
         let _ = stdin.flush();
+    }
+}
+
+/// What to show when the child exits with an error and no error event: its
+/// own `Error:` line, which already says what failed. The TUI adds which run
+/// it was, so this adds no prefix of its own; the log keeps the rest.
+fn child_failure_message(subcommand: &str, status: &str, stderr: &str) -> String {
+    let error_line = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("Error: "))
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    match error_line {
+        Some(line) => line.to_string(),
+        None if !stderr.trim().is_empty() => stderr.trim().to_string(),
+        None => format!("{subcommand} exited with {status}"),
     }
 }
 
@@ -103,12 +120,7 @@ fn stream_subcommand_events(
         .map_err(|_| anyhow!("stderr reader thread panicked"))??;
 
     if !status.success() {
-        let stderr = stderr.trim().to_string();
-        let message = if stderr.is_empty() {
-            format!("{subcommand} failed with status {status}")
-        } else {
-            format!("{subcommand} failed: {stderr}")
-        };
+        let message = child_failure_message(subcommand, &status.to_string(), &stderr);
         if should_forward_terminal_error(status.success(), saw_error_event) {
             let _ = tx.send(Err(anyhow!(message.clone())));
         }
@@ -128,23 +140,42 @@ pub fn run_scan(strict: bool, tx: Sender<Result<TuiEvent>>, cancel_rx: Receiver<
     stream_subcommand_events("scan", strict, &[], tx, cancel_rx)
 }
 
-pub fn run_link(strict: bool, tx: Sender<Result<TuiEvent>>, cancel_rx: Receiver<()>) -> Result<()> {
-    stream_subcommand_events("link", strict, &[], tx, cancel_rx)
-}
-
-pub fn run_link_selected(
+/// Link exactly the rows a person reviewed: write them to a plan file in the
+/// downloads folder, run `link --plan` on it, and remove the file afterwards.
+/// The child links only these (download, library file) pairs, so files found
+/// since the scan, or a library file that changed, are left alone.
+pub fn run_link_pairs(
     strict: bool,
-    source: &str,
+    downloads: &Path,
+    pairs: &[PlannedPair],
     tx: Sender<Result<TuiEvent>>,
     cancel_rx: Receiver<()>,
 ) -> Result<()> {
-    stream_subcommand_events(
+    let plan = downloads.join(format!(
+        ".dejaview_tui_plan.{}.{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let written = serde_json::to_vec(pairs)
+        .map_err(anyhow::Error::from)
+        .and_then(|json| safe_write_bytes(&plan, &json))
+        .with_context(|| format!("write the link plan {}", plan.display()));
+    if let Err(err) = written {
+        let _ = tx.send(Err(anyhow!("{err:#}")));
+        return Err(err);
+    }
+    let result = stream_subcommand_events(
         "link",
         strict,
-        &[String::from("--only-source"), source.to_string()],
+        &[String::from("--plan"), plan.display().to_string()],
         tx,
         cancel_rx,
-    )
+    );
+    let _ = std::fs::remove_file(&plan);
+    result
 }
 
 pub fn clear_cache() -> Result<()> {
@@ -247,6 +278,19 @@ mod tests {
         let mut written = Vec::new();
         forward_cancel(rx, &mut written);
         assert!(written.is_empty());
+    }
+
+    #[test]
+    fn a_failed_child_is_reported_by_its_own_error_line() {
+        let stderr = "Error: another DejaView run holds the lock /d/.dejaview_lock, so this run did nothing\n";
+        assert_eq!(
+            child_failure_message("link", "exit status: 3", stderr),
+            "another DejaView run holds the lock /d/.dejaview_lock, so this run did nothing"
+        );
+        assert_eq!(
+            child_failure_message("scan", "exit status: 1", "  \n"),
+            "scan exited with exit status: 1"
+        );
     }
 
     #[test]

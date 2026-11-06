@@ -21,6 +21,22 @@ pub struct LinkReportEntry {
     pub error: Option<String>,
 }
 
+/// One row a person reviewed: link this download to this library file and
+/// nothing else. The TUI hands a list of them to `link --plan`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PlannedPair {
+    pub source: String,
+    pub target: String,
+}
+
+impl LinkReportEntry {
+    /// This run turned the download into a symlink, which breaks if its
+    /// library file is upgraded, renamed or deleted (ADR 0001).
+    pub fn is_applied_symlink(&self) -> bool {
+        self.status == "applied" && self.method.as_deref() == Some("symlink")
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RunReport {
     pub mode: String,
@@ -31,6 +47,19 @@ pub struct RunReport {
     pub applied_actions: usize,
     pub total_saved_bytes: u64,
     pub skipped_by_min_age: u64,
+    /// Files under the size floor, empty files included. Missing in reports
+    /// written before the floor existed.
+    #[serde(default)]
+    pub skipped_by_min_size: u64,
+    /// Downloads left alone because they are a library file seen through a
+    /// second mount (a bind mount or a mergerfs branch). Non-zero means the
+    /// downloads folder reaches into the library.
+    #[serde(default)]
+    pub skipped_as_library_file: u64,
+    /// Symlinks in downloads that point into the library and no longer
+    /// resolve: their torrents cannot seed.
+    #[serde(default)]
+    pub dangling_symlinks: Vec<String>,
     pub warnings: WarningSummary,
     pub entries: Vec<LinkReportEntry>,
 }

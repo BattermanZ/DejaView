@@ -71,6 +71,8 @@ fn is_temp_artifact_name(name: &str) -> bool {
     name.starts_with(".dejaview_hardlink.tmp.")
         || name.starts_with(".dejaview_link.tmp.")
         || name.starts_with(".dejaview_write.tmp.")
+        || name.starts_with(".dejaview_tui_plan.")
+        || name.starts_with(".dejaview_validate_link.")
 }
 
 pub(super) fn audit_temp_artifacts(config: &Config) -> Result<Vec<std::path::PathBuf>> {

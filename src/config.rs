@@ -11,13 +11,38 @@ pub struct Config {
     pub downloads: Option<PathBuf>,
     pub media: Option<PathBuf>,
     pub min_age: Option<u64>,
+    /// Files smaller than this many bytes are skipped. Unset means
+    /// [`DEFAULT_MIN_SIZE`]; empty files are skipped whatever it says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_size: Option<u64>,
     pub threads: Option<usize>,
     pub link_mode: Option<LinkMode>,
 }
 
+/// The size floor when the config sets none: 1 MiB (ADR 0002).
+pub const DEFAULT_MIN_SIZE: u64 = 1024 * 1024;
+
+impl Config {
+    /// The smallest file a run considers. Never below 1 byte, so an empty file
+    /// is never a candidate: every empty file matches every other, and a torrent
+    /// client creates a file empty before writing into it.
+    pub fn effective_min_size(&self) -> u64 {
+        self.min_size.unwrap_or(DEFAULT_MIN_SIZE).max(1)
+    }
+}
+
+/// The config file: `DEJAVIEW_CONFIG` when set, else `dejaview/config.json`
+/// under the platform's config folder. A container run as a user with no home
+/// has no config folder, so the variable is the way to point at one.
 pub fn config_path() -> Result<PathBuf> {
-    let config_dir =
-        dirs::config_dir().ok_or_else(|| anyhow!("Could not find config directory"))?;
+    if let Some(path) = std::env::var_os("DEJAVIEW_CONFIG").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    let config_dir = dirs::config_dir().ok_or_else(|| {
+        anyhow!(
+            "cannot find a config folder: neither XDG_CONFIG_HOME nor HOME is set and this user has no home folder; set DEJAVIEW_CONFIG to the config file's path"
+        )
+    })?;
     Ok(config_dir.join("dejaview").join("config.json"))
 }
 
@@ -175,6 +200,7 @@ mod tests {
             downloads: Some(root.join("downloads")),
             media: Some(root.join("media")),
             min_age: Some(60),
+            min_size: Some(4096),
             threads: Some(4),
             link_mode: Some(LinkMode::SymlinkOnly),
         };
@@ -184,6 +210,7 @@ mod tests {
         assert_eq!(loaded.downloads, config.downloads);
         assert_eq!(loaded.media, config.media);
         assert_eq!(loaded.min_age, config.min_age);
+        assert_eq!(loaded.min_size, config.min_size);
         assert_eq!(loaded.threads, config.threads);
         assert_eq!(loaded.link_mode, config.link_mode);
 
@@ -212,6 +239,16 @@ mod tests {
     }
 
     #[test]
+    fn min_size_defaults_to_one_mib_and_never_drops_below_one_byte() {
+        assert_eq!(Config::default().effective_min_size(), 1024 * 1024);
+        let zero = Config {
+            min_size: Some(0),
+            ..Config::default()
+        };
+        assert_eq!(zero.effective_min_size(), 1);
+    }
+
+    #[test]
     fn cache_path_requires_downloads() {
         let config = Config::default();
         let result = cache_path(&config);
@@ -230,6 +267,7 @@ mod tests {
             downloads: Some(downloads),
             media: Some(media),
             min_age: None,
+            min_size: None,
             threads: None,
             link_mode: None,
         };
@@ -248,6 +286,7 @@ mod tests {
             downloads: Some(downloads),
             media: Some(root.join("missing-media")),
             min_age: None,
+            min_size: None,
             threads: None,
             link_mode: None,
         };
@@ -262,6 +301,7 @@ mod tests {
             downloads: Some(downloads.to_path_buf()),
             media: Some(media.to_path_buf()),
             min_age: None,
+            min_size: None,
             threads: None,
             link_mode: None,
         }
@@ -333,6 +373,7 @@ mod tests {
             downloads: Some(PathBuf::from("downloads")),
             media: Some(PathBuf::from("media")),
             min_age: None,
+            min_size: None,
             threads: None,
             link_mode: None,
         };

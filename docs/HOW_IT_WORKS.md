@@ -37,6 +37,7 @@ flowchart TD
     CFG --> SD[set-downloads]
     CFG --> SM[set-media]
     CFG --> SMA[set-min-age]
+    CFG --> SMS[set-min-size]
     CFG --> ST[set-threads]
     CFG --> SLM[set-link-mode]
     CFG --> CV[validate]
@@ -70,7 +71,7 @@ flowchart TD
     A[Load config] --> B{downloads/media set, valid and not overlapping?}
     B -- no --> X[Stop with actionable error]
     B -- yes --> C[Collect files from downloads + media]
-    C --> D[Skip symlinks, .dejaview_ files and files younger than min_age]
+    C --> D[Skip symlinks, .dejaview_ files, files under min_size and files younger than min_age]
     D --> E[Group by size]
     E --> F[Within a group, paths of one physical file count once]
     F --> G{More than one physical file?}

@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::cancel::{CancelToken, Cancelled};
@@ -103,7 +102,8 @@ pub(super) struct HashOptions<'a> {
     pub(super) show_progress: bool,
     pub(super) tui_events: bool,
     pub(super) link_mode: LinkMode,
-    pub(super) only_sources: &'a [PathBuf],
+    /// The run's options, for which planned actions it was asked to take.
+    pub(super) selection: &'a super::types::ScanRunOptions<'a>,
     pub(super) cancel: &'a CancelToken,
 }
 
@@ -216,10 +216,7 @@ fn emit_planned_entries(group: &[FileInfo], options: &HashOptions<'_>) {
     }
     let actions = plan_hashed_group_actions(group)
         .into_iter()
-        .filter(|action| {
-            options.only_sources.is_empty()
-                || options.only_sources.iter().any(|path| path == &action.src)
-        })
+        .filter(|action| options.selection.selects(action))
         .collect::<Vec<_>>();
     let entries = build_report_entries(&actions, options.link_mode);
     if !entries.is_empty() {
@@ -428,6 +425,7 @@ pub(super) fn hash_groups_and_update_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn file(path: &str, dev: u64, inode: u64, mtime_ns: u128) -> FileInfo {
         FileInfo {

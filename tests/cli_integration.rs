@@ -40,6 +40,8 @@ fn set_min_age_zero(root: &Path) {
     let raw = fs::read_to_string(&config_path).expect("read config");
     let mut config: serde_json::Value = serde_json::from_str(&raw).expect("parse config json");
     config["min_age"] = serde_json::json!(0);
+    // Test files are small; only the empty-file rule applies.
+    config["min_size"] = serde_json::json!(1);
     fs::write(
         &config_path,
         serde_json::to_string_pretty(&config).expect("encode config"),
@@ -244,6 +246,12 @@ fn cache_audit_and_cleanup_temp_commands_work() {
     fs::write(downloads.join(".dejaview_hardlink.tmp.1"), b"temp-artifact")
         .expect("write temp artifact");
     fs::write(nested.join(".dejaview_link.tmp.2"), b"temp-artifact").expect("write nested temp");
+    // A `config validate` test link that could not be removed.
+    fs::write(
+        downloads.join(".dejaview_validate_link.3.4"),
+        b"temp-artifact",
+    )
+    .expect("write probe leftover");
 
     run_ok(
         &root,
@@ -265,7 +273,7 @@ fn cache_audit_and_cleanup_temp_commands_work() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Temp artifacts: 2"));
+    assert!(stdout.contains("Temp artifacts: 3"));
 
     let out = run_cmd(&root, &["cache", "cleanup-temp"]);
     assert!(
@@ -274,7 +282,7 @@ fn cache_audit_and_cleanup_temp_commands_work() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Removed temp artifacts: 2"));
+    assert!(stdout.contains("Removed temp artifacts: 3"));
     assert!(!downloads.join(".dejaview_hardlink.tmp.1").exists());
     assert!(!nested.join(".dejaview_link.tmp.2").exists());
 
@@ -728,5 +736,481 @@ fn broken_config_file_error_names_the_file_and_the_fix() {
         "a broken config is left for the user to fix"
     );
 
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+/// Config with downloads and media set and min_age 0, leaving min_size at its
+/// default.
+fn configure_default_floor(root: &Path, downloads: &Path, media: &Path) {
+    run_ok(
+        root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+    run_ok(root, &["config", "set-min-age", "0"]);
+}
+
+#[test]
+fn files_under_one_mib_are_left_alone_by_default() {
+    let root = unique_temp_dir("min_size_default");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    // A subtitle-sized pair below the floor, and a video-sized pair above it.
+    write_seeded(&downloads.join("Show.S01").join("e01.srt"), 9_000, 3);
+    write_seeded(&media.join("Show").join("e01.srt"), 9_000, 3);
+    write_seeded(&downloads.join("Show.S01").join("e01.mkv"), 1_200_000, 4);
+    write_seeded(&media.join("Show").join("e01.mkv"), 1_200_000, 4);
+    configure_default_floor(&root, &downloads, &media);
+
+    let out = run_cmd(&root, &["link", "--json", "--no-progress"]);
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse link json");
+    assert_eq!(report["applied_actions"], 1, "only the video is linked");
+    assert_eq!(
+        report["skipped_by_min_size"], 2,
+        "both subtitles are skipped"
+    );
+
+    let srt = fs::metadata(downloads.join("Show.S01").join("e01.srt")).expect("srt metadata");
+    let lib_srt = fs::metadata(media.join("Show").join("e01.srt")).expect("library srt");
+    assert_ne!(srt.ino(), lib_srt.ino(), "the subtitle stays its own file");
+    let mkv = fs::metadata(downloads.join("Show.S01").join("e01.mkv")).expect("mkv metadata");
+    let lib_mkv = fs::metadata(media.join("Show").join("e01.mkv")).expect("library mkv");
+    assert_eq!(mkv.ino(), lib_mkv.ino(), "the video is hardlinked");
+
+    // The floor can be lowered, but not to zero.
+    let out = run_cmd(&root, &["config", "set-min-size", "0"]);
+    assert!(!out.status.success(), "a floor of 0 is refused");
+    run_ok(&root, &["config", "set-min-size", "1"]);
+    let out = run_cmd(&root, &["link", "--json", "--no-progress"]);
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse link json");
+    assert_eq!(report["applied_actions"], 1, "the subtitle is linked now");
+    assert_eq!(report["skipped_by_min_size"], 0);
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+/// A bind mount that the test removes again, even when an assertion fails.
+struct BindMount(PathBuf);
+
+impl BindMount {
+    /// None where this process may not mount (not root, or no CAP_SYS_ADMIN),
+    /// as on a CI runner: the caller skips the test.
+    fn new(source: &Path, target: &Path) -> Option<Self> {
+        let status = Command::new("mount")
+            .arg("--bind")
+            .arg(source)
+            .arg(target)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        status.success().then(|| BindMount(target.to_path_buf()))
+    }
+}
+
+impl Drop for BindMount {
+    fn drop(&mut self) {
+        let _ = Command::new("umount").arg(&self.0).status();
+    }
+}
+
+#[test]
+fn library_bind_mounted_inside_downloads_is_refused() {
+    let root = unique_temp_dir("bind_mount");
+    // On the host, the library sits inside the data folder. A container sees
+    // the data folder as downloads and the library as media.
+    let data = root.join("data");
+    let copy_a = data.join("media").join("A Movies").join("m.mkv");
+    let copy_b = data.join("media").join("B Movies").join("m.mkv");
+    write_seeded(&copy_a, 4096, 9);
+    write_seeded(&copy_b, 4096, 9);
+    let downloads = root.join("c").join("downloads");
+    let media = root.join("c").join("media");
+    fs::create_dir_all(&downloads).expect("create downloads mount point");
+    fs::create_dir_all(&media).expect("create media mount point");
+    let Some(_downloads_mount) = BindMount::new(&data, &downloads) else {
+        eprintln!("skipped: bind mounts need root");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    };
+    let Some(_media_mount) = BindMount::new(&data.join("media"), &media) else {
+        eprintln!("skipped: bind mounts need root");
+        return;
+    };
+    run_ok(
+        &root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        &root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+    set_min_age_zero(&root);
+
+    let out = run_cmd(&root, &["config", "validate"]);
+    assert!(!out.status.success(), "validate must see the overlap");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("second mount"), "stderr={stderr}");
+
+    let out = run_cmd(&root, &["link", "--no-progress"]);
+    assert!(!out.status.success(), "link must refuse to run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("second mount"), "stderr={stderr}");
+    for copy in [&copy_a, &copy_b] {
+        let meta = fs::symlink_metadata(copy).expect("library copy");
+        assert!(
+            meta.file_type().is_file(),
+            "{} stays a file",
+            copy.display()
+        );
+    }
+    assert_ne!(
+        fs::metadata(&copy_a).expect("a").ino(),
+        fs::metadata(&copy_b).expect("b").ino(),
+        "the library copies stay separate files"
+    );
+
+    drop(_media_mount);
+    drop(_downloads_mount);
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn configure_small_files(root: &Path, downloads: &Path, media: &Path) {
+    run_ok(
+        root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+    set_min_age_zero(root);
+}
+
+#[test]
+fn link_summary_says_how_many_downloads_became_symlinks() {
+    let root = unique_temp_dir("symlink_summary");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("a.mkv"), 5000, 1);
+    write_seeded(&media.join("a.mkv"), 5000, 1);
+    write_seeded(&downloads.join("b.mkv"), 6000, 2);
+    write_seeded(&media.join("b.mkv"), 6000, 2);
+    configure_small_files(&root, &downloads, &media);
+
+    let out = run_cmd(&root, &["link", "--symlink-only", "--no-progress"]);
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("2 of them as symlinks"), "stdout={stdout}");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn scans_list_symlinks_into_the_library_that_no_longer_resolve() {
+    let root = unique_temp_dir("dangling_symlinks");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    fs::create_dir_all(downloads.join("Show.S01")).expect("create downloads");
+    fs::create_dir_all(media.join("Show")).expect("create media");
+    // A link DejaView made, whose library file Sonarr has since upgraded away.
+    std::os::unix::fs::symlink(
+        "../../media/Show/e01.mkv",
+        downloads.join("Show.S01").join("e01.mkv"),
+    )
+    .expect("dangling symlink");
+    // A symlink pointing outside the library is none of DejaView's business.
+    std::os::unix::fs::symlink("/nonexistent/elsewhere", downloads.join("other.lnk"))
+        .expect("unrelated symlink");
+    configure_small_files(&root, &downloads, &media);
+
+    let out = run_cmd(&root, &["scan", "--json"]);
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse json");
+    let dangling = report["dangling_symlinks"]
+        .as_array()
+        .expect("dangling list");
+    assert_eq!(dangling.len(), 1, "{dangling:?}");
+    assert!(
+        dangling[0]
+            .as_str()
+            .expect("path")
+            .ends_with("Show.S01/e01.mkv")
+    );
+
+    let out = run_cmd(&root, &["scan", "--no-progress"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no longer resolve"), "stderr={stderr}");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn config_validate_tries_a_real_hardlink() {
+    let root = unique_temp_dir("validate_hardlink");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    fs::create_dir_all(&downloads).expect("create downloads");
+    write_seeded(&media.join("movie.mkv"), 5000, 1);
+    configure_small_files(&root, &downloads, &media);
+
+    let out = run_cmd(&root, &["config", "validate"]);
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("hardlinks work"), "stdout={stdout}");
+    let leftovers: Vec<_> = fs::read_dir(&downloads).expect("read").collect();
+    assert!(leftovers.is_empty(), "the probe link is removed");
+
+    // Downloads on another filesystem: the probe says why links will be symlinks.
+    let shm = Path::new("/dev/shm");
+    if shm.is_dir()
+        && fs::metadata(shm).expect("shm").dev() != fs::metadata(&media).expect("media").dev()
+    {
+        let other = shm.join(format!("dejaview_validate_{}", std::process::id()));
+        fs::create_dir_all(&other).expect("create shm downloads");
+        run_ok(
+            &root,
+            &["config", "set-downloads", other.to_str().expect("str")],
+        );
+        let out = run_cmd(&root, &["config", "validate"]);
+        let _ = fs::remove_dir_all(&other);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "a fallback is not a failure: {stderr}"
+        );
+        assert!(
+            stderr.contains("different filesystems"),
+            "stdout={stdout}\nstderr={stderr}"
+        );
+    }
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_second_run_exits_3_while_another_holds_the_lock() {
+    let root = unique_temp_dir("run_lock");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("a.mkv"), 5000, 1);
+    write_seeded(&media.join("a.mkv"), 5000, 1);
+    configure_small_files(&root, &downloads, &media);
+
+    // Stand in for a run in progress: hold the lock it would take.
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(downloads.join(".dejaview_lock"))
+        .expect("open lock file");
+    held.try_lock().expect("take the lock");
+
+    for args in [
+        &["scan", "--no-progress"][..],
+        &["link", "--no-progress"],
+        &["cache", "cleanup-temp"],
+    ] {
+        let out = run_cmd(&root, args);
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "{args:?} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("another DejaView run"),
+            "{args:?} stderr={stderr}"
+        );
+    }
+    let src = fs::metadata(downloads.join("a.mkv")).expect("download");
+    let lib = fs::metadata(media.join("a.mkv")).expect("library");
+    assert_ne!(src.ino(), lib.ino(), "the locked-out link changed nothing");
+
+    held.unlock().expect("release");
+    drop(held);
+    let out = run_cmd(&root, &["link", "--no-progress"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+fn run_cmd_env(root: &Path, args: &[&str], env: &[(&str, &Path)]) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dejaview"));
+    cmd.args(args)
+        .env("XDG_CONFIG_HOME", root.join("xdg"))
+        .env("HOME", root.join("home"))
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("DEJAVIEW_CONFIG")
+        .env_remove("DEJAVIEW_LOG");
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.output().expect("run command")
+}
+
+#[test]
+fn an_unwritable_log_location_warns_and_the_command_still_runs() {
+    let root = unique_temp_dir("unwritable_log");
+    fs::create_dir_all(&root).expect("create root");
+    // A state folder under a regular file cannot be created, even by root.
+    let blocker = root.join("not-a-dir");
+    fs::write(&blocker, b"file").expect("write blocker");
+    let state = blocker.join("state");
+
+    let out = run_cmd_env(&root, &["config", "show"], &[("XDG_STATE_HOME", &state)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr={stderr}");
+    assert!(
+        stderr.contains(&state.display().to_string()),
+        "the warning names the log path: {stderr}"
+    );
+    assert!(stderr.contains("DEJAVIEW_LOG"), "and the way out: {stderr}");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn dejaview_config_and_dejaview_log_choose_the_files() {
+    let root = unique_temp_dir("env_paths");
+    let downloads = root.join("downloads");
+    fs::create_dir_all(&downloads).expect("create downloads");
+    let config = root.join("elsewhere").join("dejaview.json");
+    let log = root.join("logs").join("run.log");
+
+    let out = run_cmd_env(
+        &root,
+        &["config", "set-downloads", downloads.to_str().expect("str")],
+        &[("DEJAVIEW_CONFIG", &config), ("DEJAVIEW_LOG", &log)],
+    );
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let saved = fs::read_to_string(&config).expect("config written at DEJAVIEW_CONFIG");
+    assert!(saved.contains("downloads"), "{saved}");
+    assert!(
+        !root
+            .join("xdg")
+            .join("dejaview")
+            .join("config.json")
+            .exists(),
+        "the XDG config is left alone"
+    );
+    let logged = fs::read_to_string(&log).expect("log written at DEJAVIEW_LOG");
+    assert!(logged.contains("run started"), "{logged}");
+
+    let out = run_cmd_env(
+        &root,
+        &["config", "show"],
+        &[
+            ("DEJAVIEW_CONFIG", &config),
+            ("DEJAVIEW_LOG", Path::new("-")),
+        ],
+    );
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(downloads.to_str().expect("str")),
+        "config show reads DEJAVIEW_CONFIG"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("run started"),
+        "DEJAVIEW_LOG=- logs to stderr"
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn link_with_a_plan_links_only_the_reviewed_pairs() {
+    let root = unique_temp_dir("plan_file");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("reviewed.mkv"), 5000, 1);
+    write_seeded(&media.join("reviewed.mkv"), 5000, 1);
+    // Appeared after the scan the person reviewed.
+    write_seeded(&downloads.join("new.mkv"), 6000, 2);
+    write_seeded(&media.join("new.mkv"), 6000, 2);
+    // Reviewed with one target; the library now plans it to another.
+    write_seeded(&downloads.join("moved.mkv"), 7000, 3);
+    write_seeded(&media.join("moved.mkv"), 7000, 3);
+    configure_small_files(&root, &downloads, &media);
+    let plan = root.join("plan.json");
+    fs::write(
+        &plan,
+        serde_json::to_vec(&serde_json::json!([
+            {"source": downloads.join("reviewed.mkv"), "target": media.join("reviewed.mkv")},
+            {"source": downloads.join("moved.mkv"), "target": media.join("old-name.mkv")},
+        ]))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+
+    let out = run_cmd(
+        &root,
+        &["link", "--json", "--plan", plan.to_str().expect("plan str")],
+    );
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ino = |path: PathBuf| fs::metadata(path).expect("metadata").ino();
+    assert_eq!(
+        ino(downloads.join("reviewed.mkv")),
+        ino(media.join("reviewed.mkv"))
+    );
+    assert_ne!(
+        ino(downloads.join("new.mkv")),
+        ino(media.join("new.mkv")),
+        "a pair nobody reviewed is left alone"
+    );
+    assert_ne!(
+        ino(downloads.join("moved.mkv")),
+        ino(media.join("moved.mkv")),
+        "a pair whose target changed is left alone"
+    );
+
+    fs::write(&plan, b"[]").expect("empty plan");
+    let out = run_cmd(&root, &["link", "--plan", plan.to_str().expect("plan str")]);
+    assert!(
+        !out.status.success(),
+        "an empty plan links nothing, not everything"
+    );
+    assert_ne!(ino(downloads.join("new.mkv")), ino(media.join("new.mkv")));
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

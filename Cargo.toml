@@ -2,6 +2,8 @@
 name = "dejaview"
 version = "0.1.0"
 edition = "2024"
+# File::try_lock, which takes the run lock, is stable from 1.89.
+rust-version = "1.89"
 license = "GPL-3.0-only"
 description = "Replace downloads that duplicate files in your media library with hardlinks"
 

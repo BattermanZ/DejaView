@@ -48,7 +48,7 @@ fn status_chip_style(row: &LinkReportEntry, _is_selected: bool) -> Style {
     if row.status.eq_ignore_ascii_case("failed") {
         return Theme::chip_danger();
     }
-    if row.status.eq_ignore_ascii_case("planned") {
+    if row.status.eq_ignore_ascii_case("planned") || row.status.eq_ignore_ascii_case("skipped") {
         return Theme::chip_pending();
     }
     if row
@@ -69,7 +69,7 @@ fn row_style(row: &LinkReportEntry, is_selected: bool) -> Style {
             Theme::danger()
         };
     }
-    if row.status.eq_ignore_ascii_case("planned") {
+    if row.status.eq_ignore_ascii_case("planned") || row.status.eq_ignore_ascii_case("skipped") {
         return if is_selected {
             Theme::result_row_selected().fg(Theme::muted().fg.unwrap_or(Color::Reset))
         } else {
@@ -211,6 +211,11 @@ fn sidebar_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             Span::styled(format!("{}s", app.min_age_secs()), Theme::base()),
         ]),
         Line::from(vec![
+            Span::styled("Min size", Theme::dim()),
+            Span::raw("   "),
+            Span::styled(format_bytes(app.min_size_bytes()), Theme::base()),
+        ]),
+        Line::from(vec![
             Span::styled("Threads", Theme::dim()),
             Span::raw("    "),
             Span::styled(app.threads_label(), Theme::base()),
@@ -249,6 +254,9 @@ fn empty_results_lines() -> Vec<Line<'static>> {
 }
 
 fn outcome_label(row: &LinkReportEntry) -> String {
+    if row.status.eq_ignore_ascii_case("already-linked") {
+        return "ALREADY LINKED".to_string();
+    }
     match row.method.as_deref() {
         Some("try-hardlink") => "TRY HARDLINK".to_string(),
         Some("hardlink") => "HARDLINK".to_string(),
@@ -448,6 +456,27 @@ fn wordmark_lines(width: u16) -> Vec<Line<'static>> {
     }
 }
 
+/// The newest log lines that fit, oldest first, one row each: a line wider than
+/// the pane is cut with an ellipsis, so the newest line is never pushed out.
+/// The log file keeps every line whole.
+fn newest_log_lines(lines: &[String], width: u16, height: u16) -> String {
+    let width = usize::from(width);
+    let start = lines.len().saturating_sub(usize::from(height));
+    lines[start..]
+        .iter()
+        .map(|line| {
+            if line.chars().count() <= width {
+                line.clone()
+            } else {
+                let mut cut: String = line.chars().take(width.saturating_sub(1)).collect();
+                cut.push('…');
+                cut
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Theme::canvas()), area);
@@ -471,10 +500,15 @@ pub fn render(frame: &mut Frame, app: &App) {
         .wrap(Wrap { trim: true });
     frame.render_widget(details, l.center_right);
 
-    let log = Paragraph::new(app.log_lines().join("\n"))
-        .block(pane_block("Run Log", false))
-        .style(Theme::panel())
-        .wrap(Wrap { trim: true });
+    let log_block = pane_block("Run Log", false);
+    let log_inner = log_block.inner(l.bottom_log);
+    let log = Paragraph::new(newest_log_lines(
+        &app.log_lines(),
+        log_inner.width,
+        log_inner.height,
+    ))
+    .block(log_block)
+    .style(Theme::panel());
     frame.render_widget(log, l.bottom_log);
 
     let footer = Paragraph::new(footer_line())
@@ -796,19 +830,15 @@ fn render_confirm_link_overlay(frame: &mut Frame, app: &App, mode: ConfirmLinkMo
         ConfirmLinkMode::All => (
             " LINK ALL CONFIRMATION ",
             format!(
-                "Confirm link-all run\n\nThis will execute filesystem changes for all currently planned rows.\n\nEstimated planned actions: {}\nCurrent mode: {}\nRows with warnings or errors: {}\n\nPress y to continue or n/q to cancel.",
-                app.planned_actions(),
-                app.mode_label(),
-                app.rows()
-                    .iter()
-                    .filter(|row| row.error.is_some() || row.fallback_reason.is_some())
-                    .count()
+                "Confirm link-all run\n\nThis links the planned rows the last scan showed, each to the library file shown. Files found since that scan are left alone, and so is a row whose files changed.\n\nRows to link: {}\nRows with errors: {}",
+                app.reviewed_planned_pairs().len(),
+                app.rows().iter().filter(|row| row.error.is_some()).count()
             ),
         ),
         ConfirmLinkMode::Selected => (
             " LINK SELECTED CONFIRMATION ",
             format!(
-                "Confirm selected-row link\n\nThis will execute filesystem changes only for the selected row.\n\nSelected source: {}\nSelected outcome: {}\nRows still planned: {}\n\nPress y to continue or n/q to cancel.",
+                "Confirm selected-row link\n\nThis will execute filesystem changes only for the selected row.\n\nSelected source: {}\nSelected outcome: {}\nRows still planned: {}",
                 app.selected_entry()
                     .map(|entry| entry.source.clone())
                     .unwrap_or_else(|| "No selection".to_string()),
@@ -819,11 +849,20 @@ fn render_confirm_link_overlay(frame: &mut Frame, app: &App, mode: ConfirmLinkMo
             ),
         ),
     };
+    // The prompt sits on the border, so a small terminal that cuts the body
+    // short still shows how to answer.
+    let prompt = Line::from(vec![
+        Span::styled(" y link ", Theme::title(true)),
+        Span::raw(" "),
+        Span::styled(" n cancel ", Theme::title(false)),
+    ])
+    .right_aligned();
     let body = Paragraph::new(body)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(Line::from(vec![Span::styled(title, Theme::title(true))]))
+                .title_bottom(prompt)
                 .style(Theme::popup())
                 .border_style(Theme::accent()),
         )
@@ -1032,6 +1071,9 @@ mod tests {
             applied_actions: 1,
             total_saved_bytes: 30,
             skipped_by_min_age: 0,
+            skipped_by_min_size: 0,
+            skipped_as_library_file: 0,
+            dangling_symlinks: Vec::new(),
             warnings: crate::protocol::WarningSummary {
                 walk_errors: 0,
                 metadata_errors: 0,
@@ -1063,6 +1105,106 @@ mod tests {
 
         assert_eq!(format_bytes(app.saved_bytes()), "10.00 B");
         assert_eq!(format_bytes(app.potential_saved_bytes()), "20.00 B");
+    }
+
+    #[test]
+    fn link_all_dialog_counts_only_rows_with_errors() {
+        let mut app = App::new(&crate::config::Config::default(), false);
+        let planned = |source: &str| LinkReportEntry {
+            source: source.to_string(),
+            target: "/media/x.mkv".to_string(),
+            size: 10,
+            status: "planned".to_string(),
+            method: Some("try-hardlink".to_string()),
+            fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
+            error: None,
+        };
+        app.set_report_for_test(crate::protocol::RunReport {
+            mode: "scan".to_string(),
+            dry_run: true,
+            strict: false,
+            files_considered: 4,
+            planned_actions: 2,
+            applied_actions: 0,
+            total_saved_bytes: 20,
+            skipped_by_min_age: 0,
+            skipped_by_min_size: 0,
+            skipped_as_library_file: 0,
+            dangling_symlinks: Vec::new(),
+            warnings: crate::protocol::WarningSummary {
+                walk_errors: 0,
+                metadata_errors: 0,
+                sample_hash_errors: 0,
+                full_hash_errors: 0,
+                link_errors: 0,
+            },
+            entries: vec![planned("/downloads/a.mkv"), planned("/downloads/b.mkv")],
+        });
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_confirm_link_overlay(frame, &app, ConfirmLinkMode::All))
+            .expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(text.contains("Rows with errors: 0"), "{text}");
+        assert!(!text.contains("Current mode"), "{text}");
+    }
+
+    #[test]
+    fn the_link_prompt_survives_a_small_terminal() {
+        let mut app = App::new(&crate::config::Config::default(), false);
+        app.set_report_for_test(crate::protocol::RunReport {
+            mode: "scan".to_string(),
+            dry_run: true,
+            strict: false,
+            files_considered: 2,
+            planned_actions: 1,
+            applied_actions: 0,
+            total_saved_bytes: 10,
+            skipped_by_min_age: 0,
+            skipped_by_min_size: 0,
+            skipped_as_library_file: 0,
+            dangling_symlinks: Vec::new(),
+            warnings: crate::protocol::WarningSummary {
+                walk_errors: 0,
+                metadata_errors: 0,
+                sample_hash_errors: 0,
+                full_hash_errors: 0,
+                link_errors: 0,
+            },
+            entries: vec![LinkReportEntry {
+                source: "/downloads/a.mkv".to_string(),
+                target: "/media/a.mkv".to_string(),
+                size: 10,
+                status: "planned".to_string(),
+                method: Some("try-hardlink".to_string()),
+                fallback_reason: None,
+                error: None,
+            }],
+        });
+        for mode in [ConfirmLinkMode::All, ConfirmLinkMode::Selected] {
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|frame| render_confirm_link_overlay(frame, &app, mode))
+                .expect("draw");
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("y link"), "{mode:?}: {text}");
+            assert!(text.contains("n cancel"), "{mode:?}: {text}");
+        }
     }
 
     #[test]

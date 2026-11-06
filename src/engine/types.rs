@@ -72,6 +72,11 @@ pub(super) struct RunWarnings {
 #[derive(Default, Clone)]
 pub(super) struct RunMetrics {
     pub(super) skipped_by_min_age: u64,
+    pub(super) skipped_by_min_size: u64,
+    /// Downloads left alone as a library file seen through a second mount.
+    pub(super) skipped_as_library_file: u64,
+    /// Symlinks in downloads that point into the library and no longer resolve.
+    pub(super) dangling_symlinks: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -93,7 +98,22 @@ pub struct ScanRunOptions<'a> {
     pub tui_events: bool,
     pub link_mode: LinkMode,
     pub only_sources: &'a [PathBuf],
+    /// Reviewed rows: when not empty, a link run links only these (download,
+    /// library file) pairs, and only to that library file.
+    pub only_pairs: &'a [(PathBuf, PathBuf)],
     pub cancel: CancelToken,
+}
+
+impl ScanRunOptions<'_> {
+    /// Whether a planned action is one this run was asked to take.
+    pub(super) fn selects(&self, action: &LinkAction) -> bool {
+        (self.only_sources.is_empty() || self.only_sources.contains(&action.src))
+            && (self.only_pairs.is_empty()
+                || self
+                    .only_pairs
+                    .iter()
+                    .any(|(src, tgt)| src == &action.src && tgt == &action.tgt))
+    }
 }
 
 pub(super) fn emit_tui_event(event: &TuiEvent) -> io::Result<()> {

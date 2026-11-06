@@ -10,6 +10,7 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use crate::config::{Config, load_config, save_config, validate_runtime_paths};
 use crate::engine::LinkMode;
 use crate::fsutil::normalize_runtime_dir;
+use crate::protocol::PlannedPair;
 
 use super::actions;
 use super::events::{self, Event};
@@ -75,11 +76,15 @@ pub struct App {
     selected_row: usize,
     pub overlay: Overlay,
     report: Option<RunReport>,
+    /// The reviewed report, put aside while a link runs: restored if the run
+    /// ends without a report of its own, so the rows are not lost.
+    report_before_link: Option<RunReport>,
     live_entries: Vec<LinkReportEntry>,
     logs: VecDeque<String>,
     downloads: Option<PathBuf>,
     media: Option<PathBuf>,
     min_age: Option<u64>,
+    min_size: u64,
     threads: Option<usize>,
     link_mode: LinkMode,
     expand_paths: bool,
@@ -108,11 +113,13 @@ impl App {
             selected_row: 0,
             overlay: Overlay::None,
             report: None,
+            report_before_link: None,
             live_entries: Vec::new(),
             logs,
             downloads: config.downloads.clone(),
             media: config.media.clone(),
             min_age: config.min_age,
+            min_size: config.effective_min_size(),
             threads: config.threads,
             link_mode: config.link_mode.unwrap_or(LinkMode::Best),
             expand_paths: false,
@@ -284,6 +291,23 @@ impl App {
 
     pub fn min_age_secs(&self) -> u64 {
         self.min_age.unwrap_or(0)
+    }
+
+    /// The planned rows of the last finished run, as shown: what `L` links.
+    pub fn reviewed_planned_pairs(&self) -> Vec<PlannedPair> {
+        self.report
+            .iter()
+            .flat_map(|report| &report.entries)
+            .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
+            .map(|entry| PlannedPair {
+                source: entry.source.clone(),
+                target: entry.target.clone(),
+            })
+            .collect()
+    }
+
+    pub fn min_size_bytes(&self) -> u64 {
+        self.min_size
     }
 
     pub fn threads_label(&self) -> String {
@@ -485,7 +509,16 @@ impl App {
                     self.push_log(format!("Rescan failed: {err}"));
                 }
             }
-            KeyCode::Char('L') => self.overlay = Overlay::ConfirmLink(ConfirmLinkMode::All),
+            KeyCode::Char('L') => {
+                if self.reviewed_planned_pairs().is_empty() {
+                    self.push_log(
+                        "Run a scan first: L links the planned rows a finished scan shows, and nothing else."
+                            .to_string(),
+                    );
+                } else {
+                    self.overlay = Overlay::ConfirmLink(ConfirmLinkMode::All);
+                }
+            }
             KeyCode::Char('l') => {
                 if self
                     .selected_entry()
@@ -581,8 +614,13 @@ impl App {
             self.push_log("A run is already in progress.".to_string());
             return;
         }
+        let pairs = self.reviewed_planned_pairs();
+        let Some(downloads) = self.downloads.clone().filter(|_| !pairs.is_empty()) else {
+            self.push_log("Run a scan first: nothing reviewed is planned.".to_string());
+            return;
+        };
         self.reset_live_run_state();
-        self.report = None;
+        self.report_before_link = self.report.take();
         self.live_entries.clear();
         self.selected_row = 0;
         self.push_log("Running link...".to_string());
@@ -590,7 +628,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let (cancel_tx, cancel_rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = actions::run_link(strict, tx, cancel_rx);
+            let _ = actions::run_link_pairs(strict, &downloads, &pairs, tx, cancel_rx);
         });
         self.job_started_at = Some(Instant::now());
         self.current_phase = Some("planning".to_string());
@@ -604,14 +642,22 @@ impl App {
             return Ok(());
         }
 
-        let Some(source) = self
+        let Some(pair) = self
             .selected_entry()
             .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
-            .map(|entry| entry.source.clone())
+            .map(|entry| PlannedPair {
+                source: entry.source.clone(),
+                target: entry.target.clone(),
+            })
         else {
             self.push_log("Select a planned row before running a single-item link.".to_string());
             return Ok(());
         };
+        let Some(downloads) = self.downloads.clone() else {
+            self.push_log("Set the downloads path before linking.".to_string());
+            return Ok(());
+        };
+        let source = pair.source.clone();
 
         self.live_entries.clear();
         self.live_planned_actions = None;
@@ -627,11 +673,10 @@ impl App {
         self.push_log(format!("Running selected link for {source}"));
 
         let strict = self.strict;
-        let source_for_job = source.clone();
         let (tx, rx) = mpsc::channel();
         let (cancel_tx, cancel_rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = actions::run_link_selected(strict, &source_for_job, tx, cancel_rx);
+            let _ = actions::run_link_pairs(strict, &downloads, &[pair], tx, cancel_rx);
         });
         self.running_job = Some(RunningJob::new(
             JobKind::LinkSelected(source),
@@ -734,6 +779,7 @@ impl App {
 
         self.downloads = config.downloads.clone();
         self.media = config.media.clone();
+        self.min_size = config.effective_min_size();
         self.link_mode = config.link_mode.unwrap_or(LinkMode::Best);
         self.overlay = Overlay::None;
         self.push_log("Saved TUI path configuration.".to_string());
@@ -850,6 +896,21 @@ impl App {
         }
     }
 
+    /// A link run that ended without a report of its own (it failed, could not
+    /// start, or was cancelled before changing anything) gives the reviewed
+    /// rows back, so they can be linked again without a new scan.
+    fn restore_reviewed_rows(&mut self) {
+        if let Some(previous) = self.report_before_link.take()
+            && self.report.is_none()
+        {
+            self.report = Some(previous);
+            self.push_log(
+                "The rows shown are from before the link run; scan again to see what it changed."
+                    .to_string(),
+            );
+        }
+    }
+
     fn fail_running_job(&mut self, kind: JobKind, message: String) {
         self.running_job = None;
         self.live_entries.clear();
@@ -860,7 +921,10 @@ impl App {
             JobKind::Scan => "Scan",
             JobKind::LinkAll | JobKind::LinkSelected(_) => "Link",
         };
-        self.push_log(format!("{label} failed: {message}"));
+        let line = format!("{label} failed: {message}");
+        self.latest_activity_message = Some(line.clone());
+        self.push_log(line);
+        self.restore_reviewed_rows();
     }
 
     fn apply_tui_event(&mut self, kind: JobKind, event: TuiEvent) -> bool {
@@ -980,12 +1044,15 @@ impl App {
                 self.live_planned_actions = None;
                 self.live_applied_actions = None;
                 self.finish_live_run();
-                self.push_log(match kind {
+                let line = match kind {
                     JobKind::Scan => "Scan cancelled. Finished hashes are cached.".to_string(),
                     JobKind::LinkAll | JobKind::LinkSelected(_) => {
                         "Link cancelled before any file was changed.".to_string()
                     }
-                });
+                };
+                self.latest_activity_message = Some(line.clone());
+                self.push_log(line);
+                self.restore_reviewed_rows();
                 true
             }
             TuiEvent::Error { message } => {
@@ -995,32 +1062,44 @@ impl App {
                     JobKind::Scan => "Scan",
                     JobKind::LinkAll | JobKind::LinkSelected(_) => "Link",
                 };
-                self.push_log(format!("{label} failed: {message}"));
+                let line = format!("{label} failed: {message}");
+                self.latest_activity_message = Some(line.clone());
+                self.push_log(line);
+                self.restore_reviewed_rows();
                 true
             }
             TuiEvent::Done { report } => {
                 let planned = report.planned_actions;
                 let applied = report.applied_actions;
                 let link_failures = report.warnings.link_errors;
+                let symlinked = report
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.is_applied_symlink())
+                    .count();
                 self.selected_row = 0;
                 self.current_path = None;
                 self.active_workers.clear();
                 self.hash_progress_done = None;
                 self.hash_progress_total = None;
+                self.report_before_link = None;
                 self.merge_report(kind.clone(), report);
                 self.live_entries.clear();
                 self.running_job = None;
                 self.finish_live_run();
-                match kind {
-                    JobKind::Scan => {
-                        self.push_log(format!("Scan finished. Planned actions: {planned}"))
+                let line = match kind {
+                    JobKind::Scan => format!("Scan finished. Planned actions: {planned}"),
+                    JobKind::LinkAll => format!("Link finished. Applied actions: {applied}"),
+                    JobKind::LinkSelected(_) => {
+                        format!("Selected link finished. Applied actions: {applied}")
                     }
-                    JobKind::LinkAll => {
-                        self.push_log(format!("Link finished. Applied actions: {applied}"))
-                    }
-                    JobKind::LinkSelected(_) => self.push_log(format!(
-                        "Selected link finished. Applied actions: {applied}"
-                    )),
+                };
+                self.latest_activity_message = Some(line.clone());
+                self.push_log(line);
+                if matches!(kind, JobKind::LinkAll | JobKind::LinkSelected(_)) && symlinked > 0 {
+                    self.push_log(format!(
+                        "{symlinked} of them as symlinks: each breaks if its library file is upgraded, renamed or deleted. See fallback_reason."
+                    ));
                 }
                 if matches!(kind, JobKind::LinkAll | JobKind::LinkSelected(_)) && link_failures > 0
                 {
@@ -1227,6 +1306,9 @@ mod tests {
             applied_actions: 0,
             total_saved_bytes: 1024,
             skipped_by_min_age: 0,
+            skipped_by_min_size: 0,
+            skipped_as_library_file: 0,
+            dangling_symlinks: Vec::new(),
             warnings: WarningSummary {
                 walk_errors: 0,
                 metadata_errors: 0,
@@ -1254,6 +1336,9 @@ mod tests {
             applied_actions: 1,
             total_saved_bytes: 30,
             skipped_by_min_age: 0,
+            skipped_by_min_size: 0,
+            skipped_as_library_file: 0,
+            dangling_symlinks: Vec::new(),
             warnings: WarningSummary {
                 walk_errors: 0,
                 metadata_errors: 0,
@@ -1439,6 +1524,96 @@ mod tests {
             app.selected_entry()
                 .and_then(|entry| entry.method.as_deref()),
             Some("try-hardlink")
+        );
+    }
+
+    #[test]
+    fn a_link_that_fails_to_run_keeps_the_reviewed_rows() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        let mut report = sample_report();
+        report.entries = vec![LinkReportEntry {
+            source: "/downloads/a.mkv".to_string(),
+            target: "/media/a.mkv".to_string(),
+            size: 10,
+            status: "planned".to_string(),
+            method: Some("try-hardlink".to_string()),
+            fallback_reason: None,
+            error: None,
+        }];
+        // What start_link_job leaves behind: the reviewed report put aside
+        // while the child runs.
+        app.report_before_link = Some(report);
+        let (tx, rx) = mpsc::channel();
+        app.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, mpsc::channel().0));
+        tx.send(Err(anyhow!(
+            "link failed: Error: another DejaView run holds the lock"
+        )))
+        .expect("send error");
+
+        app.poll_running_job();
+
+        assert!(app.running_job.is_none());
+        assert_eq!(app.reviewed_planned_pairs().len(), 1, "the rows come back");
+        app.handle_main_key(KeyCode::Char('L'))
+            .expect("key handling should not fail");
+        assert!(matches!(
+            app.overlay,
+            Overlay::ConfirmLink(ConfirmLinkMode::All)
+        ));
+    }
+
+    fn rendered_text(app: &App, cols: u16, rows: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(cols, rows);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| crate::tui::view::render(frame, app))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..rows)
+            .map(|y| {
+                (0..cols)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_run_log_shows_its_newest_lines() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        for n in 1..=30 {
+            app.push_log(format!("log line number {n}"));
+        }
+
+        let text = rendered_text(&app, 120, 36);
+
+        assert!(text.contains("log line number 30"), "{text}");
+        assert!(
+            !text.contains("TUI started"),
+            "the oldest line has scrolled off"
+        );
+    }
+
+    #[test]
+    fn a_failed_link_says_why_on_the_activity_line() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        let (tx, rx) = mpsc::channel();
+        app.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, mpsc::channel().0));
+        app.latest_activity_message = Some("Preparing link run".to_string());
+        tx.send(Err(anyhow!(
+            "another DejaView run holds the lock /downloads/.dejaview_lock"
+        )))
+        .expect("send error");
+
+        app.poll_running_job();
+
+        assert_eq!(
+            app.activity_message(),
+            "Link failed: another DejaView run holds the lock /downloads/.dejaview_lock"
         );
     }
 
@@ -1674,9 +1849,73 @@ mod tests {
     }
 
     #[test]
+    fn uppercase_l_needs_a_finished_scan_with_planned_rows() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+
+        app.handle_main_key(KeyCode::Char('L'))
+            .expect("key handling should not fail");
+
+        assert!(matches!(app.overlay, Overlay::None), "nothing reviewed yet");
+        assert!(app.running_job.is_none());
+        assert!(app.logs.iter().any(|line| line.contains("scan")));
+
+        // A finished scan with nothing planned is no better.
+        app.report = Some(sample_report());
+        app.handle_main_key(KeyCode::Char('L'))
+            .expect("key handling should not fail");
+        assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn link_all_takes_the_planned_rows_the_scan_showed() {
+        let config = Config::default();
+        let mut app = App::new(&config, false);
+        let mut report = sample_report();
+        let row = |source: &str, status: &str| LinkReportEntry {
+            source: source.to_string(),
+            target: format!("/media{source}"),
+            size: 10,
+            status: status.to_string(),
+            method: None,
+            fallback_reason: None,
+            error: None,
+        };
+        report.entries = vec![
+            row("/downloads/a.mkv", "planned"),
+            row("/downloads/b.mkv", "applied"),
+            row("/downloads/c.mkv", "planned"),
+        ];
+        app.report = Some(report);
+
+        let pairs = app.reviewed_planned_pairs();
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|pair| (pair.source.as_str(), pair.target.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("/downloads/a.mkv", "/media/downloads/a.mkv"),
+                ("/downloads/c.mkv", "/media/downloads/c.mkv"),
+            ]
+        );
+    }
+
+    #[test]
     fn uppercase_l_opens_confirmation_overlay() {
         let config = Config::default();
         let mut app = App::new(&config, false);
+        let mut report = sample_report();
+        report.entries = vec![LinkReportEntry {
+            source: "/downloads/a.mkv".to_string(),
+            target: "/media/a.mkv".to_string(),
+            size: 10,
+            status: "planned".to_string(),
+            method: Some("try-hardlink".to_string()),
+            fallback_reason: Some("tries hardlink first; may fall back to symlink".to_string()),
+            error: None,
+        }];
+        app.report = Some(report);
 
         app.handle_main_key(KeyCode::Char('L'))
             .expect("key handling should not fail");
@@ -1728,6 +1967,9 @@ mod tests {
             applied_actions: 0,
             total_saved_bytes: 30,
             skipped_by_min_age: 0,
+            skipped_by_min_size: 0,
+            skipped_as_library_file: 0,
+            dangling_symlinks: Vec::new(),
             warnings: WarningSummary {
                 walk_errors: 0,
                 metadata_errors: 0,
@@ -1777,6 +2019,9 @@ mod tests {
                 applied_actions: 1,
                 total_saved_bytes: 10,
                 skipped_by_min_age: 0,
+                skipped_by_min_size: 0,
+                skipped_as_library_file: 0,
+                dangling_symlinks: Vec::new(),
                 warnings: WarningSummary {
                     walk_errors: 0,
                     metadata_errors: 0,
@@ -1894,6 +2139,7 @@ mod tests {
                     downloads: Some(PathBuf::from("/stale/downloads")),
                     media: Some(PathBuf::from("/stale/media")),
                     min_age: Some(900),
+                    min_size: None,
                     threads: Some(8),
                     link_mode: Some(LinkMode::Best),
                 })
@@ -1903,6 +2149,7 @@ mod tests {
                     downloads: config.downloads.clone(),
                     media: config.media.clone(),
                     min_age: config.min_age,
+                    min_size: config.min_size,
                     threads: config.threads,
                     link_mode: config.link_mode,
                 });

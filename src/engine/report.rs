@@ -21,16 +21,32 @@ fn format_size(bytes: u64) -> String {
 
 pub(super) fn print_run_summary(
     files_seen: usize,
-    skipped_by_min_age: u64,
+    metrics: &RunMetrics,
     planned_actions: usize,
     applied_actions: usize,
+    symlinked: usize,
     warnings: &RunWarnings,
 ) {
     println!("{} Files considered: {}", "ℹ".cyan(), files_seen);
-    println!("{} Skipped by min-age: {}", "ℹ".cyan(), skipped_by_min_age);
+    println!(
+        "{} Skipped by min-size: {}",
+        "ℹ".cyan(),
+        metrics.skipped_by_min_size
+    );
+    println!(
+        "{} Skipped by min-age: {}",
+        "ℹ".cyan(),
+        metrics.skipped_by_min_age
+    );
     println!("{} Planned actions: {}", "ℹ".cyan(), planned_actions);
     if applied_actions > 0 {
         println!("{} Applied actions: {}", "ℹ".cyan(), applied_actions);
+    }
+    if symlinked > 0 {
+        println!(
+            "{} {symlinked} of them as symlinks: each points at its library file and breaks if Sonarr or Radarr upgrades, renames or deletes that file. `fallback_reason` in the report says why each is not a hardlink.",
+            "⚠".yellow()
+        );
     }
 
     let total = warning_total(warnings);
@@ -59,6 +75,29 @@ pub(super) fn print_space_summary(actions_empty: bool, total_saved_space: u64) {
     }
 }
 
+/// Name the symlinks in downloads that point into the library and no longer
+/// resolve, a few at a time; the report lists every one.
+pub(super) fn print_dangling_symlinks(dangling: &[PathBuf]) {
+    if dangling.is_empty() {
+        return;
+    }
+    eprintln!(
+        "{} {} symlink(s) in downloads point into the library and no longer resolve, so their torrents cannot seed. The library file was probably upgraded, renamed or deleted; re-download or remove them:",
+        "⚠".yellow(),
+        dangling.len()
+    );
+    const SHOWN: usize = 10;
+    for path in dangling.iter().take(SHOWN) {
+        eprintln!("    {}", path.display());
+    }
+    if dangling.len() > SHOWN {
+        eprintln!(
+            "    and {} more; `dangling_symlinks` in the --json report lists them all",
+            dangling.len() - SHOWN
+        );
+    }
+}
+
 pub(super) fn maybe_confirm_apply(require_confirm: bool, planned_actions: usize) -> Result<()> {
     if !require_confirm || planned_actions == 0 {
         return Ok(());
@@ -82,6 +121,15 @@ pub(super) fn maybe_confirm_apply(require_confirm: bool, planned_actions: usize)
     } else {
         Err(anyhow!("operation cancelled by user"))
     }
+}
+
+/// Downloads this run turned into symlinks, which depend on their library file
+/// staying where it is (ADR 0001).
+pub(super) fn symlinked_count(entries: &[LinkReportEntry]) -> usize {
+    entries
+        .iter()
+        .filter(|entry| entry.is_applied_symlink())
+        .count()
 }
 
 pub(super) fn warning_total(warnings: &RunWarnings) -> u64 {
@@ -153,7 +201,7 @@ pub(super) fn build_report_entries(
             } else if action.src_snapshot.dev == action.tgt_snapshot.dev {
                 Some("tries hardlink first; may fall back to symlink".to_string())
             } else {
-                Some("cross-device; hardlink not possible".to_string())
+                Some(super::linking::CROSS_DEVICE_REASON.to_string())
             },
             error: None,
         })
@@ -174,6 +222,14 @@ pub(super) fn build_run_report(options: &ScanRunOptions<'_>, input: RunReportInp
         applied_actions: input.applied_actions,
         total_saved_bytes: input.total_saved_space,
         skipped_by_min_age: input.metrics.skipped_by_min_age,
+        skipped_by_min_size: input.metrics.skipped_by_min_size,
+        skipped_as_library_file: input.metrics.skipped_as_library_file,
+        dangling_symlinks: input
+            .metrics
+            .dangling_symlinks
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
         warnings: WarningSummary {
             walk_errors: input.warnings.walk_errors,
             metadata_errors: input.warnings.metadata_errors,

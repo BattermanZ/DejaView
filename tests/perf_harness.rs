@@ -41,6 +41,8 @@ fn set_min_age_zero(root: &Path) {
     let raw = fs::read_to_string(&config_path).expect("read config");
     let mut config: serde_json::Value = serde_json::from_str(&raw).expect("parse config json");
     config["min_age"] = serde_json::json!(0);
+    // Test files are small; only the empty-file rule applies.
+    config["min_size"] = serde_json::json!(1);
     fs::write(
         &config_path,
         serde_json::to_string_pretty(&config).expect("encode config"),

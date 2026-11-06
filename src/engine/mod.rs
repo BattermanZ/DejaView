@@ -7,10 +7,12 @@ mod cancel;
 mod collect;
 mod hashing;
 mod linking;
+mod lock;
 mod report;
 mod types;
 
 pub use cancel::{CancelToken, Cancelled};
+pub use lock::LockHeld;
 pub use types::LinkMode;
 pub use types::ScanRunOptions;
 
@@ -42,7 +44,88 @@ pub fn audit_temp_artifacts(config: &Config) -> Result<Vec<std::path::PathBuf>> 
 }
 
 pub fn cleanup_temp_artifacts(config: &Config) -> Result<Vec<std::path::PathBuf>> {
+    let downloads = config
+        .downloads
+        .as_ref()
+        .ok_or_else(|| anyhow!("Downloads path not set"))?;
+    let _lock = lock::acquire(downloads)?;
     cache::cleanup_temp_artifacts(config)
+}
+
+/// Refuse downloads and media that reach each other through a second mount,
+/// which a comparison of their paths cannot see. Walks the directories of both.
+pub fn ensure_roots_not_mounted_inside(
+    downloads: &std::path::Path,
+    media: &std::path::Path,
+) -> Result<()> {
+    let downloads = collect::RootId::of("downloads", downloads)?;
+    let media = collect::RootId::of("media", media)?;
+    collect::ensure_root_not_reached(&downloads, &media)?;
+    collect::ensure_root_not_reached(&media, &downloads)
+}
+
+/// What one real hardlink from the library into downloads did.
+pub enum HardlinkProbe {
+    /// The library holds no file to try with.
+    NoFile,
+    Works {
+        file: std::path::PathBuf,
+        /// Why the probe link could not be removed again, if it could not.
+        leftover: Option<String>,
+    },
+    Fails {
+        file: std::path::PathBuf,
+        /// What a person can act on, from the OS error.
+        cause: &'static str,
+        error: String,
+    },
+}
+
+/// Hardlink the first library file found into downloads under a temp name, then
+/// remove it. This changes nothing in the library but that file's ctime, so
+/// its cache entry is read once more on the next scan.
+pub fn probe_hardlink(downloads: &std::path::Path, media: &std::path::Path) -> HardlinkProbe {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let file = walkdir::WalkDir::new(media)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_type().is_file()
+                && !entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".dejaview_"))
+        })
+        .map(walkdir::DirEntry::into_path);
+    let Some(file) = file else {
+        return HardlinkProbe::NoFile;
+    };
+    let probe = downloads.join(format!(
+        ".dejaview_validate_link.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    match std::fs::hard_link(&file, &probe) {
+        Ok(()) => {
+            let leftover = std::fs::remove_file(&probe).err().map(|err| {
+                format!(
+                    "the test link {} could not be removed ({err}); `dejaview cache cleanup-temp` removes it",
+                    probe.display()
+                )
+            });
+            HardlinkProbe::Works { file, leftover }
+        }
+        Err(err) => {
+            let error = err.to_string();
+            let cause = linking::hardlink_failure_cause(&anyhow::Error::new(err))
+                .unwrap_or("the filesystem refused the hardlink");
+            HardlinkProbe::Fails { file, cause, error }
+        }
+    }
 }
 
 pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
@@ -77,15 +160,18 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     logger::info(
         "run",
         format!(
-            "starting mode={} downloads={} media={} dry_run={} strict={}",
+            "starting mode={} downloads={} media={} dry_run={} strict={} min_size={}",
             if options.dry_run { "scan" } else { "link" },
             downloads.display(),
             media.display(),
             options.dry_run,
-            options.strict
+            options.strict,
+            config.effective_min_size()
         ),
     );
 
+    // Held until the run returns, cache save and report included.
+    let _lock = lock::acquire(downloads)?;
     let mut warnings = RunWarnings::default();
     let mut metrics = RunMetrics::default();
     if options.tui_events {
@@ -101,6 +187,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         media,
         min_age,
         CollectOptions {
+            min_size: config.effective_min_size(),
             strict: options.strict,
             show_progress: options.show_progress,
             tui_events: options.tui_events,
@@ -111,6 +198,24 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     )?;
     let files_seen = files.len();
     logger::info("run", format!("collected {} candidate files", files_seen));
+    for path in &metrics.dangling_symlinks {
+        logger::warn(
+            "scan",
+            format!(
+                "{} points into the library and no longer resolves",
+                path.display()
+            ),
+        );
+    }
+    if options.tui_events && !metrics.dangling_symlinks.is_empty() {
+        let _ = types::emit_tui_event(&TuiEvent::Log {
+            message: format!(
+                "{} symlink(s) in downloads point into the library and no longer resolve, such as {}. The report lists them.",
+                metrics.dangling_symlinks.len(),
+                metrics.dangling_symlinks[0].display()
+            ),
+        });
+    }
     if options.tui_events {
         let _ = types::emit_tui_event(&TuiEvent::Count {
             files_seen: Some(files_seen),
@@ -151,7 +256,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
             show_progress: options.show_progress,
             tui_events: options.tui_events,
             link_mode: options.link_mode,
-            only_sources: options.only_sources,
+            selection: &options,
             cancel: &options.cancel,
         },
         &mut warnings,
@@ -174,15 +279,29 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     save_cache(&cache_path, &cache)?;
     hash_result?;
 
-    let (table, actions, _total_saved_space) = plan_actions_and_table(&groups);
-    let actions = if options.only_sources.is_empty() {
-        actions
-    } else {
-        actions
-            .into_iter()
-            .filter(|action| options.only_sources.iter().any(|path| path == &action.src))
-            .collect::<Vec<_>>()
-    };
+    let linking::Plan {
+        table,
+        actions,
+        seen_through_second_mount,
+    } = plan_actions_and_table(&groups);
+    report_second_mount_skips(&seen_through_second_mount, &options, &mut metrics);
+    let actions = actions
+        .into_iter()
+        .filter(|action| options.selects(action))
+        .collect::<Vec<_>>();
+    if actions.len() < options.only_pairs.len() {
+        let message = format!(
+            "{} of the {} reviewed row(s) are no longer planned as shown, because a file changed since the scan; they are left alone. Scan again to review them.",
+            options.only_pairs.len() - actions.len(),
+            options.only_pairs.len()
+        );
+        logger::warn("run", &message);
+        if options.tui_events {
+            let _ = types::emit_tui_event(&TuiEvent::Log { message });
+        } else if !options.json_output {
+            eprintln!("{} {message}", "⚠".yellow());
+        }
+    }
     let total_saved_space = actions.iter().map(|action| action.size).sum();
     let planned_actions = actions.len();
     logger::info(
@@ -219,6 +338,8 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
 
     let ApplyOutcome {
         applied: applied_actions,
+        already_linked,
+        skipped,
         strict_error: strict_link_error,
         cancelled: apply_cancelled,
     } = if options.dry_run {
@@ -243,6 +364,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
             &actions,
             media,
             &ApplyOptions {
+                downloads,
                 strict: options.strict,
                 json_output: options.json_output,
                 tui_events: options.tui_events,
@@ -267,12 +389,26 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         }
     }
 
+    if skipped > 0 && !machine_output {
+        println!(
+            "{} Left alone {skipped} pair(s) on purpose; each entry's `error` in the report says why.",
+            "ℹ".cyan()
+        );
+    }
+    if already_linked > 0 && !machine_output {
+        println!(
+            "{} {already_linked} pair(s) already were one file; nothing changed. The filesystem gives one file different inode numbers: on mergerfs, mount with inodecalc=hybrid-hash, or use_ino on older versions.",
+            "ℹ".cyan()
+        );
+    }
     if !machine_output {
+        report::print_dangling_symlinks(&metrics.dangling_symlinks);
         print_run_summary(
             files_seen,
-            metrics.skipped_by_min_age,
+            &metrics,
             planned_actions,
             applied_actions,
+            report::symlinked_count(&report_entries),
             &warnings,
         );
     }
@@ -327,6 +463,41 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         ),
     );
     Ok(())
+}
+
+/// A download that is a library file seen through a second mount means the
+/// downloads folder reaches into the library, through a bind mount or a mergerfs
+/// branch. Such downloads are never planned; say so, since the configuration
+/// is what needs fixing.
+fn report_second_mount_skips(
+    skipped: &[(std::path::PathBuf, std::path::PathBuf)],
+    options: &ScanRunOptions<'_>,
+    metrics: &mut RunMetrics,
+) {
+    metrics.skipped_as_library_file = skipped.len() as u64;
+    for (download, library) in skipped {
+        logger::warn(
+            "plan",
+            format!(
+                "left alone {}: it is the library file {} seen through a second mount (same size and timestamps on another device)",
+                download.display(),
+                library.display()
+            ),
+        );
+    }
+    if skipped.is_empty() {
+        return;
+    }
+    let message = format!(
+        "Left alone {} download(s) that are library files seen through a second mount, such as {}. The downloads folder reaches into the library through a bind mount or a mergerfs branch: point downloads and media at the same view of the disks. The log lists every one.",
+        skipped.len(),
+        skipped[0].0.display()
+    );
+    if options.tui_events {
+        let _ = types::emit_tui_event(&TuiEvent::Log { message });
+    } else if !options.json_output {
+        eprintln!("{} {message}", "⚠".yellow());
+    }
 }
 
 #[cfg(test)]
