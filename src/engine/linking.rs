@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use colored::*;
-use comfy_table::{ContentArrangement, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
+use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use pathdiff::diff_paths;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, symlink};
@@ -350,8 +350,7 @@ pub(super) fn plan_hashed_group_actions(group: &[FileInfo]) -> Vec<LinkAction> {
 pub(super) fn plan_actions_and_table(groups: &[Vec<FileInfo>]) -> (Table, Vec<LinkAction>, u64) {
     let mut table = Table::new();
     table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(vec!["Download".yellow(), "Media".yellow()]);
 
