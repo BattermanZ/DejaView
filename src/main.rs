@@ -279,7 +279,7 @@ fn run_cli() -> Result<ExitCode> {
         } => {
             let end = tui_stream(output.tui_events, || {
                 let mut config = loaded?;
-                ensure_required_paths(&config)?;
+                config::check(&config)?;
                 if min_size.is_some() {
                     config.min_size = min_size;
                 }
@@ -314,7 +314,7 @@ fn run_cli() -> Result<ExitCode> {
         } => {
             let end = tui_stream(output.tui_events, || {
                 let mut config = loaded?;
-                ensure_required_paths(&config)?;
+                config::check(&config)?;
                 let only_pairs = match &plan {
                     Some(path) => read_plan(path)?,
                     None => Vec::new(),
@@ -572,11 +572,6 @@ fn effective_link_mode(config: &config::Config, symlink_only: bool) -> LinkMode 
     }
 }
 
-fn ensure_required_paths(config: &config::Config) -> Result<()> {
-    config::check(config)?;
-    Ok(())
-}
-
 /// `config validate`: the check every run makes, then a walk of both folders
 /// for a second mount, then one real hardlink. Every problem is listed.
 fn validate_config(config: &config::Config) -> Result<()> {
@@ -633,7 +628,6 @@ mod tests {
     use crate::test_common::TempDir;
     use std::fs;
 
-    #[cfg(unix)]
     #[test]
     fn parses_scan_command() {
         let cli = Cli::try_parse_from(["dejaview", "scan", "--strict"]).expect("parse scan");
