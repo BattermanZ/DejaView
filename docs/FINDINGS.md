@@ -14,9 +14,9 @@ Written for the next session that works on this repo. It holds every open findin
 
 `AGENTS.md` holds them: the contracts DejaView keeps, the setup to weigh changes against, branching, commits, the changelog, and the `just` recipes for checks and the live run. For this list in particular:
 
-- A finding is built from a GitHub issue. File it first (`docs/agents/issue-tracker.md`; one issue per finding, or per tight group such as S2 with P1), labelled `needs-triage`, and build it once the owner has moved it to `ready-for-agent`. The four decisions below come before the findings that hang on them.
-- New report fields (C3), cache format changes (P2, P7) and the golden JSON (M1) touch the public formats `AGENTS.md` lists: the ticket says so, and the change carries a changelog line.
-- A new dependency (decision 3) goes to the owner before it is added.
+- This first round works the findings straight from this file, with no GitHub issue for each. Take them in the suggested order at the end, one branch and pull request per finding or tight group (S2 with P1), naming the findings in the pull request and marking them done here in the same pull request. The four decisions below are settled, and the findings follow them.
+- New report fields (C3), cache format changes (P2, P7) and the golden JSON (M1) touch the public formats `AGENTS.md` lists: the pull request says so, and the change carries a changelog line.
+- A dependency beyond the ones decision 3 allows goes to the owner before it is added.
 
 ## Already done on this branch (do not redo)
 
@@ -24,12 +24,12 @@ Dependencies updated to latest (ratatui 0.30, crossterm 0.29, comfy-table 8, ind
 
 ## Decisions for the owner
 
-Ask before acting on these:
+All four are settled:
 
-1. Make `hardlink-only` the default link mode (skip a pair, with the reason, instead of falling back to a symlink)? Recommended for *arr setups; see S3.
-2. Default minimum file size: 1 byte (skip only empty files) or 1 MiB (also skips .nfo, .srt, thumbnails)? See S2 and P1.
-3. New dependencies need approval (AGENTS.md): a signal handler for Ctrl+C/SIGTERM (`signal-hook` or `ctrlc`, P5), optionally `jwalk` for the parallel walk (P3, can be done with rayon instead), optionally `libc` for `flock`/`fadvise` (C2; note `std::fs::File::try_lock` exists from Rust 1.89 while the MSRV is 1.88).
-4. Change what the CLI returns: a distinct exit code for "finished with failures", and timestamped reports instead of one overwritten file.
+1. Decided: the symlink fallback stays the default (`docs/adr/0001-a-download-that-cannot-be-hardlinked-becomes-a-symlink.md`). S3's other fixes stand.
+2. Decided: files under 1 MiB are skipped by default, empty files always (`docs/adr/0002-files-under-1-mib-are-left-alone.md`). This settles the size floor in S2 and P1.
+3. Decided: add `ctrlc` with its `termination` feature, so SIGINT and SIGTERM cancel a CLI run and keep its hashes (P5). No `jwalk`: the parallel walk uses rayon, already a dependency (P3). No `libc`: set `rust-version = "1.89"` and take the lock with `std::fs::File::try_lock` (C2); the `fadvise` hint (P9) goes with it.
+4. Decided: exit codes 0, 1, 2 (finished with failures) and 3 (another run holds the lock); one report at the fixed path, left alone by a run that planned nothing and stamped with `started_at` and `finished_at` (`docs/adr/0003-a-run-answers-a-script-with-its-exit-code-and-one-report.md`).
 
 ## Findings
 
@@ -47,14 +47,14 @@ Severity: High, Medium, Low. Evidence tags: **[verified]** reproduced in the mai
 **S2. High. Empty files are planned and linked; later writes land in the library.** **[verified]**
 - Where: `src/engine/collect.rs:87` and `158-164` (no size floor), `linking.rs:334-361`.
 - Every empty download is linked to the first empty media file: an empty `.keep` was linked to the library's `.plexignore`. With `min_age` 0, a file a torrent client has created but not yet written qualifies; the client then writes into the shared inode and the library file changes. Tiny sidecars (a 9-byte .srt, .nfo files) are linked too, saving nothing and tying unrelated library files to downloads.
-- Fix (tiny): skip `size == 0` in collect. Then add `min_size` (see P1 and the decision above).
+- Fix (tiny): skip `size == 0` in collect, whatever the floor. Then add `min_size`, default 1 MiB (P1, ADR 0002).
 
 **S3. High. The silent symlink fallback is unsafe for *arr setups.** **[reproduced]**
 - Where: `linking.rs:282-323`, `collect.rs:23-25` (the walk skips symlinks, so a symlinked download is never looked at again), `types.rs` `LinkMode { Best, SymlinkOnly }`.
 - The hardlink fails, and DejaView quietly makes a symlink, when: the cron user does not own the library file and `fs.protected_hardlinks=1` (default on Debian/Ubuntu; EPERM); Docker mounts downloads and media separately or media is `:ro` (EXDEV even on one device); mergerfs path-preserving policies put the two files on different disks (EXDEV).
 - Why it hurts: the symlink dangles when Sonarr/Radarr upgrades or deletes the library file, and the torrent breaks; a client re-downloading the missing file writes through the dangling link and creates a file in the library; a category move in the client breaks the relative link; container paths may not exist on the host.
 - The planned row says "TRY HARDLINK" and the report's `fallback_reason` loses the errno (see C3).
-- Fix: add `link_mode = hardlink-only` (skip the pair and record why); make `config validate` try one real hardlink from media into downloads and explain EPERM (ownership, protected_hardlinks) separately from EXDEV (filesystem, mount or mergerfs branch); print "N linked as symlinks" in the summary; add a check that lists symlinks under downloads pointing into media that no longer resolve (scan warning or a `check` command).
+- Fix: the symlink fallback stays the default (ADR 0001), so make it visible: make `config validate` try one real hardlink from media into downloads and explain EPERM (ownership, protected_hardlinks) separately from EXDEV (filesystem, mount or mergerfs branch); print "N linked as symlinks" in the summary; add a check that lists symlinks under downloads pointing into media that no longer resolve (scan warning or a `check` command).
 
 **S4. Medium (High with separate users). A hardlinked download takes on the library file's owner, mode, ACLs, xattrs and SELinux label.** **[reproduced]**
 - Where: `linking.rs:465-470` and `194-256`; nothing compares ownership.
@@ -81,7 +81,7 @@ Severity: High, Medium, Low. Evidence tags: **[verified]** reproduced in the mai
 **C2. Medium. No lock against concurrent runs.** **[reproduced]**
 - Where: `src/engine/mod.rs:131-174`, `report.rs:117-128`, `cache.rs:108-121`.
 - Two `link` runs over 300 pairs: no data damage, but 129/171 and 171/129 spurious "source changed" failures, both exit 0, and the second overwrote the first's report. The cache is last-writer-wins (atomic, but hashes are lost). `cache cleanup-temp` during a run can delete an in-flight temp link and force a symlink fallback.
-- Fix (small): a non-blocking exclusive lock on `<downloads>/.dejaview.lock` for scan, link and cleanup-temp; exit with a clear message and a distinct code when held. Fix the README cron line too (absolute binary path, `flock -n`, stdout to /dev/null, dated `--report`).
+- Fix (small): a non-blocking exclusive lock (`File::try_lock`, decision 3) on `<downloads>/.dejaview.lock` for scan, link and cleanup-temp; exit with a clear message and code 3 when held (ADR 0003). Fix the README cron line too (absolute binary path, `flock -n`, stdout to /dev/null, dated `--report`).
 
 **C3. Medium. Reports and errors don't match what happened.** **[reproduced]**
 - Where: `src/engine/mod.rs:186` (total computed before apply), `report.rs:117` (one fixed path), `report.rs:130-160`, `linking.rs:252, 306, 476-479, 500-505`, `mod.rs:297-312`, `hashing.rs:316, 400`.
@@ -91,7 +91,7 @@ Severity: High, Medium, Low. Evidence tags: **[verified]** reproduced in the mai
 - `.dejaview_link_report.json` is overwritten on every run, including a no-op run, and a TUI single-row link leaves a 1-entry report. Reports carry no timestamp, version, roots or link mode.
 - `--json --strict` prints nothing on stdout when it fails.
 - Non-strict runs with failed links exit 0.
-- Fix (small to medium): format errors with `{:#}` everywhere an anyhow error becomes a string; clear method and reason on failure; compute freed bytes from applied actions per inode (add `nlink` to FileInfo); add optional report fields `version`, `started_at`, `finished_at`, `downloads`, `media`, `link_mode`, `outcome` (complete, cancelled, failed), `symlinked` count, `already_linked` pairs/bytes, and split `planned_bytes` / `freed_bytes`; write timestamped reports or skip writing when nothing was planned; emit JSON before returning a strict error; document exit codes and add one for "completed with failures".
+- Fix (small to medium): format errors with `{:#}` everywhere an anyhow error becomes a string; clear method and reason on failure; compute freed bytes from applied actions per inode (add `nlink` to FileInfo); add optional report fields `version`, `started_at`, `finished_at`, `downloads`, `media`, `link_mode`, `outcome` (complete, cancelled, failed), `symlinked` count, `already_linked` pairs/bytes, and split `planned_bytes` / `freed_bytes`; skip writing the report when nothing was planned; emit JSON before returning a strict error; exit codes as ADR 0003 sets them.
 
 **C4. High (blocks Docker and hardened systemd). Logger setup is fatal and paths can't be overridden.** **[verified]**
 - Where: `src/main.rs:169`, `src/logger.rs:35-40, 66, 70`, `src/config.rs:18-22`.
@@ -145,7 +145,7 @@ Measured by the reviewer on a 93,730-file library shaped like a Jellyfin/Kodi li
 **P3. High. The folder walk is single-threaded and is the floor for every run.** **[reproduced]**
 - Where: `collect.rs:49-120` (WalkDir, one statx per file at :64).
 - Real mergerfs: 4.2-5.7 s for 93.7k files vs 0.23 s on ext4. Prototype parallel walk (rayon over `read_dir` plus `symlink_metadata`): serial 5.25 s, 4 threads 1.45 s, 16 threads 0.67 s. Sim: serial 65 s, 16 threads 4.0 s.
-- Fix (medium): parallel walk with its own concurrency (default about 16, not tied to CPU count); walk downloads and media at the same time; keep walk/metadata error counts, strict errors and cancel checks.
+- Fix (medium): parallel walk on rayon (decision 3) with its own concurrency (default about 16, not tied to CPU count); walk downloads and media at the same time; keep walk/metadata error counts, strict errors and cancel checks.
 
 **P4. Medium. One thread setting for two kinds of I/O.** **[reproduced in sim]**
 - Where: `main.rs:176-180` (rayon global pool, CPU count), `hashing.rs:282`, `:365`.
@@ -155,7 +155,7 @@ Measured by the reviewer on a 93,730-file library shaped like a Jellyfin/Kodi li
 **P5. Medium-High. Ctrl+C, SIGTERM or a cron timeout on a CLI run throws away every finished hash.** **[reproduced]**
 - Where: `main.rs:321-327` (cancel token wired only for `--tui-events`), `mod.rs:146-174` (cache saved once, after hashing).
 - A first run over copied pairs can take hours on a NAS; any interruption restarts from zero.
-- Fix: catch SIGINT/SIGTERM and call `CancelToken::cancel` (needs a dependency, see decisions); also save the cache periodically during the full pass (every few minutes or N GB).
+- Fix: catch SIGINT/SIGTERM and call `CancelToken::cancel` (with `ctrlc`, decision 3); also save the cache periodically during the full pass (every few minutes or N GB).
 
 **P6. Medium. TUI single-row link and link-all repeat the whole walk.** **[reproduced]**
 - Where: `src/tui/actions.rs:127-148`, `src/engine/mod.rs:99-145`.
@@ -215,7 +215,7 @@ All reproduced by rendering the TUI in a pty with pyte at 60x20, 80x24, 100x30, 
 
 **U6. Medium. CLI output.**
 - Link with a failure prints "Potential space saved", warnings, "Done" and exits 0; with 0 applied there is no "Applied" line; a successful link never states space actually freed. Nothing found prints "Found duplicates:" over an empty table. The table header is misaligned because the coloured header cells count escape bytes (`linking.rs:384`). Each row repeats both absolute roots (350 rows is about 1,750 lines at 80 columns). No quiet mode for cron; `--json` mails the whole report.
-- Fix (small): "Linked 7 of 8, 8.0 MiB freed, 1 failed: see <report>" and "No duplicates found."; uncoloured header; print roots once and paths relative; `--quiet` (print only when something was linked or failed); exit code for completed-with-failures (C3).
+- Fix (small): "Linked 7 of 8, 8.0 MiB freed, 1 failed: see <report>" and "No duplicates found."; uncoloured header; print roots once and paths relative; `--quiet` (print only when something was linked or failed); exit code 2 for completed-with-failures (ADR 0003).
 
 **U7. Low-Medium. `x` clears the cache with no confirmation.** Lowercase x (next to c, not documented) wipes the cache, which costs a full library rehash. Confirm X/x. Where: `app.rs:483`.
 
@@ -231,9 +231,9 @@ All reproduced by rendering the TUI in a pty with pyte at 60x20, 80x24, 100x30, 
 
 **M1. High value. Stringly-typed values.** "planned" appears at 17 sites, "applied" at 11, "try-hardlink" at 10; each of the 5 phase strings at 5-10 sites; 20 `eq_ignore_ascii_case` comparisons. Where: `src/protocol.rs`, `src/engine/report.rs:130-185`, `linking.rs:471-478`, `src/tui/app.rs`, `view/mod.rs`. Replace with enums (`Mode`, `EntryStatus`, `LinkMethod`, `Phase`) with serde renames so the JSON stays byte-identical; add a golden test serialising a RunReport and a few TuiEvents against checked-in JSON; merge `RunWarnings`/`WarningSummary` and the duplicate `warning_total` and `format_size`/`format_bytes`. About 300 mechanical lines, low risk.
 
-**M2. High value. Releases and MSRV.** The real minimum Rust is exactly 1.88 (`cargo +1.88 build/test --locked` passes; 1.87 fails: ratatui 0.30.2, comfy-table, darling and instability need 1.88; let-chains need 1.88). Debian 13's rustc 1.85 can't build it. `cargo build --release --target x86_64-unknown-linux-musl` works out of the box (60 s, 3.3 MB static binary); aarch64-musl from x86 fails in blake3's C build without a cross sysroot. Recommend: `rust-version = "1.88"` in Cargo.toml; tag v0.1.0; a tag-triggered workflow building x86_64 and aarch64 `*-unknown-linux-musl` (aarch64 on `ubuntu-24.04-arm` or with cross), stripped, with sha256sums, attached to a GitHub Release; README install section using it; `[profile.release]` with `strip = true`, `lto = "thin"`. Optional container: `FROM scratch` plus the binary, `ENV XDG_CONFIG_HOME=/config XDG_STATE_HOME=/config`, run with `--user PUID:PGID`, mount `/data` with the same layout as the torrent client and *arrs, schedule from the host. Needs C4 first.
+**M2. High value. Releases and MSRV.** The real minimum Rust is exactly 1.88 (`cargo +1.88 build/test --locked` passes; 1.87 fails: ratatui 0.30.2, comfy-table, darling and instability need 1.88; let-chains need 1.88). Debian 13's rustc 1.85 can't build it. `cargo build --release --target x86_64-unknown-linux-musl` works out of the box (60 s, 3.3 MB static binary); aarch64-musl from x86 fails in blake3's C build without a cross sysroot. Recommend: `rust-version = "1.89"` in Cargo.toml (decision 3, for the lock); tag v0.1.0; a tag-triggered workflow building x86_64 and aarch64 `*-unknown-linux-musl` (aarch64 on `ubuntu-24.04-arm` or with cross), stripped, with sha256sums, attached to a GitHub Release; README install section using it; `[profile.release]` with `strip = true`, `lto = "thin"`. Optional container: `FROM scratch` plus the binary, `ENV XDG_CONFIG_HOME=/config XDG_STATE_HOME=/config`, run with `--user PUID:PGID`, mount `/data` with the same layout as the torrent client and *arrs, schedule from the host. Needs C4 first.
 
-**M3. Medium. CI hardening.** CI uses `@stable` with `-D warnings`, so a new Rust release can break an unrelated change. Pin the toolchain in `rust-toolchain.toml`; add `--locked` to clippy and test; add a `cargo +1.88 check --locked --all-targets` job; add a weekly cargo-audit job (prebuilt via `taiki-e/install-action`). cargo-audit 0.22.2 currently reports 0 vulnerabilities across 228 lockfile crates. The lockfile's apparent duplicates (syn 1, nix 0.29, bitflags 1, thiserror 1) come only from ratatui's termwiz backend, which isn't compiled (a clean release build compiles 112 crates).
+**M3. Medium. CI hardening.** CI uses `@stable` with `-D warnings`, so a new Rust release can break an unrelated change. Pin the toolchain in `rust-toolchain.toml`; add `--locked` to clippy and test; add a `cargo +1.89 check --locked --all-targets` job; add a weekly cargo-audit job (prebuilt via `taiki-e/install-action`). cargo-audit 0.22.2 currently reports 0 vulnerabilities across 228 lockfile crates. The lockfile's apparent duplicates (syn 1, nix 0.29, bitflags 1, thiserror 1) come only from ratatui's termwiz backend, which isn't compiled (a clean release build compiles 112 crates).
 
 **M4. Medium. Test gaps.**
 - Done in `just test`, which reruns the unit tests as `nobody` under root. A bare `cargo test` as root still reports the five as `ok`.

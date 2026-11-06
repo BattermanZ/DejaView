@@ -182,5 +182,5 @@ maintainer's to make first.
 
 A decision that is hard to reverse (a default, a format, a refusal) is
 recorded as an ADR under `docs/adr/` once made, and the words DejaView uses
-for its own things go in `GLOSSARY.md`. Neither exists yet. Where a ticket and
-an ADR disagree, the ADR wins.
+for its own things go in `GLOSSARY.md`, which does not exist yet. Where a
+ticket and an ADR disagree, the ADR wins.
