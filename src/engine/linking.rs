@@ -44,6 +44,34 @@ pub(super) fn ensure_target_within_media_root(media_root: &Path, target: &Path) 
     Ok(())
 }
 
+/// The library is never written to: refuse any source that resolves inside the
+/// media root, whatever the planner produced. The final path component is not
+/// resolved, so a source that is itself a symlink is judged by where it lives.
+pub(super) fn ensure_source_outside_media_root(media_root: &Path, source: &Path) -> Result<()> {
+    let refuse = || {
+        anyhow!(
+            "refusing to replace a file inside the media root: {}",
+            source.display()
+        )
+    };
+    if source.starts_with(media_root) {
+        return Err(refuse());
+    }
+
+    let parent = source
+        .parent()
+        .ok_or_else(|| anyhow!("source path has no parent: {}", source.display()))?;
+    let canonical_parent =
+        fs::canonicalize(parent).with_context(|| format!("canonicalize {}", parent.display()))?;
+    let canonical_media = fs::canonicalize(media_root)
+        .with_context(|| format!("canonicalize {}", media_root.display()))?;
+    if canonical_parent.starts_with(&canonical_media) {
+        return Err(refuse());
+    }
+
+    Ok(())
+}
+
 fn snapshot_from_file_info(file: &FileInfo) -> FileSnapshot {
     FileSnapshot {
         size: file.size,
@@ -408,6 +436,7 @@ pub(super) fn apply_actions(
                     action.tgt.display()
                 ),
             );
+            ensure_source_outside_media_root(media, &action.src)?;
             ensure_source_snapshot_matches(&action.src, &action.src_snapshot)?;
             ensure_target_within_media_root(media, &action.tgt)?;
             ensure_target_snapshot_matches(&action.tgt, &action.tgt_snapshot)?;

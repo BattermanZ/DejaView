@@ -371,6 +371,16 @@ fn validate_config(config: &config::Config) -> Result<()> {
             .push("media path not set; run: DejaView config set-media /path/to/media".to_string()),
     }
 
+    if let (Some(downloads), Some(media)) = (&config.downloads, &config.media)
+        && let (Ok(downloads), Ok(media)) = (
+            normalize_runtime_dir(downloads),
+            normalize_runtime_dir(media),
+        )
+        && let Err(err) = config::ensure_roots_disjoint(&downloads, &media)
+    {
+        failures.push(err.to_string());
+    }
+
     if failures.is_empty() {
         println!("{} Configuration is valid.", "✔".green());
         Ok(())

@@ -1028,3 +1028,67 @@ fn save_cache_failure_cleans_up_temp_file() {
     fs::set_permissions(&root, reset).expect("reset perms");
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+fn snapshot_of(path: &Path) -> super::types::FileSnapshot {
+    let meta = fs::metadata(path).expect("metadata");
+    super::types::FileSnapshot {
+        size: meta.len(),
+        mtime_ns: meta
+            .modified()
+            .expect("modified")
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("mtime")
+            .as_nanos(),
+        ctime_ns: (meta.ctime() as i128 * 1_000_000_000) + meta.ctime_nsec() as i128,
+        dev: meta.dev(),
+        inode: meta.ino(),
+    }
+}
+
+#[test]
+fn apply_actions_refuses_to_replace_a_file_inside_the_media_root() {
+    let root = unique_temp_dir("source_in_media");
+    let media = root.join("media");
+    let canonical = media.join("a.mkv");
+    let library_copy = media.join("b.mkv");
+    write_file(&canonical, b"same-content");
+    write_file(&library_copy, b"same-content");
+    let library_copy_inode = fs::metadata(&library_copy).expect("meta").ino();
+
+    let action = super::types::LinkAction {
+        src: library_copy.clone(),
+        tgt: canonical.clone(),
+        size: 12,
+        src_snapshot: snapshot_of(&library_copy),
+        tgt_snapshot: snapshot_of(&canonical),
+    };
+    let mut warnings = RunWarnings::default();
+    let mut report_entries = vec![planned_entry_for(&action)];
+    let (applied, _) = apply_actions(
+        &[action],
+        &media,
+        false,
+        true,
+        false,
+        LinkMode::Best,
+        &mut warnings,
+        &mut report_entries,
+    );
+
+    assert_eq!(applied, 0);
+    assert_eq!(warnings.link_errors, 1);
+    assert!(
+        report_entries[0]
+            .error
+            .as_deref()
+            .expect("error message")
+            .contains("refusing to replace a file inside the media root")
+    );
+    assert_eq!(
+        fs::metadata(&library_copy).expect("meta").ino(),
+        library_copy_inode,
+        "library file must not be replaced"
+    );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}

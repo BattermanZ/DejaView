@@ -112,6 +112,34 @@ pub fn validate_runtime_paths(config: &Config) -> Result<()> {
         ));
     }
 
+    ensure_roots_disjoint(&normalized_downloads, &normalized_media)
+}
+
+/// Downloads and media must be separate trees. If one sits inside the other, the
+/// downloads walk sees library files as downloads and a link run rewrites files
+/// inside the library. Both paths must already be canonical, so nesting hidden
+/// behind a symlink is caught too.
+pub fn ensure_roots_disjoint(downloads: &Path, media: &Path) -> Result<()> {
+    if downloads == media {
+        return Err(anyhow!(
+            "downloads and media are the same directory: {}; point them at separate folders",
+            downloads.display()
+        ));
+    }
+    if media.starts_with(downloads) {
+        return Err(anyhow!(
+            "media path is inside the downloads path ({} is under {}); point them at separate folders",
+            media.display(),
+            downloads.display()
+        ));
+    }
+    if downloads.starts_with(media) {
+        return Err(anyhow!(
+            "downloads path is inside the media path ({} is under {}); point media at the library folder itself",
+            downloads.display(),
+            media.display()
+        ));
+    }
     Ok(())
 }
 
@@ -211,6 +239,70 @@ mod tests {
 
         let result = validate_runtime_paths(&config);
         assert!(result.is_err());
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    fn config_for(downloads: &Path, media: &Path) -> Config {
+        Config {
+            downloads: Some(downloads.to_path_buf()),
+            media: Some(media.to_path_buf()),
+            min_age: None,
+            threads: None,
+            link_mode: None,
+        }
+    }
+
+    fn assert_overlap_rejected(config: &Config, expected: &str) {
+        let err = validate_runtime_paths(config).expect_err("overlapping roots must be rejected");
+        assert!(
+            err.to_string().contains(expected),
+            "expected '{expected}' in '{err}'"
+        );
+    }
+
+    #[test]
+    fn validate_runtime_paths_rejects_media_inside_downloads() {
+        let root = unique_temp_dir("validate_media_nested");
+        let downloads = root.join("downloads");
+        let media = downloads.join("library");
+        fs::create_dir_all(&media).expect("create nested media");
+
+        assert_overlap_rejected(&config_for(&downloads, &media), "media path is inside");
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn validate_runtime_paths_rejects_downloads_inside_media() {
+        let root = unique_temp_dir("validate_downloads_nested");
+        let media = root.join("data");
+        let downloads = media.join("torrents");
+        fs::create_dir_all(&downloads).expect("create nested downloads");
+
+        assert_overlap_rejected(&config_for(&downloads, &media), "downloads path is inside");
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn validate_runtime_paths_rejects_same_directory() {
+        let root = unique_temp_dir("validate_same_dir");
+        let shared = root.join("shared");
+        fs::create_dir_all(&shared).expect("create shared dir");
+
+        assert_overlap_rejected(&config_for(&shared, &shared), "the same directory");
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_runtime_paths_rejects_nesting_hidden_behind_symlink() {
+        let root = unique_temp_dir("validate_symlink_nested");
+        let downloads = root.join("downloads");
+        let real_media = downloads.join("library");
+        let media_link = root.join("media");
+        fs::create_dir_all(&real_media).expect("create nested media");
+        std::os::unix::fs::symlink(&real_media, &media_link).expect("create media symlink");
+
+        assert_overlap_rejected(&config_for(&downloads, &media_link), "media path is inside");
         fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 

@@ -509,3 +509,44 @@ fn link_confirm_conflicts_with_json_mode() {
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+#[test]
+fn nested_media_root_is_rejected_and_library_is_untouched() {
+    let root = unique_temp_dir("nested_roots");
+    let downloads = root.join("downloads");
+    let media = downloads.join("media");
+    fs::create_dir_all(&media).expect("create nested media");
+    fs::write(media.join("a.bin"), vec![7u8; 4096]).expect("write a");
+    fs::write(media.join("b.bin"), vec![7u8; 4096]).expect("write b");
+    fs::write(downloads.join("dupe.bin"), vec![7u8; 4096]).expect("write dupe");
+    let library_inode = fs::metadata(media.join("b.bin")).expect("meta").ino();
+
+    run_ok(
+        &root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        &root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+    set_min_age_zero(&root);
+
+    let validate = run_cmd(&root, &["config", "validate"]);
+    assert!(!validate.status.success());
+    assert!(String::from_utf8_lossy(&validate.stderr).contains("media path is inside"));
+
+    let link = run_cmd(&root, &["link", "--no-progress"]);
+    assert!(!link.status.success());
+    assert!(String::from_utf8_lossy(&link.stderr).contains("media path is inside"));
+    assert_eq!(
+        fs::metadata(media.join("b.bin")).expect("meta").ino(),
+        library_inode,
+        "library file must not be relinked"
+    );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
