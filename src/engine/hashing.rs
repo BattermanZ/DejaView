@@ -81,8 +81,11 @@ pub(super) struct HashOptions<'a> {
     pub(super) only_sources: &'a [PathBuf],
 }
 
-/// Hashing work for one size group. Paths that share a (dev, inode) are one
-/// physical file: only its first path is read, and the hash is copied to the rest.
+/// Hashing work for one size group. Paths that share dev, inode, mtime and ctime
+/// are one physical file: only its first path is read, and the hash is copied to
+/// the rest. The timestamps guard against filesystems that can report one inode
+/// for different files (mergerfs with inodecalc=passthrough); hardlinks always
+/// share them.
 struct GroupWork {
     /// Indices into the group, one entry per physical file.
     inodes: Vec<Vec<usize>>,
@@ -97,10 +100,10 @@ impl GroupWork {
 }
 
 fn split_by_inode(group: &[FileInfo]) -> Vec<Vec<usize>> {
-    let mut index: HashMap<(u64, u64), usize> = HashMap::new();
+    let mut index: HashMap<(u64, u64, u128, i128), usize> = HashMap::new();
     let mut inodes: Vec<Vec<usize>> = Vec::new();
     for (idx, file) in group.iter().enumerate() {
-        match index.entry((file.dev, file.inode)) {
+        match index.entry((file.dev, file.inode, file.mtime_ns, file.ctime_ns)) {
             Entry::Occupied(slot) => inodes[*slot.get()].push(idx),
             Entry::Vacant(slot) => {
                 slot.insert(inodes.len());
@@ -442,6 +445,17 @@ mod tests {
     #[test]
     fn same_inode_on_another_device_is_a_different_file() {
         let group = vec![file("/dl/a", 1, 7, 0), file("/media/a", 2, 7, 0)];
+        let work = plan_group_work(&group, &Cache::new()).expect("two physical files");
+        assert_eq!(work.inodes.len(), 2);
+    }
+
+    #[test]
+    fn colliding_inode_with_different_times_is_not_shared() {
+        // mergerfs inodecalc=passthrough can report one inode for different files on
+        // different branches; a real hardlink always shares its timestamps too.
+        let mut other = file("/media/b", 1, 7, 5);
+        other.ctime_ns = 5;
+        let group = vec![file("/dl/a", 1, 7, 0), other];
         let work = plan_group_work(&group, &Cache::new()).expect("two physical files");
         assert_eq!(work.inodes.len(), 2);
     }
