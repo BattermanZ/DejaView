@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -55,6 +55,19 @@ enum JobKind {
 struct RunningJob {
     kind: JobKind,
     receiver: Receiver<Result<TuiEvent>>,
+    cancel: Sender<()>,
+    cancel_requested: bool,
+}
+
+impl RunningJob {
+    fn new(kind: JobKind, receiver: Receiver<Result<TuiEvent>>, cancel: Sender<()>) -> Self {
+        Self {
+            kind,
+            receiver,
+            cancel,
+            cancel_requested: false,
+        }
+    }
 }
 
 pub struct App {
@@ -143,6 +156,9 @@ impl App {
 
     pub fn mode_label(&self) -> &str {
         if let Some(job) = &self.running_job {
+            if job.cancel_requested {
+                return "Cancelling";
+            }
             return match job.kind {
                 JobKind::Scan => "Scanning",
                 JobKind::LinkAll | JobKind::LinkSelected(_) => "Linking",
@@ -443,6 +459,10 @@ impl App {
             },
             Overlay::BlockingNotice(_) => match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.overlay = Overlay::None,
+                KeyCode::Char('c') => {
+                    self.overlay = Overlay::None;
+                    self.request_cancel();
+                }
                 _ => {}
             },
             Overlay::None => self.handle_main_key(code)?,
@@ -457,6 +477,7 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Char('p') => self.toggle_path_mode(),
+            KeyCode::Char('c') => self.request_cancel(),
             KeyCode::Char('e') => self.open_config_editor(),
             KeyCode::Char('S') | KeyCode::Char('s') => self.start_scan_job(),
             KeyCode::Char('X') | KeyCode::Char('x') => {
@@ -526,16 +547,14 @@ impl App {
         self.push_log("Running scan...".to_string());
         let strict = self.strict;
         let (tx, rx) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = actions::run_scan(strict, tx);
+            let _ = actions::run_scan(strict, tx, cancel_rx);
         });
         self.job_started_at = Some(Instant::now());
         self.current_phase = Some("collecting".to_string());
         self.latest_activity_message = Some("Collecting candidate files".to_string());
-        self.running_job = Some(RunningJob {
-            kind: JobKind::Scan,
-            receiver: rx,
-        });
+        self.running_job = Some(RunningJob::new(JobKind::Scan, rx, cancel_tx));
     }
 
     fn start_rescan_job(&mut self) -> Result<()> {
@@ -569,16 +588,14 @@ impl App {
         self.push_log("Running link...".to_string());
         let strict = self.strict;
         let (tx, rx) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = actions::run_link(strict, tx);
+            let _ = actions::run_link(strict, tx, cancel_rx);
         });
         self.job_started_at = Some(Instant::now());
         self.current_phase = Some("planning".to_string());
         self.latest_activity_message = Some("Preparing link run".to_string());
-        self.running_job = Some(RunningJob {
-            kind: JobKind::LinkAll,
-            receiver: rx,
-        });
+        self.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, cancel_tx));
     }
 
     fn start_selected_link_job(&mut self) -> Result<()> {
@@ -612,13 +629,15 @@ impl App {
         let strict = self.strict;
         let source_for_job = source.clone();
         let (tx, rx) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = actions::run_link_selected(strict, &source_for_job, tx);
+            let _ = actions::run_link_selected(strict, &source_for_job, tx, cancel_rx);
         });
-        self.running_job = Some(RunningJob {
-            kind: JobKind::LinkSelected(source),
-            receiver: rx,
-        });
+        self.running_job = Some(RunningJob::new(
+            JobKind::LinkSelected(source),
+            rx,
+            cancel_tx,
+        ));
         Ok(())
     }
 
@@ -756,10 +775,33 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Ask the running job to stop. A scan stops within one read chunk and keeps
+    /// the hashes it finished in the cache; a link stops between files, so files
+    /// already linked stay linked and the rest stay planned.
+    fn request_cancel(&mut self) {
+        let Some(job) = self.running_job.as_mut() else {
+            self.push_log("No run to cancel.".to_string());
+            return;
+        };
+        if job.cancel_requested {
+            return;
+        }
+        job.cancel_requested = true;
+        let _ = job.cancel.send(());
+        let message = match job.kind {
+            JobKind::Scan => "Cancelling scan; finished hashes stay cached.",
+            JobKind::LinkAll | JobKind::LinkSelected(_) => {
+                "Cancelling link; it stops before the next file."
+            }
+        };
+        self.latest_activity_message = Some(message.to_string());
+        self.push_log(message.to_string());
+    }
+
     fn request_quit(&mut self) {
         if self.running_job.is_some() {
             self.overlay = Overlay::BlockingNotice(
-                "A run is still active. Quitting is disabled until it finishes so the TUI cannot detach from a live filesystem operation.".to_string(),
+                "A run is still active, so quitting is disabled until it stops. Press c to cancel it, or Esc to keep it running.".to_string(),
             );
             self.push_log("Quit blocked while a run is active.".to_string());
         } else if !matches!(self.overlay, Overlay::None) {
@@ -931,6 +973,20 @@ impl App {
                 self.latest_activity_message = Some(message.clone());
                 self.push_log(message);
                 false
+            }
+            TuiEvent::Cancelled => {
+                self.running_job = None;
+                self.live_entries.clear();
+                self.live_planned_actions = None;
+                self.live_applied_actions = None;
+                self.finish_live_run();
+                self.push_log(match kind {
+                    JobKind::Scan => "Scan cancelled. Finished hashes are cached.".to_string(),
+                    JobKind::LinkAll | JobKind::LinkSelected(_) => {
+                        "Link cancelled before any file was changed.".to_string()
+                    }
+                });
+                true
             }
             TuiEvent::Error { message } => {
                 self.running_job = None;
@@ -1107,12 +1163,11 @@ impl App {
         self.hash_progress_total = Some(total);
     }
 
-    pub(crate) fn set_running_scan_for_test(&mut self) {
+    pub(crate) fn set_running_scan_for_test(&mut self) -> Receiver<()> {
         let (_tx, rx) = mpsc::channel();
-        self.running_job = Some(RunningJob {
-            kind: JobKind::Scan,
-            receiver: rx,
-        });
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        self.running_job = Some(RunningJob::new(JobKind::Scan, rx, cancel_tx));
+        cancel_rx
     }
 
     pub(crate) fn set_report_for_test(&mut self, report: RunReport) {
@@ -1262,10 +1317,7 @@ mod tests {
         let mut app = App::new(&config, false);
 
         let (_tx, rx) = mpsc::channel();
-        app.running_job = Some(RunningJob {
-            kind: JobKind::Scan,
-            receiver: rx,
-        });
+        app.running_job = Some(RunningJob::new(JobKind::Scan, rx, mpsc::channel().0));
 
         app.start_link_job();
         assert!(
@@ -1281,10 +1333,7 @@ mod tests {
         let mut app = App::new(&config, false);
 
         let (tx, rx) = mpsc::channel();
-        app.running_job = Some(RunningJob {
-            kind: JobKind::Scan,
-            receiver: rx,
-        });
+        app.running_job = Some(RunningJob::new(JobKind::Scan, rx, mpsc::channel().0));
         tx.send(Ok(TuiEvent::Done {
             report: sample_report(),
         }))
@@ -1302,10 +1351,7 @@ mod tests {
         let mut app = App::new(&config, false);
 
         let (tx, rx) = mpsc::channel();
-        app.running_job = Some(RunningJob {
-            kind: JobKind::LinkAll,
-            receiver: rx,
-        });
+        app.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, mpsc::channel().0));
         let mut report = sample_report();
         report.mode = "link".to_string();
         report.warnings.link_errors = 2;
@@ -1331,10 +1377,7 @@ mod tests {
         let mut app = App::new(&config, false);
 
         let (tx, rx) = mpsc::channel();
-        app.running_job = Some(RunningJob {
-            kind: JobKind::Scan,
-            receiver: rx,
-        });
+        app.running_job = Some(RunningJob::new(JobKind::Scan, rx, mpsc::channel().0));
         app.job_started_at = Some(Instant::now());
 
         tx.send(Ok(TuiEvent::Phase {
@@ -1372,10 +1415,7 @@ mod tests {
         let mut app = App::new(&config, false);
 
         let (tx, rx) = mpsc::channel();
-        app.running_job = Some(RunningJob {
-            kind: JobKind::Scan,
-            receiver: rx,
-        });
+        app.running_job = Some(RunningJob::new(JobKind::Scan, rx, mpsc::channel().0));
 
         tx.send(Ok(TuiEvent::PlannedEntries {
             entries: vec![LinkReportEntry {
@@ -1408,10 +1448,7 @@ mod tests {
         let mut app = App::new(&config, false);
 
         let (tx, rx) = mpsc::channel();
-        app.running_job = Some(RunningJob {
-            kind: JobKind::LinkAll,
-            receiver: rx,
-        });
+        app.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, mpsc::channel().0));
 
         tx.send(Ok(TuiEvent::PlannedEntries {
             entries: vec![LinkReportEntry {
@@ -1533,15 +1570,84 @@ mod tests {
     }
 
     #[test]
+    fn c_sends_cancel_once_and_marks_the_job_cancelling() {
+        let mut app = App::new(&Config::default(), false);
+        let cancel_rx = app.set_running_scan_for_test();
+
+        app.handle_main_key(KeyCode::Char('c')).expect("key");
+        app.handle_main_key(KeyCode::Char('c')).expect("key");
+
+        assert_eq!(cancel_rx.try_iter().count(), 1);
+        assert_eq!(app.mode_label(), "Cancelling");
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line.starts_with("Cancelling scan"))
+        );
+    }
+
+    #[test]
+    fn c_without_a_run_only_logs() {
+        let mut app = App::new(&Config::default(), false);
+        app.handle_main_key(KeyCode::Char('c')).expect("key");
+        assert!(app.logs.iter().any(|line| line == "No run to cancel."));
+        assert!(app.running_job.is_none());
+    }
+
+    #[test]
+    fn cancelled_event_ends_the_job_without_rows() {
+        let mut app = App::new(&Config::default(), false);
+        let (tx, rx) = mpsc::channel();
+        app.running_job = Some(RunningJob::new(JobKind::Scan, rx, mpsc::channel().0));
+        app.live_entries.push(sample_entry_for_cancel());
+        tx.send(Ok(TuiEvent::Cancelled)).expect("send cancelled");
+
+        app.poll_running_job();
+
+        assert!(app.running_job.is_none());
+        assert!(app.rows().is_empty());
+        assert_eq!(app.mode_label(), "Idle");
+        assert!(
+            app.logs
+                .iter()
+                .any(|line| line.starts_with("Scan cancelled"))
+        );
+    }
+
+    #[test]
+    fn c_in_the_quit_notice_cancels_the_run() {
+        let mut app = App::new(&Config::default(), false);
+        let cancel_rx = app.set_running_scan_for_test();
+
+        app.handle_key(KeyCode::Char('q'), KeyModifiers::NONE)
+            .expect("key");
+        assert!(matches!(app.overlay, Overlay::BlockingNotice(_)));
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::NONE)
+            .expect("key");
+
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(cancel_rx.try_iter().count(), 1);
+    }
+
+    fn sample_entry_for_cancel() -> LinkReportEntry {
+        LinkReportEntry {
+            source: "/dl/a".to_string(),
+            target: "/media/a".to_string(),
+            size: 1,
+            status: "planned".to_string(),
+            method: None,
+            fallback_reason: None,
+            error: None,
+        }
+    }
+
+    #[test]
     fn quit_is_blocked_while_job_is_running() {
         let config = Config::default();
         let mut app = App::new(&config, false);
 
         let (_tx, rx) = mpsc::channel();
-        app.running_job = Some(RunningJob {
-            kind: JobKind::LinkAll,
-            receiver: rx,
-        });
+        app.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, mpsc::channel().0));
 
         app.handle_main_key(KeyCode::Char('q'))
             .expect("key handling should not fail");
@@ -1656,10 +1762,11 @@ mod tests {
         });
 
         let (tx, rx) = mpsc::channel();
-        app.running_job = Some(RunningJob {
-            kind: JobKind::LinkSelected("/downloads/a.mkv".to_string()),
-            receiver: rx,
-        });
+        app.running_job = Some(RunningJob::new(
+            JobKind::LinkSelected("/downloads/a.mkv".to_string()),
+            rx,
+            mpsc::channel().0,
+        ));
         tx.send(Ok(TuiEvent::Done {
             report: RunReport {
                 mode: "link".to_string(),

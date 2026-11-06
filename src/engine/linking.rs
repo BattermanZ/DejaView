@@ -12,6 +12,7 @@ use crate::protocol::TuiEvent;
 
 use crate::protocol::LinkReportEntry;
 
+use super::cancel::CancelToken;
 use super::types::emit_tui_event;
 use super::types::{FileInfo, FileSnapshot, LinkAction, LinkMode, RunWarnings};
 
@@ -399,21 +400,42 @@ pub(super) fn plan_actions_and_table(groups: &[Vec<FileInfo>]) -> (Table, Vec<Li
     (table, actions, total_saved_space)
 }
 
+pub(super) struct ApplyOptions<'a> {
+    pub(super) strict: bool,
+    pub(super) json_output: bool,
+    pub(super) tui_events: bool,
+    pub(super) link_mode: LinkMode,
+    pub(super) cancel: &'a CancelToken,
+}
+
+#[derive(Default)]
+pub(super) struct ApplyOutcome {
+    pub(super) applied: usize,
+    pub(super) strict_error: Option<anyhow::Error>,
+    /// Stopped between actions on request; actions not reached stay planned.
+    pub(super) cancelled: bool,
+}
+
 pub(super) fn apply_actions(
     actions: &[LinkAction],
     media: &Path,
-    strict: bool,
-    json_output: bool,
-    tui_events: bool,
-    link_mode: LinkMode,
+    options: &ApplyOptions<'_>,
     warnings: &mut RunWarnings,
     report_entries: &mut [LinkReportEntry],
-) -> (usize, Option<anyhow::Error>) {
+) -> ApplyOutcome {
+    let ApplyOptions {
+        strict,
+        json_output,
+        tui_events,
+        link_mode,
+        cancel,
+    } = *options;
     let mut applied_actions = 0usize;
     let mut strict_link_error: Option<anyhow::Error> = None;
+    let mut cancelled = false;
 
     if actions.is_empty() {
-        return (applied_actions, strict_link_error);
+        return ApplyOutcome::default();
     }
 
     if !json_output && !tui_events {
@@ -421,6 +443,10 @@ pub(super) fn apply_actions(
     }
 
     for (index, action) in actions.iter().enumerate() {
+        if cancel.is_cancelled() {
+            cancelled = true;
+            break;
+        }
         if tui_events {
             let _ = emit_tui_event(&TuiEvent::File {
                 phase: Some("applying".to_string()),
@@ -511,5 +537,9 @@ pub(super) fn apply_actions(
         }
     }
 
-    (applied_actions, strict_link_error)
+    ApplyOutcome {
+        applied: applied_actions,
+        strict_error: strict_link_error,
+        cancelled,
+    }
 }

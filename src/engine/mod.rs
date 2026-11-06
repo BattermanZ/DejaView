@@ -3,12 +3,14 @@ use colored::*;
 use std::collections::HashSet;
 
 mod cache;
+mod cancel;
 mod collect;
 mod hashing;
 mod linking;
 mod report;
 mod types;
 
+pub use cancel::{CancelToken, Cancelled};
 pub use types::LinkMode;
 pub use types::ScanRunOptions;
 
@@ -16,7 +18,7 @@ use crate::protocol::TuiEvent;
 use cache::{cache_key, load_cache, prune_cache, save_cache};
 use collect::{CollectOptions, collect_run_files, group_files_by_size};
 use hashing::{HashOptions, hash_groups_and_update_cache};
-use linking::{apply_actions, plan_actions_and_table};
+use linking::{ApplyOptions, ApplyOutcome, apply_actions, plan_actions_and_table};
 use report::{
     RunReportInput, build_report_entries, build_run_report, maybe_confirm_apply,
     maybe_return_strict_errors, print_run_summary, print_space_summary, resolve_report_path,
@@ -44,6 +46,20 @@ pub fn cleanup_temp_artifacts(config: &Config) -> Result<Vec<std::path::PathBuf>
 }
 
 pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
+    let tui_events = options.tui_events;
+    let result = run(config, options);
+    if let Err(err) = &result
+        && err.is::<Cancelled>()
+    {
+        logger::info("run", "cancelled by user before any change was made");
+        if tui_events {
+            let _ = types::emit_tui_event(&TuiEvent::Cancelled);
+        }
+    }
+    result
+}
+
+fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     if options.json_output && options.tui_events {
         return Err(anyhow!("--json cannot be combined with --tui-events"));
     }
@@ -88,6 +104,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
             strict: options.strict,
             show_progress: options.show_progress,
             tui_events: options.tui_events,
+            cancel: &options.cancel,
         },
         &mut warnings,
         &mut metrics,
@@ -117,7 +134,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
 
     let seen_paths: HashSet<String> = files.iter().map(|file| cache_key(&file.path)).collect();
     let mut groups = group_files_by_size(files);
-    hash_groups_and_update_cache(
+    let hash_result = hash_groups_and_update_cache(
         &mut groups,
         &mut cache,
         &HashOptions {
@@ -126,10 +143,11 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
             tui_events: options.tui_events,
             link_mode: options.link_mode,
             only_sources: options.only_sources,
+            cancel: &options.cancel,
         },
         &mut warnings,
-    )?;
-    if warnings.walk_errors == 0 && warnings.metadata_errors == 0 {
+    );
+    if hash_result.is_ok() && warnings.walk_errors == 0 && warnings.metadata_errors == 0 {
         let pruned = prune_cache(&mut cache, &seen_paths);
         if pruned > 0 {
             logger::info(
@@ -143,7 +161,9 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
             "walk was incomplete; keeping entries for paths not seen this run",
         );
     }
+    // Hashes finished before a cancel or a strict failure are valid: keep them.
     save_cache(&cache_path, &cache)?;
+    hash_result?;
 
     let (table, actions, _total_saved_space) = plan_actions_and_table(&groups);
     let actions = if options.only_sources.is_empty() {
@@ -188,8 +208,12 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
     let out_path = resolve_report_path(downloads, &options);
     let mut report_entries = build_report_entries(&actions, options.link_mode);
 
-    let (applied_actions, strict_link_error) = if options.dry_run {
-        (0usize, None)
+    let ApplyOutcome {
+        applied: applied_actions,
+        strict_error: strict_link_error,
+        cancelled: apply_cancelled,
+    } = if options.dry_run {
+        ApplyOutcome::default()
     } else {
         if options.json_output && options.require_confirm {
             return Err(anyhow!(
@@ -209,14 +233,30 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         apply_actions(
             &actions,
             media,
-            options.strict,
-            options.json_output,
-            options.tui_events,
-            options.link_mode,
+            &ApplyOptions {
+                strict: options.strict,
+                json_output: options.json_output,
+                tui_events: options.tui_events,
+                link_mode: options.link_mode,
+                cancel: &options.cancel,
+            },
             &mut warnings,
             &mut report_entries,
         )
     };
+    if apply_cancelled {
+        let message = format!(
+            "Link cancelled after {applied_actions} of {planned_actions} action(s); the rest stay planned."
+        );
+        logger::info("run", &message);
+        if options.tui_events {
+            let _ = types::emit_tui_event(&TuiEvent::Log {
+                message: message.clone(),
+            });
+        } else if !options.json_output {
+            eprintln!("{} {message}", "⚠".yellow());
+        }
+    }
 
     if !machine_output {
         print_run_summary(

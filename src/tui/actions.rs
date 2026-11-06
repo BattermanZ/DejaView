@@ -1,7 +1,7 @@
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 
 use anyhow::{Context, Result, anyhow};
 
@@ -15,17 +15,28 @@ fn should_forward_terminal_error(status_success: bool, saw_error_event: bool) ->
     !status_success && !saw_error_event
 }
 
+/// Ask the child to stop when the UI sends a cancel. If the sender is dropped
+/// without sending, the child's stdin just closes, which the child ignores.
+fn forward_cancel<W: Write>(cancel_rx: Receiver<()>, mut stdin: W) {
+    if cancel_rx.recv().is_ok() {
+        let _ = stdin.write_all(b"cancel\n");
+        let _ = stdin.flush();
+    }
+}
+
 fn stream_subcommand_events(
     subcommand: &str,
     strict: bool,
     extra_args: &[String],
     tx: Sender<Result<TuiEvent>>,
+    cancel_rx: Receiver<()>,
 ) -> Result<()> {
     let exe = std::env::current_exe().context("resolve current executable")?;
     let mut cmd = Command::new(exe);
     cmd.arg(subcommand)
         .arg("--tui-events")
         .arg("--no-progress")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd.args(extra_args);
@@ -36,6 +47,8 @@ fn stream_subcommand_events(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("execute '{subcommand}' in subprocess"))?;
+    let stdin = child.stdin.take().context("capture subprocess stdin")?;
+    std::thread::spawn(move || forward_cancel(cancel_rx, stdin));
     let stdout = child.stdout.take().context("capture subprocess stdout")?;
     let stderr = child.stderr.take().context("capture subprocess stderr")?;
 
@@ -78,7 +91,7 @@ fn stream_subcommand_events(
         if matches!(event, TuiEvent::Done { .. }) {
             saw_done = true;
         }
-        if matches!(event, TuiEvent::Error { .. }) {
+        if matches!(event, TuiEvent::Error { .. } | TuiEvent::Cancelled) {
             saw_error_event = true;
         }
         let _ = tx.send(Ok(event));
@@ -111,20 +124,26 @@ fn stream_subcommand_events(
     Ok(())
 }
 
-pub fn run_scan(strict: bool, tx: Sender<Result<TuiEvent>>) -> Result<()> {
-    stream_subcommand_events("scan", strict, &[], tx)
+pub fn run_scan(strict: bool, tx: Sender<Result<TuiEvent>>, cancel_rx: Receiver<()>) -> Result<()> {
+    stream_subcommand_events("scan", strict, &[], tx, cancel_rx)
 }
 
-pub fn run_link(strict: bool, tx: Sender<Result<TuiEvent>>) -> Result<()> {
-    stream_subcommand_events("link", strict, &[], tx)
+pub fn run_link(strict: bool, tx: Sender<Result<TuiEvent>>, cancel_rx: Receiver<()>) -> Result<()> {
+    stream_subcommand_events("link", strict, &[], tx, cancel_rx)
 }
 
-pub fn run_link_selected(strict: bool, source: &str, tx: Sender<Result<TuiEvent>>) -> Result<()> {
+pub fn run_link_selected(
+    strict: bool,
+    source: &str,
+    tx: Sender<Result<TuiEvent>>,
+    cancel_rx: Receiver<()>,
+) -> Result<()> {
     stream_subcommand_events(
         "link",
         strict,
         &[String::from("--only-source"), source.to_string()],
         tx,
+        cancel_rx,
     )
 }
 
@@ -210,6 +229,24 @@ mod tests {
         assert_eq!(report.mode, "scan");
         assert_eq!(report.files_considered, 10);
         assert_eq!(report.warning_total(), 0);
+    }
+
+    #[test]
+    fn forward_cancel_writes_cancel_line_when_asked() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(()).expect("send cancel");
+        let mut written = Vec::new();
+        forward_cancel(rx, &mut written);
+        assert_eq!(written, b"cancel\n");
+    }
+
+    #[test]
+    fn forward_cancel_writes_nothing_when_job_ends() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        drop(tx);
+        let mut written = Vec::new();
+        forward_cancel(rx, &mut written);
+        assert!(written.is_empty());
     }
 
     #[test]

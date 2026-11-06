@@ -11,6 +11,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::cancel::{CancelToken, Cancelled};
 use super::linking::plan_hashed_group_actions;
 use super::report::build_report_entries;
 use super::types::emit_tui_event;
@@ -59,11 +60,14 @@ fn emit_hash_progress(done: usize, total: usize, tui_events: bool) {
     }
 }
 
-pub(super) fn full_digest(path: &Path) -> Result<String> {
+/// Full BLAKE3 of a file, checking for cancellation between 1 MiB chunks so a
+/// cancel does not wait for a large file to finish.
+pub(super) fn full_digest(path: &Path, cancel: &CancelToken) -> Result<String> {
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut hasher = Hasher::new();
-    let mut buf = [0u8; 1 << 20];
+    let mut buf = vec![0u8; 1 << 20];
     loop {
+        cancel.check()?;
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
@@ -79,6 +83,7 @@ pub(super) struct HashOptions<'a> {
     pub(super) tui_events: bool,
     pub(super) link_mode: LinkMode,
     pub(super) only_sources: &'a [PathBuf],
+    pub(super) cancel: &'a CancelToken,
 }
 
 /// Hashing work for one size group. Paths that share dev, inode, mtime and ctime
@@ -263,6 +268,7 @@ pub(super) fn hash_groups_and_update_cache(
             let worker = worker_id();
             let mut sample_hashes: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
             for (inode_idx, members) in work.inodes.iter().enumerate() {
+                options.cancel.check()?;
                 let file = &group[members[0]];
                 emit_worker_activity(
                     "hashing_sample",
@@ -335,7 +341,7 @@ pub(super) fn hash_groups_and_update_cache(
 
     // Phase 2: full hash for each colliding physical file not already cached, then
     // copy the hash to every path of that file.
-    groups
+    let full_result = groups
         .par_iter_mut()
         .zip(works.par_iter())
         .zip(full_candidates.into_par_iter())
@@ -356,7 +362,7 @@ pub(super) fn hash_groups_and_update_cache(
                         Some(path.display().to_string()),
                         tui_events,
                     );
-                    let digest_result = full_digest(&path);
+                    let digest_result = full_digest(&path, options.cancel);
                     let done = full_done.fetch_add(1, Ordering::Relaxed) + 1;
                     emit_hash_progress(done as usize, total_full_files, tui_events);
                     if let Some(progress_bar) = &bar {
@@ -366,6 +372,7 @@ pub(super) fn hash_groups_and_update_cache(
 
                     match digest_result {
                         Ok(hash) => hash,
+                        Err(err) if err.is::<Cancelled>() => return Err(err),
                         Err(err) => {
                             full_hash_errors.fetch_add(1, Ordering::Relaxed);
                             if strict {
@@ -383,8 +390,9 @@ pub(super) fn hash_groups_and_update_cache(
             }
             emit_planned_entries(group, options);
             Ok(())
-        })?;
+        });
 
+    // Hashes finished before a cancel or a strict failure are still valid.
     sync_cache(cache, groups);
 
     warnings.sample_hash_errors += sample_hash_errors.load(Ordering::Relaxed);
@@ -393,7 +401,7 @@ pub(super) fn hash_groups_and_update_cache(
         bar.finish_with_message("Hashing complete ✔".green().bold().to_string());
     }
 
-    Ok(())
+    full_result
 }
 
 #[cfg(test)]

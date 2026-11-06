@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use super::cancel::CancelToken;
 use crate::protocol::TuiEvent;
 use serde::{Deserialize, Serialize};
 
@@ -97,6 +98,7 @@ pub struct ScanRunOptions<'a> {
     pub tui_events: bool,
     pub link_mode: LinkMode,
     pub only_sources: &'a [PathBuf],
+    pub cancel: CancelToken,
 }
 
 pub(super) fn emit_tui_event(event: &TuiEvent) -> io::Result<()> {

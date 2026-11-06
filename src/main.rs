@@ -203,6 +203,7 @@ fn main() -> Result<()> {
                     tui_events: output.tui_events,
                     link_mode: effective_link_mode(&config, symlink_only),
                     only_sources: &[],
+                    cancel: run_cancel_token(output.tui_events),
                 },
             )?
         }
@@ -231,6 +232,7 @@ fn main() -> Result<()> {
                     tui_events: output.tui_events,
                     link_mode: effective_link_mode(&config, symlink_only),
                     only_sources: &only_sources,
+                    cancel: run_cancel_token(output.tui_events),
                 },
             )?
         }
@@ -312,6 +314,16 @@ fn command_name(command: &Commands) -> &'static str {
         Commands::Tui { .. } => "tui",
         Commands::TuiLogoPreview => "tui-logo-preview",
     }
+}
+
+/// A run driven by the TUI can be cancelled by a `cancel` line on stdin; any
+/// other run ignores stdin.
+fn run_cancel_token(tui_events: bool) -> engine::CancelToken {
+    let token = engine::CancelToken::default();
+    if tui_events {
+        token.watch(std::io::stdin());
+    }
+    token
 }
 
 fn effective_link_mode(config: &config::Config, symlink_only: bool) -> LinkMode {

@@ -165,6 +165,9 @@ fn display_path(input: &str, max_len: usize, expand: bool) -> String {
 }
 
 fn mode_chip(app: &App) -> (&'static str, Style) {
+    if app.mode_label().eq_ignore_ascii_case("Cancelling") {
+        return ("CANCELLING", Theme::chip_danger());
+    }
     if app.mode_label().eq_ignore_ascii_case("Linking") {
         return ("LINK ACTIVE", Theme::badge_accent());
     }
@@ -224,6 +227,7 @@ fn sidebar_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         key_hint("X", "rescan fresh", false),
         key_hint("l", "link selected", false),
         key_hint("L", "link all", false),
+        key_hint("c", "cancel run", false),
         key_hint("R", "save report", false),
         key_hint("J", "json preview", false),
         key_hint("p", "toggle paths", false),
@@ -386,6 +390,9 @@ fn footer_line() -> Line<'static> {
         Span::raw("  "),
         Span::styled(" L ", Theme::badge()),
         Span::styled("link all", Theme::muted()),
+        Span::raw("  "),
+        Span::styled(" c ", Theme::badge()),
+        Span::styled("cancel", Theme::muted()),
         Span::raw("  "),
         Span::styled(" p ", Theme::badge()),
         Span::styled("paths", Theme::muted()),
@@ -667,7 +674,7 @@ fn render_help_overlay(frame: &mut Frame) {
     let area = centered_rect(78, 72, frame.area());
     frame.render_widget(Clear, area);
     let help = Paragraph::new(
-        "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\np toggle compact/full paths\nj/k move rows\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nX clear cache and rescan\nl confirm and link selected row\nL confirm and run link-all job\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels",
+        "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\np toggle compact/full paths\nj/k move rows\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nX clear cache and rescan\nl confirm and link selected row\nL confirm and run link-all job\nc cancel the running scan or link\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels",
     )
     .block(
         Block::default()

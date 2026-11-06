@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::cache::{clear_cache_file, load_cache, save_cache};
 use super::collect::{CollectOptions, collect_files, collect_run_files, group_files_by_size};
 use super::linking::{
-    apply_actions, ensure_target_within_media_root, plan_group_actions,
+    ApplyOptions, ApplyOutcome, apply_actions, ensure_target_within_media_root, plan_group_actions,
     replace_file_with_best_link_with, replace_file_with_hardlink_and_rename_with,
     replace_file_with_relative_symlink,
 };
@@ -66,6 +66,7 @@ fn run_scan(config: &Config, dry_run: bool, strict: bool, report_path: Option<&P
             tui_events: false,
             link_mode: LinkMode::Best,
             only_sources: &[],
+            cancel: CancelToken::default(),
         },
     )
     .expect("run scan");
@@ -339,8 +340,12 @@ fn collect_files_strict_fails_on_walk_error() {
         &missing,
         true,
         Duration::from_secs(0),
-        true,
-        false,
+        &CollectOptions {
+            strict: true,
+            show_progress: false,
+            tui_events: false,
+            cancel: &CancelToken::default(),
+        },
         &mut warnings,
         &mut metrics,
     );
@@ -372,6 +377,7 @@ fn partially_linked_groups_still_plan_remaining_download_duplicates() {
             strict: false,
             show_progress: false,
             tui_events: false,
+            cancel: &CancelToken::default(),
         },
         &mut warnings,
         &mut metrics,
@@ -525,13 +531,20 @@ fn apply_actions_rejects_source_metadata_change_after_planning() {
 
     let mut warnings = RunWarnings::default();
     let mut report_entries = vec![planned_entry_for(&action)];
-    let (applied, strict_error) = apply_actions(
+    let ApplyOutcome {
+        applied,
+        strict_error,
+        ..
+    } = apply_actions(
         &[action],
         &media,
-        false,
-        true,
-        false,
-        LinkMode::Best,
+        &ApplyOptions {
+            strict: false,
+            json_output: true,
+            tui_events: false,
+            link_mode: LinkMode::Best,
+            cancel: &CancelToken::default(),
+        },
         &mut warnings,
         &mut report_entries,
     );
@@ -598,13 +611,20 @@ fn apply_actions_rejects_target_metadata_change_after_planning() {
 
     let mut warnings = RunWarnings::default();
     let mut report_entries = vec![planned_entry_for(&action)];
-    let (applied, strict_error) = apply_actions(
+    let ApplyOutcome {
+        applied,
+        strict_error,
+        ..
+    } = apply_actions(
         &[action],
         &media,
-        false,
-        true,
-        false,
-        LinkMode::Best,
+        &ApplyOptions {
+            strict: false,
+            json_output: true,
+            tui_events: false,
+            link_mode: LinkMode::Best,
+            cancel: &CancelToken::default(),
+        },
         &mut warnings,
         &mut report_entries,
     );
@@ -696,13 +716,20 @@ fn apply_actions_allow_multiple_sources_for_same_target_in_one_run() {
 
     let mut warnings = RunWarnings::default();
     let mut report_entries = actions.iter().map(planned_entry_for).collect::<Vec<_>>();
-    let (applied, strict_error) = apply_actions(
+    let ApplyOutcome {
+        applied,
+        strict_error,
+        ..
+    } = apply_actions(
         &actions,
         &media,
-        false,
-        true,
-        false,
-        LinkMode::Best,
+        &ApplyOptions {
+            strict: false,
+            json_output: true,
+            tui_events: false,
+            link_mode: LinkMode::Best,
+            cancel: &CancelToken::default(),
+        },
         &mut warnings,
         &mut report_entries,
     );
@@ -841,6 +868,7 @@ fn run_scan_strict_fails_on_sample_hash_error() {
             tui_events: false,
             link_mode: LinkMode::Best,
             only_sources: &[],
+            cancel: CancelToken::default(),
         },
     );
     assert!(strict_result.is_err());
@@ -856,6 +884,7 @@ fn run_scan_strict_fails_on_sample_hash_error() {
             tui_events: false,
             link_mode: LinkMode::Best,
             only_sources: &[],
+            cancel: CancelToken::default(),
         },
     );
     assert!(non_strict_result.is_ok());
@@ -898,6 +927,7 @@ fn run_scan_non_strict_link_failure_continues() {
             tui_events: false,
             link_mode: LinkMode::Best,
             only_sources: &[],
+            cancel: CancelToken::default(),
         },
     );
     assert!(result.is_ok());
@@ -944,6 +974,7 @@ fn run_scan_strict_link_failure_returns_error() {
             tui_events: false,
             link_mode: LinkMode::Best,
             only_sources: &[],
+            cancel: CancelToken::default(),
         },
     );
     assert!(result.is_err());
@@ -1064,13 +1095,16 @@ fn apply_actions_refuses_to_replace_a_file_inside_the_media_root() {
     };
     let mut warnings = RunWarnings::default();
     let mut report_entries = vec![planned_entry_for(&action)];
-    let (applied, _) = apply_actions(
+    let ApplyOutcome { applied, .. } = apply_actions(
         &[action],
         &media,
-        false,
-        true,
-        false,
-        LinkMode::Best,
+        &ApplyOptions {
+            strict: false,
+            json_output: true,
+            tui_events: false,
+            link_mode: LinkMode::Best,
+            cancel: &CancelToken::default(),
+        },
         &mut warnings,
         &mut report_entries,
     );
@@ -1112,8 +1146,12 @@ fn collect_files_skips_dejaview_own_files() {
         &root,
         true,
         Duration::from_secs(0),
-        false,
-        false,
+        &CollectOptions {
+            strict: false,
+            show_progress: false,
+            tui_events: false,
+            cancel: &CancelToken::default(),
+        },
         &mut warnings,
         &mut metrics,
     )
@@ -1187,4 +1225,101 @@ fn prune_cache_keeps_only_seen_paths() {
     assert_eq!(pruned, 1);
     assert!(!cache.contains_key("/dl/b"));
     assert_eq!(cache.len(), 2);
+}
+
+#[test]
+fn cancelled_link_run_returns_cancelled_and_changes_nothing() {
+    let root = unique_temp_dir("cancelled_run");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_file(&downloads.join("movie.mkv"), b"same-content");
+    write_file(&media.join("movie.mkv"), b"same-content");
+    let download_inode = fs::metadata(downloads.join("movie.mkv"))
+        .expect("meta")
+        .ino();
+    let config = make_config(&downloads, &media, 0);
+    let cancel = CancelToken::default();
+    cancel.cancel();
+
+    let err = run_scan_with_options(
+        &config,
+        ScanRunOptions {
+            dry_run: false,
+            strict: false,
+            report_path: None,
+            json_output: false,
+            show_progress: false,
+            require_confirm: false,
+            tui_events: false,
+            link_mode: LinkMode::Best,
+            only_sources: &[],
+            cancel,
+        },
+    )
+    .expect_err("a cancelled run returns an error");
+
+    assert!(err.is::<Cancelled>());
+    assert_eq!(
+        fs::metadata(downloads.join("movie.mkv"))
+            .expect("meta")
+            .ino(),
+        download_inode
+    );
+    assert!(!downloads.join(".dejaview_link_report.json").exists());
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn apply_actions_stops_before_the_next_file_when_cancelled() {
+    let root = unique_temp_dir("cancelled_apply");
+    let src = root.join("downloads").join("movie.mkv");
+    let tgt = root.join("media").join("movie.mkv");
+    write_file(&src, b"same-content");
+    write_file(&tgt, b"same-content");
+    let src_inode = fs::metadata(&src).expect("meta").ino();
+    let action = super::types::LinkAction {
+        src: src.clone(),
+        tgt: tgt.clone(),
+        size: 12,
+        src_snapshot: snapshot_of(&src),
+        tgt_snapshot: snapshot_of(&tgt),
+    };
+    let cancel = CancelToken::default();
+    cancel.cancel();
+    let mut warnings = RunWarnings::default();
+    let mut report_entries = vec![planned_entry_for(&action)];
+
+    let outcome = apply_actions(
+        &[action],
+        &root.join("media"),
+        &ApplyOptions {
+            strict: false,
+            json_output: true,
+            tui_events: false,
+            link_mode: LinkMode::Best,
+            cancel: &cancel,
+        },
+        &mut warnings,
+        &mut report_entries,
+    );
+
+    assert!(outcome.cancelled);
+    assert_eq!(outcome.applied, 0);
+    assert_eq!(report_entries[0].status, "planned");
+    assert_eq!(fs::metadata(&src).expect("meta").ino(), src_inode);
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn full_digest_stops_when_cancelled() {
+    let root = unique_temp_dir("cancelled_digest");
+    let path = root.join("big.bin");
+    write_file(&path, &[1u8; 4096]);
+    let cancel = CancelToken::default();
+    cancel.cancel();
+
+    let err = super::hashing::full_digest(&path, &cancel).expect_err("cancelled digest");
+
+    assert!(err.is::<Cancelled>());
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

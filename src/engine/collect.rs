@@ -7,15 +7,17 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 use walkdir::{DirEntry, WalkDir};
 
+use super::cancel::CancelToken;
 use super::types::emit_tui_event;
 use super::types::{FileInfo, RunMetrics, RunWarnings};
 use crate::protocol::TuiEvent;
 
 #[derive(Copy, Clone)]
-pub(super) struct CollectOptions {
+pub(super) struct CollectOptions<'a> {
     pub strict: bool,
     pub show_progress: bool,
     pub tui_events: bool,
+    pub cancel: &'a CancelToken,
 }
 
 fn is_regular(entry: &DirEntry) -> bool {
@@ -35,14 +37,17 @@ pub(super) fn collect_files(
     root: &Path,
     in_downloads: bool,
     min_age: Duration,
-    strict: bool,
-    tui_events: bool,
+    options: &CollectOptions<'_>,
     warnings: &mut RunWarnings,
     metrics: &mut RunMetrics,
 ) -> Result<Vec<FileInfo>> {
+    let CollectOptions {
+        strict, tui_events, ..
+    } = *options;
     let deadline = SystemTime::now() - min_age;
     let mut files = Vec::new();
     for entry in WalkDir::new(root).follow_links(false).into_iter() {
+        options.cancel.check()?;
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
@@ -120,7 +125,7 @@ pub(super) fn collect_run_files(
     downloads: &Path,
     media: &Path,
     min_age: Duration,
-    options: CollectOptions,
+    options: CollectOptions<'_>,
     warnings: &mut RunWarnings,
     metrics: &mut RunMetrics,
 ) -> Result<Vec<FileInfo>> {
@@ -139,24 +144,8 @@ pub(super) fn collect_run_files(
         None
     };
 
-    let mut files = collect_files(
-        downloads,
-        true,
-        min_age,
-        options.strict,
-        options.tui_events,
-        warnings,
-        metrics,
-    )?;
-    let media_files = collect_files(
-        media,
-        false,
-        min_age,
-        options.strict,
-        options.tui_events,
-        warnings,
-        metrics,
-    )?;
+    let mut files = collect_files(downloads, true, min_age, &options, warnings, metrics)?;
+    let media_files = collect_files(media, false, min_age, &options, warnings, metrics)?;
     files.extend(media_files);
 
     if let Some(spinner) = spinner {

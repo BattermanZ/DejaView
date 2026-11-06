@@ -70,6 +70,8 @@ pub enum TuiEvent {
     Error {
         message: String,
     },
+    /// The run stopped on request before changing anything.
+    Cancelled,
 }
 
 impl RunReport {
