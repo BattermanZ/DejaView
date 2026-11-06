@@ -58,12 +58,43 @@ pub enum LinkCheck {
     Untested,
     Testing,
     Hardlinks,
-    /// The test failed, so link runs will make symlinks; `cause` says why.
+    /// The test failed, so link runs will make symlinks; `cause` says why,
+    /// in words a person can act on.
     Symlinks {
-        cause: String,
+        cause: &'static str,
     },
     /// The library holds no file to try with yet.
     NoLibraryFile,
+    /// The link mode is symlink-only, so there is nothing to test.
+    SymlinkOnly,
+    /// The folders reach each other through a second mount, so no test file
+    /// was made; `reason` says how.
+    Refused {
+        reason: String,
+    },
+}
+
+impl LinkCheck {
+    /// What link runs will make, in one line, once a test has an answer.
+    pub fn summary(&self) -> Option<String> {
+        Some(match self {
+            Self::Untested => return None,
+            Self::Testing => "Testing a hardlink between the folders…".to_string(),
+            Self::Hardlinks => {
+                "A test hardlink worked: the folders share a filesystem, so links free space"
+                    .to_string()
+            }
+            Self::Symlinks { cause } => format!(
+                "A test hardlink failed ({}): links will be symlinks",
+                cause.split(':').next().unwrap_or(cause)
+            ),
+            Self::NoLibraryFile => "No library file to test a hardlink with yet".to_string(),
+            Self::SymlinkOnly => {
+                "The link mode is symlink-only: links will be symlinks".to_string()
+            }
+            Self::Refused { reason } => format!("No test hardlink made: {reason}"),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,6 +153,8 @@ pub struct App {
     threads: usize,
     full_threads: usize,
     link_mode: LinkMode,
+    /// The names every walk leaves out, for the check before a test hardlink.
+    exclude: Vec<String>,
     expand_paths: bool,
     current_phase: Option<String>,
     current_path: Option<String>,
@@ -141,7 +174,7 @@ pub struct App {
     last_run_duration: Option<Duration>,
     running_job: Option<RunningJob>,
     link_check: LinkCheck,
-    link_check_rx: Option<Receiver<(LinkCheck, Option<String>)>>,
+    link_check_rx: Option<Receiver<(LinkCheck, Vec<String>)>>,
     should_quit: bool,
 }
 
@@ -166,6 +199,7 @@ impl App {
             threads: config.effective_threads(),
             full_threads: config.effective_full_threads(),
             link_mode: config.link_mode.unwrap_or(LinkMode::Best),
+            exclude: config.effective_exclude(),
             expand_paths: false,
             current_phase: None,
             current_path: None,
@@ -212,23 +246,6 @@ impl App {
         Ok(())
     }
 
-    pub fn mode_label(&self) -> &str {
-        if let Some(job) = &self.running_job {
-            if job.cancel_requested {
-                return "Cancelling";
-            }
-            return match job.kind {
-                JobKind::Scan => "Scanning",
-                JobKind::LinkAll | JobKind::LinkSelected(_) => "Linking",
-            };
-        }
-        match &self.report {
-            Some(report) if report.mode == "link" => "Link",
-            Some(_) => "Scan",
-            None => "Idle",
-        }
-    }
-
     pub fn files_considered(&self) -> usize {
         self.live_files_seen
             .or_else(|| self.report.as_ref().map(|r| r.files_considered))
@@ -243,20 +260,6 @@ impl App {
                         r.entries.iter().filter(|entry| entry.is_planned()).count()
                     } else {
                         r.planned_actions
-                    }
-                })
-            })
-            .unwrap_or(0)
-    }
-
-    pub fn applied_actions(&self) -> usize {
-        self.live_applied_actions
-            .or_else(|| {
-                self.report.as_ref().map(|r| {
-                    if r.mode == "link" {
-                        r.entries.iter().filter(|entry| entry.is_applied()).count()
-                    } else {
-                        r.applied_actions
                     }
                 })
             })
@@ -499,6 +502,13 @@ impl App {
 
     pub fn has_report(&self) -> bool {
         self.report.is_some()
+    }
+
+    /// The running job was asked to stop and has not yet.
+    pub fn cancelling(&self) -> bool {
+        self.running_job
+            .as_ref()
+            .is_some_and(|job| job.cancel_requested)
     }
 
     pub fn link_check(&self) -> &LinkCheck {
@@ -896,41 +906,42 @@ impl App {
     }
 
     /// Try one hardlink between the saved folders, off the UI thread.
+    /// Try one hardlink between the saved folders, off the UI thread, as
+    /// `config validate` does: only once a walk has found that neither
+    /// folder reaches the other through a second mount, so the test file is
+    /// never made inside the library.
     fn start_link_check(&mut self) {
         let (Some(downloads), Some(media)) = (self.downloads.clone(), self.media.clone()) else {
             return;
         };
+        if self.link_mode == LinkMode::SymlinkOnly {
+            self.link_check = LinkCheck::SymlinkOnly;
+            self.link_check_rx = None;
+            return;
+        }
         self.link_check = LinkCheck::Testing;
-        self.link_check_rx = Some(actions::spawn_link_check(downloads, media));
+        self.link_check_rx = Some(actions::spawn_link_check(
+            downloads,
+            media,
+            self.exclude.clone(),
+        ));
     }
 
     fn poll_link_check(&mut self) {
         let Some(receiver) = &self.link_check_rx else {
             return;
         };
-        let (check, warning) = match receiver.try_recv() {
+        let (check, lines) = match receiver.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => (LinkCheck::Untested, None),
+            Err(TryRecvError::Disconnected) => (
+                LinkCheck::Untested,
+                vec!["The test hardlink stopped before it could say how it went.".to_string()],
+            ),
         };
         self.link_check_rx = None;
-        let line = match &check {
-            LinkCheck::Hardlinks => {
-                Some("A test hardlink worked: link runs will free space.".to_string())
-            }
-            LinkCheck::Symlinks { cause } => Some(format!(
-                "A test hardlink failed: {cause}. Link runs will make symlinks, which break if a library file is renamed, upgraded or deleted."
-            )),
-            LinkCheck::NoLibraryFile => {
-                Some("No library file to test a hardlink with yet.".to_string())
-            }
-            LinkCheck::Untested | LinkCheck::Testing => None,
-        };
-        if let Some(line) = line {
+        for line in lines {
             self.push_log(line);
-        }
-        if let Some(warning) = warning {
-            self.push_log(warning);
         }
         self.link_check = check;
     }
@@ -961,6 +972,7 @@ impl App {
         self.media = config.media.clone();
         self.min_size = config.effective_min_size();
         self.link_mode = config.link_mode.unwrap_or(LinkMode::Best);
+        self.exclude = config.effective_exclude();
         self.overlay = Overlay::None;
         self.push_log("Saved TUI path configuration.".to_string());
         Ok(())
@@ -1516,6 +1528,19 @@ impl App {
         let (cancel_tx, cancel_rx) = mpsc::channel();
         self.running_job = Some(RunningJob::new(JobKind::Scan, rx, cancel_tx));
         cancel_rx
+    }
+
+    /// A link run partway through applying: `applied` of `planned` linked.
+    pub(crate) fn set_running_link_for_test(&mut self, applied: usize, planned: usize) {
+        let (_tx, rx) = mpsc::channel();
+        self.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, mpsc::channel().0));
+        self.current_phase = Some("applying".to_string());
+        self.live_applied_actions = Some(applied);
+        self.live_planned_actions = Some(planned);
+    }
+
+    pub(crate) fn set_last_run_for_test(&mut self, duration: Duration) {
+        self.last_run_duration = Some(duration);
     }
 
     pub(crate) fn set_report_for_test(&mut self, report: RunReport) {
@@ -2087,7 +2112,7 @@ mod tests {
         assert!(app.running_job.is_none());
         assert!(app.rows().is_empty());
         assert_eq!(app.planned_actions(), 0);
-        assert_eq!(app.applied_actions(), 0);
+        assert_eq!(app.live_applied_actions, None);
         assert!(
             app.logs
                 .iter()
@@ -2344,7 +2369,7 @@ mod tests {
         app.handle_main_key(KeyCode::Char('c')).expect("key");
 
         assert_eq!(cancel_rx.try_iter().count(), 1);
-        assert_eq!(app.mode_label(), "Cancelling");
+        assert!(app.cancelling());
         assert!(
             app.logs
                 .iter()
@@ -2372,7 +2397,7 @@ mod tests {
 
         assert!(app.running_job.is_none());
         assert!(app.rows().is_empty());
-        assert_eq!(app.mode_label(), "Idle");
+        assert!(!app.is_running() && !app.has_report());
         assert!(
             app.logs
                 .iter()
@@ -2669,7 +2694,7 @@ mod tests {
         app.poll_running_job();
 
         assert_eq!(app.rows().len(), 2);
-        assert_eq!(app.applied_actions(), 1);
+        assert_eq!(app.rows().iter().filter(|row| row.is_applied()).count(), 1);
         assert_eq!(app.planned_actions(), 1);
         assert_eq!(app.rows()[0].status, "applied");
         assert_eq!(app.rows()[1].status, "planned");

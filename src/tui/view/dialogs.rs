@@ -7,8 +7,8 @@ use ratatui::prelude::*;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
-use super::pairs::{LinkKind, short_cause};
-use super::{format_bytes, pad, trim_keep_name, wrap_text};
+use super::pairs::{LinkKind, Tally};
+use super::{SYMLINK_BREAKS, format_bytes, pad, sentence, trim_keep_name, wrap_text};
 use crate::tui::app::{App, ConfigEditor, ConfigField, ConfirmLinkMode, LinkCheck};
 use crate::tui::theme::Theme;
 
@@ -120,6 +120,11 @@ fn help_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             "not linked yet: becomes a hardlink, or a symlink across filesystems",
         ),
         (
+            LinkKind::PlannedSymlink,
+            "Planned",
+            "not linked yet, and to become a symlink: the two are on different filesystems, or the link mode is symlink-only",
+        ),
+        (
             LinkKind::Hardlink,
             "Hardlink",
             "one file on disk under both names; the torrent keeps seeding",
@@ -147,11 +152,7 @@ fn help_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     ];
     let indent = 9 + 2 + 15;
     for (kind, name, meaning) in legend {
-        let style = if kind == LinkKind::Already {
-            Theme::faint()
-        } else {
-            kind.style()
-        };
+        let style = kind.style();
         let wrapped = wrap_text(meaning, width.saturating_sub(indent).max(12));
         for (index, part) in wrapped.into_iter().enumerate() {
             let mut spans = if index == 0 {
@@ -303,42 +304,24 @@ fn render_scrolling(
 
 /// What the test hardlink between the saved folders showed, for the editor.
 fn link_check_lines(check: &LinkCheck, width: usize) -> Vec<Line<'static>> {
-    let dim = Theme::popup_dim();
-    match check {
-        LinkCheck::Untested => plain(
+    let Some(summary) = check.summary() else {
+        return plain(
             "Saving tries one hardlink between the two folders, to tell whether links will be hardlinks or symlinks.",
             width,
-            dim,
-        ),
-        LinkCheck::Testing => plain("Testing a hardlink between the saved folders…", width, dim),
-        LinkCheck::Hardlinks => {
-            let mut lines = plain(
-                "  Saved folders: a test hardlink worked, so links will be hardlinks and free space.",
-                width,
-                Theme::popup(),
-            );
-            if let Some(first) = lines.first_mut() {
-                first.spans[0].content = first.spans[0].content.replacen("  ", "", 1).into();
-                first
-                    .spans
-                    .insert(0, Span::styled("✓ ", Theme::on_popup(Theme::hardlinked())));
-            }
-            lines
+            Theme::popup_dim(),
+        );
+    };
+    let (mark, style) = match check {
+        LinkCheck::Hardlinks => ("✓ ", Theme::on_popup(Theme::hardlinked())),
+        LinkCheck::Symlinks { .. } | LinkCheck::SymlinkOnly => {
+            ("! ", Theme::on_popup(Theme::symlinked()))
         }
-        LinkCheck::Symlinks { cause } => plain(
-            &format!(
-                "! Saved folders: a test hardlink failed ({}), so links will be symlinks, which break if a library file is renamed, upgraded or deleted.",
-                short_cause(cause)
-            ),
-            width,
-            Theme::on_popup(Theme::symlinked()),
-        ),
-        LinkCheck::NoLibraryFile => plain(
-            "Saved folders: no library file to test a hardlink with yet.",
-            width,
-            dim,
-        ),
-    }
+        LinkCheck::Refused { .. } => ("! ", Theme::on_popup(Theme::failed())),
+        LinkCheck::Untested | LinkCheck::Testing | LinkCheck::NoLibraryFile => {
+            ("", Theme::popup_dim())
+        }
+    };
+    plain(&format!("{mark}Saved folders: {summary}."), width, style)
 }
 
 /// A field of the editor: its name and what it is for, then its text, the
@@ -352,10 +335,12 @@ fn field(name: &str, purpose: &str, value: &str, active: bool, width: usize) -> 
         ),
     ]);
     let room = width.saturating_sub(3);
-    let count = value.chars().count();
-    let shown: String = if count > room {
-        let tail: String = value.chars().skip(count - (room - 1)).collect();
-        format!("…{tail}")
+    let shown = if super::width_of(value) > room {
+        // The end of what is typed stays in view.
+        match room {
+            0 => String::new(),
+            _ => format!("…{}", super::tail_fitting(value, room - 1)),
+        }
     } else {
         value.to_string()
     };
@@ -420,25 +405,31 @@ pub(super) fn render_config_editor(frame: &mut Frame, app: &App, editor: &Config
 
 pub(super) fn render_confirm_link(frame: &mut Frame, app: &App, mode: ConfirmLinkMode) {
     let screen = frame.area();
-    let symlinks = match app.link_check() {
-        LinkCheck::Symlinks { cause } => Some(short_cause(cause).to_string()),
-        _ => None,
-    };
     let (title, text, answer) = match mode {
         ConfirmLinkMode::All => {
             let pairs = app.reviewed_planned_pairs().len();
-            let bytes: u64 = app
-                .rows()
-                .iter()
-                .filter(|row| row.is_planned())
-                .map(|row| row.size)
-                .sum();
+            let tally = Tally::of(app.rows());
+            let (hardlinks, symlinks) = (
+                tally.count(LinkKind::Planned),
+                tally.count(LinkKind::PlannedSymlink),
+            );
+            // A scan counts a cross-seeded download once, as the header does.
+            let bytes = if app.showing_link_report() {
+                tally.bytes(LinkKind::Planned) + tally.bytes(LinkKind::PlannedSymlink)
+            } else {
+                app.potential_saved_bytes()
+            };
             let with_errors = app.rows().iter().filter(|row| row.error.is_some()).count();
-            let how = match &symlinks {
-                Some(cause) => format!(
-                    "A test hardlink failed here ({cause}), so each download becomes a symlink to its library file. A symlink breaks if that file is renamed, upgraded or deleted."
+            let how = match (hardlinks, symlinks) {
+                (_, 0) => "Each download becomes a hardlink to its library file: one file on disk, and the torrent keeps seeding. If a hardlink fails, that download becomes a symlink instead.".to_string(),
+                (0, _) => format!(
+                    "Each download becomes a symlink to its library file, as the plan says: the two are on different filesystems, or the link mode is symlink-only. {SYMLINK_BREAKS}"
                 ),
-                None => "Each download becomes a hardlink to its library file: one file on disk, and the torrent keeps seeding. Where the two are on different filesystems it becomes a symlink instead.".to_string(),
+                (hardlinks, symlinks) => format!(
+                    "Hardlinks: {hardlinks} {}, one file on disk each, and the torrents keep seeding. Symlinks: {symlinks} {}, as the plan says for each: the two are on different filesystems, or the link mode is symlink-only. {SYMLINK_BREAKS}",
+                    if hardlinks == 1 { "pair" } else { "pairs" },
+                    if symlinks == 1 { "pair" } else { "pairs" },
+                ),
             };
             let mut text = format!(
                 "{how}\n\nOnly the pairs this scan showed are linked: files found since are left alone, and so is a pair whose files changed.\n\n{pairs} {}, {} to free",
@@ -472,13 +463,20 @@ pub(super) fn render_confirm_link(frame: &mut Frame, app: &App, mode: ConfirmLin
                     .to_string()
             });
             let target = entry.map_or_else(String::new, |entry| entry.target.clone());
-            let kind = if symlinks.is_some() {
-                "symlink"
+            let symlink =
+                entry.is_some_and(|entry| LinkKind::of(entry) == LinkKind::PlannedSymlink);
+            let risk = if symlink {
+                let reason = entry
+                    .and_then(|entry| entry.fallback_reason.as_deref())
+                    .map(|reason| format!("{} ", sentence(reason)))
+                    .unwrap_or_default();
+                format!("{reason}{SYMLINK_BREAKS}")
             } else {
-                "hardlink"
+                "If the hardlink fails, it becomes a symlink instead.".to_string()
             };
             let text = format!(
-                "{name}\n\nbecomes a {kind} to\n\n{}\n\n{} still planned in all.",
+                "{name}\n\nbecomes a {} to\n\n{}\n\n{risk}\n\n{} still planned in all.",
+                if symlink { "symlink" } else { "hardlink" },
                 trim_keep_name(&target, 76),
                 app.planned_actions()
             );
@@ -568,6 +566,54 @@ mod tests {
     }
 
     #[test]
+    fn link_all_counts_a_cross_seeded_download_once_as_the_header_does() {
+        let mut app = app_with_episodes(2);
+        // Two paths of one download: the scan counts its bytes once.
+        let mut report = crate::protocol::RunReport {
+            mode: "scan".to_string(),
+            planned_actions: 2,
+            total_saved_bytes: 1_500_000_000,
+            entries: app.rows().to_vec(),
+            ..Default::default()
+        };
+        report.entries[1].size = 1_500_000_000;
+        app.set_report_for_test(report);
+        press(&mut app, KeyCode::Char('L'));
+        let text = screen(&app, 120, 40);
+        assert!(text.contains("2 pairs, 1.4 GiB to free"), "{text}");
+    }
+
+    #[test]
+    fn link_all_says_which_pairs_become_symlinks() {
+        let mut app = app_with_episodes(2);
+        let mut entries = app.rows().to_vec();
+        entries[1].method = Some("symlink".to_string());
+        app.set_report_for_test(crate::protocol::RunReport {
+            mode: "scan".to_string(),
+            planned_actions: 2,
+            total_saved_bytes: 3_000_000_000,
+            entries,
+            ..Default::default()
+        });
+        press(&mut app, KeyCode::Char('L'));
+        let text = screen(&app, 120, 40);
+        let joined: String = text.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+        assert!(joined.contains("Hardlinks: 1 pair"), "{text}");
+        assert!(joined.contains("Symlinks: 1 pair"), "{text}");
+        assert!(joined.contains("A symlink breaks"), "{text}");
+    }
+
+    #[test]
+    fn the_folder_editor_survives_a_terminal_too_narrow_for_its_fields() {
+        let mut app = App::new(&crate::config::Config::default(), false);
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Char('/'));
+        for cols in 1..=10 {
+            screen(&app, cols, 12);
+        }
+    }
+
+    #[test]
     fn the_rescan_question_fits_a_small_terminal() {
         let mut app = app_with_episodes(1);
         press(&mut app, KeyCode::Char('x'));
@@ -653,11 +699,11 @@ mod tests {
         let text = screen(&app, 120, 40);
         assert!(text.contains("Saving tries one hardlink"), "{text}");
         app.set_link_check_for_test(LinkCheck::Symlinks {
-            cause: "different filesystems: two disks".to_string(),
+            cause: "different filesystems: two disks",
         });
         let text = screen(&app, 120, 40);
         assert!(
-            text.contains("a test hardlink failed (different filesystems)"),
+            text.contains("A test hardlink failed (different filesystems)"),
             "{text}"
         );
         assert!(text.contains("links will be symlinks"), "{text}");

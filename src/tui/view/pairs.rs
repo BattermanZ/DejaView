@@ -9,10 +9,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::{
-    cut, format_bytes, group_digits, line_width, pad, pad_left, row_path, rule, take_top,
-    trim_keep_name, visible_row_window,
+    SYMLINK_BREAKS, cut, format_bytes, group_digits, line_width, pad, pad_left, row_path, rule,
+    sentence, take_top, trim_keep_name, visible_row_window,
 };
-use crate::tui::app::{App, LinkCheck};
+use crate::tui::app::App;
 use crate::tui::layout;
 use crate::tui::model::LinkReportEntry;
 use crate::tui::theme::Theme;
@@ -20,8 +20,11 @@ use crate::tui::theme::Theme;
 /// What became of a pair, as its link column draws it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum LinkKind {
-    /// Not linked yet.
+    /// Not linked yet: a hardlink is tried first.
     Planned,
+    /// Not linked yet, and to become a symlink: the two files are on
+    /// different devices, or the link mode is symlink-only.
+    PlannedSymlink,
     /// One file on disk under both names.
     Hardlink,
     /// The download points at the library file.
@@ -34,6 +37,8 @@ pub(super) enum LinkKind {
 }
 
 impl LinkKind {
+    const ALL: usize = 7;
+
     pub(super) fn of(entry: &LinkReportEntry) -> Self {
         if entry.is_failed() {
             Self::Failed
@@ -45,9 +50,16 @@ impl LinkKind {
             Self::Symlink
         } else if entry.is_applied() {
             Self::Hardlink
+        } else if entry.method.as_deref() == Some("symlink") {
+            Self::PlannedSymlink
         } else {
             Self::Planned
         }
+    }
+
+    /// Not linked yet, whatever it will become.
+    pub(super) fn is_planned(self) -> bool {
+        matches!(self, Self::Planned | Self::PlannedSymlink)
     }
 
     /// The link column's drawing: nine cells wide, or five on a narrow
@@ -56,6 +68,8 @@ impl LinkKind {
         match (self, wide) {
             (Self::Planned, true) => "╌╌╌╌○╌╌╌╌",
             (Self::Planned, false) => "╌╌○╌╌",
+            (Self::PlannedSymlink, true) => "╌╌╌╌╌╌╌╌▷",
+            (Self::PlannedSymlink, false) => "╌╌╌╌▷",
             (Self::Hardlink | Self::Already, true) => "━━━━●━━━━",
             (Self::Hardlink | Self::Already, false) => "━━●━━",
             (Self::Symlink, true) => "────────▶",
@@ -71,6 +85,7 @@ impl LinkKind {
     pub(super) fn glyph(self) -> &'static str {
         match self {
             Self::Planned => "╌○╌",
+            Self::PlannedSymlink => "╌╌▷",
             Self::Hardlink | Self::Already => "━●━",
             Self::Symlink => "──▶",
             Self::Failed => "─✗ ",
@@ -80,7 +95,7 @@ impl LinkKind {
 
     pub(super) fn style(self) -> Style {
         match self {
-            Self::Planned => Theme::planned(),
+            Self::Planned | Self::PlannedSymlink => Theme::planned(),
             Self::Hardlink => Theme::hardlinked(),
             Self::Symlink => Theme::symlinked(),
             Self::Failed => Theme::failed(),
@@ -101,37 +116,26 @@ impl LinkKind {
 /// How many pairs, and how many bytes, each kind holds.
 #[derive(Default)]
 pub(super) struct Tally {
-    counts: [(usize, u64); 6],
+    counts: [(usize, u64); LinkKind::ALL],
 }
 
 impl Tally {
     pub(super) fn of(rows: &[LinkReportEntry]) -> Self {
         let mut tally = Self::default();
         for row in rows {
-            let slot = &mut tally.counts[Self::slot(LinkKind::of(row))];
+            let slot = &mut tally.counts[LinkKind::of(row) as usize];
             slot.0 += 1;
             slot.1 += row.size;
         }
         tally
     }
 
-    fn slot(kind: LinkKind) -> usize {
-        match kind {
-            LinkKind::Planned => 0,
-            LinkKind::Hardlink => 1,
-            LinkKind::Symlink => 2,
-            LinkKind::Failed => 3,
-            LinkKind::Already => 4,
-            LinkKind::Skipped => 5,
-        }
-    }
-
     pub(super) fn count(&self, kind: LinkKind) -> usize {
-        self.counts[Self::slot(kind)].0
+        self.counts[kind as usize].0
     }
 
     pub(super) fn bytes(&self, kind: LinkKind) -> u64 {
-        self.counts[Self::slot(kind)].1
+        self.counts[kind as usize].1
     }
 }
 
@@ -150,10 +154,12 @@ enum Item {
     },
 }
 
-/// The download's folder below the downloads folder, if it is in one.
-fn download_folder<'a>(app: &App, entry: &'a LinkReportEntry) -> Option<&'a str> {
+/// The release folder a download sits in: its first folder below the
+/// downloads folder, if it is in one. Rows come in path order, so every
+/// file of a release, in subfolders too, comes in one run.
+fn release_folder<'a>(app: &App, entry: &'a LinkReportEntry) -> Option<&'a str> {
     row_path(&entry.source, app.downloads_root(), false)
-        .rsplit_once('/')
+        .split_once('/')
         .map(|(folder, _)| folder)
 }
 
@@ -179,19 +185,19 @@ fn shared_library_folder(app: &App, rows: &[LinkReportEntry]) -> String {
 }
 
 /// The pairs in order, a season's episodes under their release folder: two
-/// or more rows in a row that share a download folder. Full paths show no
-/// folders, since each row then names its own.
+/// or more rows in a row that share one. Full paths show no folders, since
+/// each row then names its own.
 fn items(app: &App) -> Vec<Item> {
     let rows = app.rows();
     let mut items = Vec::new();
     let mut start = 0;
     while start < rows.len() {
         let folder = (!app.expand_paths())
-            .then(|| download_folder(app, &rows[start]))
+            .then(|| release_folder(app, &rows[start]))
             .flatten();
         let mut end = start + 1;
         if let Some(folder) = folder {
-            while end < rows.len() && download_folder(app, &rows[end]) == Some(folder) {
+            while end < rows.len() && release_folder(app, &rows[end]) == Some(folder) {
                 end += 1;
             }
         }
@@ -224,10 +230,10 @@ fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// The download as its row names it: the file name when its folder only
-/// repeats it, as a release's does, else its path below the downloads
-/// folder when that fits in `width`, else the file name; the whole path
-/// with `p`.
+/// The download as its row names it: under a release folder's heading, its
+/// path below that folder; else the file name when its folder only repeats
+/// it, as a release's does, or its path below the downloads folder when that
+/// fits in `width`, or else the file name; the whole path with `p`.
 fn download_text(app: &App, entry: &LinkReportEntry, nested: bool, width: usize) -> String {
     let path = row_path(&entry.source, app.downloads_root(), app.expand_paths());
     if app.expand_paths() {
@@ -235,9 +241,13 @@ fn download_text(app: &App, entry: &LinkReportEntry, nested: bool, width: usize)
     }
     let name = file_name(path);
     if nested {
-        return name.to_string();
+        // Below its release folder, which the heading above names.
+        return path
+            .split_once('/')
+            .map_or(path, |(_, below)| below)
+            .to_string();
     }
-    if path.chars().count() > width {
+    if super::width_of(path) > width {
         return name.to_string();
     }
     match path.rsplit_once('/') {
@@ -261,7 +271,7 @@ fn library_text(app: &App, entry: &LinkReportEntry, nested: bool, width: usize) 
     if app.expand_paths() {
         return path.to_string();
     }
-    if nested || path.chars().count() > width {
+    if nested || super::width_of(path) > width {
         file_name(path).to_string()
     } else {
         path.to_string()
@@ -399,21 +409,18 @@ pub(super) fn render_pairs(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let items = items(app);
-    let capacity = usize::from(list.height);
-    app.view_sizes().result_rows.set(capacity);
     let selected = items
         .iter()
         .position(|item| matches!(item, Item::Pair { index, .. } if *index == app.selected_row()))
         .unwrap_or(0);
-    let (mut start, mut end) = visible_row_window(items.len(), selected, capacity);
-    if start == selected
-        && start > 0
-        && end - start > 1
-        && let Item::Folder { .. } = items[start - 1]
-    {
-        start -= 1;
-        end -= 1;
-    }
+    let (start, end) = visible_row_window(items.len(), selected, usize::from(list.height));
+    // PgUp and PgDn move by the pairs on screen, not the lines, so a page
+    // of release headings skips no pair.
+    let pairs_shown = items[start..end]
+        .iter()
+        .filter(|item| matches!(item, Item::Pair { .. }))
+        .count();
+    app.view_sizes().result_rows.set(pairs_shown.max(1));
 
     let rows = app.rows();
     let lines: Vec<Line> = items[start..end]
@@ -457,7 +464,7 @@ pub(super) fn render_pairs(frame: &mut Frame, area: Rect, app: &App) {
                 if selected {
                     style = style.add_modifier(Modifier::BOLD);
                 }
-                let library_style = if kind == LinkKind::Planned && !selected {
+                let library_style = if kind.is_planned() && !selected {
                     Theme::muted()
                 } else {
                     kind.text_style()
@@ -493,12 +500,10 @@ pub(super) fn render_pairs(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// What the selected pair's link is, or will be.
-fn link_sentence(kind: LinkKind, check: &LinkCheck) -> &'static str {
+fn link_sentence(kind: LinkKind) -> &'static str {
     match kind {
-        LinkKind::Planned => match check {
-            LinkCheck::Symlinks { .. } => "becomes a symlink to",
-            _ => "becomes a hardlink to",
-        },
+        LinkKind::Planned => "becomes a hardlink to",
+        LinkKind::PlannedSymlink => "becomes a symlink to",
         LinkKind::Hardlink => "is a hardlink to",
         LinkKind::Symlink => "is a symlink to",
         LinkKind::Failed => "was not linked to",
@@ -507,40 +512,32 @@ fn link_sentence(kind: LinkKind, check: &LinkCheck) -> &'static str {
     }
 }
 
-/// What the person should know about the selected pair, and in what colour.
-fn note(entry: &LinkReportEntry, kind: LinkKind, check: &LinkCheck) -> (String, Style) {
-    const BREAKS: &str = "A symlink breaks if the library file is renamed, upgraded or deleted.";
+/// What the person should know about the selected pair, and in what
+/// colour: each symlink's reason, as the plan or the run gave it, comes with
+/// what a symlink risks.
+fn note(entry: &LinkReportEntry, kind: LinkKind) -> (String, Style) {
+    let reason = entry.fallback_reason.as_deref().map(sentence);
+    let reason_and = |rest: &str| match &reason {
+        Some(reason) => format!("{reason} {rest}"),
+        None => rest.to_string(),
+    };
     match kind {
-        LinkKind::Planned => match check {
-            LinkCheck::Hardlinks => (
-                "One file on disk under both names, and the torrent keeps seeding.".to_string(),
-                Theme::dim(),
-            ),
-            LinkCheck::Symlinks { cause } => (
-                format!("A test hardlink failed here ({}). {BREAKS}", short_cause(cause)),
-                Theme::symlinked(),
-            ),
-            _ => (
-                "One file on disk under both names, or a symlink where the two are on different filesystems.".to_string(),
-                Theme::dim(),
-            ),
-        },
+        LinkKind::Planned => (
+            "One file on disk under both names, and the torrent keeps seeding. If the hardlink fails, it becomes a symlink.".to_string(),
+            Theme::dim(),
+        ),
         LinkKind::Hardlink => (
             "One file on disk under both names, and the torrent keeps seeding.".to_string(),
             Theme::dim(),
         ),
-        LinkKind::Symlink => {
-            let why = entry
-                .fallback_reason
-                .as_deref()
-                .map(|reason| format!("Not a hardlink: {reason}. "))
-                .unwrap_or_default();
-            (format!("{why}{BREAKS}"), Theme::symlinked())
+        LinkKind::PlannedSymlink | LinkKind::Symlink => {
+            (reason_and(SYMLINK_BREAKS), Theme::symlinked())
         }
         LinkKind::Failed => (
             entry
                 .error
-                .clone()
+                .as_deref()
+                .map(sentence)
                 .unwrap_or_else(|| "The link failed; the log says why.".to_string()),
             Theme::failed(),
         ),
@@ -551,16 +548,12 @@ fn note(entry: &LinkReportEntry, kind: LinkKind, check: &LinkCheck) -> (String, 
         LinkKind::Skipped => (
             entry
                 .error
-                .clone()
+                .as_deref()
+                .map(sentence)
                 .unwrap_or_else(|| "Left alone on purpose.".to_string()),
             Theme::dim(),
         ),
     }
-}
-
-/// A test hardlink's cause up to its colon: "different filesystems".
-pub(super) fn short_cause(cause: &str) -> &str {
-    cause.split(':').next().unwrap_or(cause)
 }
 
 /// The selected pair in full: its download, the link it has or will have to
@@ -573,16 +566,15 @@ pub(super) fn render_details(frame: &mut Frame, area: Rect, app: &App) {
     let body = super::inset(take_top(area, 1).1, 2);
     let width = usize::from(body.width);
     let kind = LinkKind::of(entry);
-    let check = app.link_check();
     let (folder, name) = entry
         .source
         .rsplit_once('/')
         .map_or(("", entry.source.as_str()), |(folder, name)| (folder, name));
     let size = format_bytes(entry.size);
-    let sentence = link_sentence(kind, check);
+    let says = link_sentence(kind);
     let drawing = kind.drawing(true);
-    let target_room = width.saturating_sub(drawing.chars().count() + sentence.len() + 2);
-    let (note, note_style) = note(entry, kind, check);
+    let target_room = width.saturating_sub(drawing.chars().count() + says.len() + 2);
+    let (note, note_style) = note(entry, kind);
     let lines = vec![
         Line::from(vec![
             Span::styled(
@@ -598,7 +590,7 @@ pub(super) fn render_details(frame: &mut Frame, area: Rect, app: &App) {
         )),
         Line::from(vec![
             Span::styled(drawing, kind.style()),
-            Span::styled(format!(" {sentence} "), Theme::muted()),
+            Span::styled(format!(" {says} "), Theme::muted()),
             Span::styled(trim_keep_name(&entry.target, target_room), Theme::text()),
         ]),
     ];
@@ -836,16 +828,17 @@ pub(super) fn render_empty(frame: &mut Frame, area: Rect, app: &App) {
 mod tests {
     use super::super::test_support::{app_with_episodes, app_with_link_report, screen};
     use super::*;
+    use crate::tui::app::LinkCheck;
 
     /// The lines that show a pair: those with a link drawing.
     fn pair_lines(text: &str) -> Vec<&str> {
         text.lines()
             .filter(|line| {
-                ["○", "●", "▶", "✗", "–"]
+                ["○", "●", "▶", "▷", "✗", "–"]
                     .iter()
                     .any(|mark| line.contains(mark))
             })
-            .filter(|line| line.contains("GiB"))
+            .filter(|line| line.contains("iB"))
             .collect()
     }
 
@@ -853,6 +846,7 @@ mod tests {
     fn each_kind_of_link_has_its_own_drawing() {
         let kinds = [
             LinkKind::Planned,
+            LinkKind::PlannedSymlink,
             LinkKind::Hardlink,
             LinkKind::Symlink,
             LinkKind::Failed,
@@ -971,11 +965,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("Not a hardlink: different filesystems."),
-            "{text}"
-        );
-        assert!(
-            text.contains("breaks if the library file is renamed"),
+            text.contains("Different filesystems. A symlink breaks if its library file is renamed"),
             "{text}"
         );
         app.handle_key_for_test(KeyCode::Down, KeyModifiers::NONE);
@@ -984,17 +974,181 @@ mod tests {
         assert!(text.contains("Permission denied (os error 13)"), "{text}");
     }
 
+    /// A scan with one pair planned as a symlink, as symlink-only mode or
+    /// two devices plan it, and one planned as a hardlink.
+    fn app_with_a_planned_symlink() -> App {
+        let config = crate::config::Config {
+            downloads: Some("/downloads".into()),
+            media: Some("/media".into()),
+            ..crate::config::Config::default()
+        };
+        let mut app = App::new(&config, false);
+        let planned = |name: &str, method: &str, reason: &str| LinkReportEntry {
+            source: format!("/downloads/{name}/{name}.mkv"),
+            target: format!("/media/Movies/{name}.mkv"),
+            size: 1_000_000_000,
+            status: "planned".to_string(),
+            method: Some(method.to_string()),
+            fallback_reason: Some(reason.to_string()),
+            ..Default::default()
+        };
+        app.set_report_for_test(crate::tui::model::RunReport {
+            mode: "scan".to_string(),
+            planned_actions: 2,
+            total_saved_bytes: 2_000_000_000,
+            entries: vec![
+                planned("Alpha", "symlink", "symlink-only mode enabled"),
+                planned(
+                    "Beta",
+                    "try-hardlink",
+                    "tries hardlink first; may fall back to symlink",
+                ),
+            ],
+            ..Default::default()
+        });
+        app
+    }
+
     #[test]
-    fn a_failed_test_hardlink_says_planned_pairs_become_symlinks() {
-        let mut app = app_with_episodes(1);
-        app.set_link_check_for_test(LinkCheck::Symlinks {
-            cause: "different filesystems: two disks".to_string(),
+    fn a_pair_planned_as_a_symlink_says_so_and_why() {
+        let mut app = app_with_a_planned_symlink();
+        // The test hardlink speaks for the folders, not for this pair.
+        app.set_link_check_for_test(LinkCheck::Hardlinks);
+        let text = screen(&app, 120, 36);
+        let row = pair_lines(&text)
+            .into_iter()
+            .find(|row| row.contains("Alpha"))
+            .unwrap_or_else(|| panic!("the Alpha row:\n{text}"));
+        assert!(row.contains("╌╌╌╌╌╌╌╌▷"), "{row}");
+        assert!(
+            text.contains("becomes a symlink to /media/Movies/Alpha.mkv"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Symlink-only mode enabled. A symlink breaks"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("becomes a hardlink to /media/Movies/Alpha"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_wide_name_keeps_the_columns_in_line() {
+        let config = crate::config::Config {
+            downloads: Some("/dl".into()),
+            media: Some("/media".into()),
+            ..crate::config::Config::default()
+        };
+        let mut app = App::new(&config, false);
+        let entry = |name: &str| LinkReportEntry {
+            source: format!("/dl/{name}"),
+            target: format!("/media/{name}"),
+            size: 1_000_000_000,
+            status: "planned".to_string(),
+            method: Some("try-hardlink".to_string()),
+            ..Default::default()
+        };
+        app.set_report_for_test(crate::tui::model::RunReport {
+            mode: "scan".to_string(),
+            planned_actions: 2,
+            entries: vec![entry("葬送のフリーレン 01.mkv"), entry("Plain 01.mkv")],
+            ..Default::default()
+        });
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| super::super::render(frame, &app))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let size_column = |needle: &str| {
+            (0..36u16)
+                .find_map(|y| {
+                    let row: String = (0..120u16).map(|x| buffer[(x, y)].symbol()).collect();
+                    (row.contains(needle) && row.contains("MiB"))
+                        .then(|| (0..120u16).find(|&x| buffer[(x, y)].symbol() == "M"))
+                        .flatten()
+                })
+                .unwrap_or_else(|| panic!("the {needle} row's size"))
+        };
+        assert_eq!(size_column("Plain"), size_column("フ"));
+    }
+
+    #[test]
+    fn paging_shows_every_pair_past_release_headings() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let config = crate::config::Config {
+            downloads: Some("/dl".into()),
+            media: Some("/media".into()),
+            ..crate::config::Config::default()
+        };
+        let mut app = App::new(&config, false);
+        let entries = (0..30)
+            .flat_map(|group| {
+                (0..2).map(move |episode| LinkReportEntry {
+                    source: format!("/dl/G{group:02}/G{group:02}E{episode}.mkv"),
+                    target: format!("/media/G{group:02}/G{group:02}E{episode}.mkv"),
+                    size: 1,
+                    status: "planned".to_string(),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        app.set_report_for_test(crate::tui::model::RunReport {
+            mode: "scan".to_string(),
+            entries,
+            ..Default::default()
+        });
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..30 {
+            let text = screen(&app, 80, 24);
+            for group in 0..30 {
+                for episode in 0..2 {
+                    let name = format!("G{group:02}E{episode}.mkv");
+                    if text.contains(&name) {
+                        seen.insert(name);
+                    }
+                }
+            }
+            app.handle_key_for_test(KeyCode::PageDown, KeyModifiers::NONE);
+        }
+        assert_eq!(seen.len(), 60, "pages skipped pairs: {seen:?}");
+    }
+
+    #[test]
+    fn a_release_with_a_subfolder_has_one_heading() {
+        let config = crate::config::Config {
+            downloads: Some("/dl".into()),
+            media: Some("/media".into()),
+            ..crate::config::Config::default()
+        };
+        let mut app = App::new(&config, false);
+        let entries = [
+            "Show/a1.mkv",
+            "Show/a2.mkv",
+            "Show/Extras/c.mkv",
+            "Show/z1.mkv",
+        ]
+        .into_iter()
+        .map(|path| LinkReportEntry {
+            source: format!("/dl/{path}"),
+            target: format!("/media/TV/{path}"),
+            size: 1,
+            status: "planned".to_string(),
+            ..Default::default()
+        })
+        .collect();
+        app.set_report_for_test(crate::tui::model::RunReport {
+            mode: "scan".to_string(),
+            entries,
+            ..Default::default()
         });
         let text = screen(&app, 120, 36);
-        assert!(text.contains("becomes a symlink to"), "{text}");
+        assert_eq!(text.matches("▾ Show").count(), 1, "{text}");
         assert!(
-            text.contains("A test hardlink failed here (different filesystems)"),
-            "{text}"
+            text.contains("  Extras/c.mkv"),
+            "the path below the release: {text}"
         );
     }
 

@@ -176,13 +176,14 @@ Each row is a download beside the library file it is a copy of, with the link be
 
 | Link | Means |
 |---|---|
-| `╌╌╌╌○╌╌╌╌` orange | Not linked yet |
+| `╌╌╌╌○╌╌╌╌` orange | Not linked yet; a hardlink is tried first |
+| `╌╌╌╌╌╌╌╌▷` orange | Not linked yet, and to become a symlink: the two are on different filesystems, or the link mode is symlink-only |
 | `━━━━●━━━━` green | A hardlink: one file on disk under both names |
 | `────────▶` amber | A symlink: it points at the library file and breaks if that file is renamed, upgraded or deleted |
 | `━━━━●━━━━` grey | Already one file; nothing to do |
 | `────✗` red | Failed; the details under the rows say why |
 
-Above the rows, the space a link run would free, or the space it freed, is drawn big, with the counts of hardlinks and symlinks beside it. Saving the folders in the path editor (`e`) tries one hardlink between them, as `dejaview config validate` does, and says whether links will be hardlinks or symlinks.
+Above the rows, the space a link run would free, or the space it freed, is drawn big, with the counts of hardlinks and symlinks beside it. Saving the folders in the path editor (`e`) tries one hardlink between them, as `dejaview config validate` does, after the same check that neither folder reaches the other through a second mount, and says whether links will be hardlinks or symlinks.
 
 | Key | Action |
 |---|---|

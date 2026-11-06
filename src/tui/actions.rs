@@ -14,28 +14,54 @@ use super::model::{RunReport, TuiEvent};
 use crate::protocol::{PROTOCOL_VERSION, PlannedPair};
 
 /// Try one real hardlink from the library into downloads, as `config
-/// validate` does, on a thread of its own, and send what it showed with any
-/// warning to log. It changes nothing in the library but one file's change
-/// time.
+/// validate` does, on a thread of its own: first the walk that refuses two
+/// folders that reach each other through a second mount, so the test file is
+/// never made inside the library, then the link. It sends what it showed and
+/// the lines to log, which name the file tried and the OS error. It changes
+/// nothing in the library but one file's change time.
 pub fn spawn_link_check(
     downloads: std::path::PathBuf,
     media: std::path::PathBuf,
-) -> Receiver<(LinkCheck, Option<String>)> {
+    exclude: Vec<String>,
+) -> Receiver<(LinkCheck, Vec<String>)> {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = match engine::probe_hardlink(&downloads, &media) {
-            engine::HardlinkProbe::NoFile => (LinkCheck::NoLibraryFile, None),
-            engine::HardlinkProbe::Works { leftover, .. } => (LinkCheck::Hardlinks, leftover),
-            engine::HardlinkProbe::Fails { cause, .. } => (
-                LinkCheck::Symlinks {
-                    cause: cause.to_string(),
-                },
-                None,
-            ),
-        };
-        let _ = sender.send(result);
+        let _ = sender.send(check_links(&downloads, &media, exclude));
     });
     receiver
+}
+
+fn check_links(downloads: &Path, media: &Path, exclude: Vec<String>) -> (LinkCheck, Vec<String>) {
+    if let Err(err) = engine::ensure_roots_not_mounted_inside(downloads, media, exclude) {
+        let reason = format!("{err:#}");
+        return (
+            LinkCheck::Refused {
+                reason: reason.clone(),
+            },
+            vec![format!("No test hardlink made: {reason}")],
+        );
+    }
+    match engine::probe_hardlink(downloads, media) {
+        engine::HardlinkProbe::NoFile => (
+            LinkCheck::NoLibraryFile,
+            vec!["No library file to test a hardlink with yet.".to_string()],
+        ),
+        engine::HardlinkProbe::Works { file, leftover } => {
+            let mut lines = vec![format!(
+                "A test hardlink of {} into downloads worked: link runs will free space.",
+                file.display()
+            )];
+            lines.extend(leftover);
+            (LinkCheck::Hardlinks, lines)
+        }
+        engine::HardlinkProbe::Fails { file, cause, error } => (
+            LinkCheck::Symlinks { cause },
+            vec![format!(
+                "A test hardlink of {} into downloads failed: {cause} ({error}). Link runs will make symlinks, which break if a library file is renamed, upgraded or deleted.",
+                file.display()
+            )],
+        ),
+    }
 }
 
 /// A child that already ended its stream with a done, error or cancelled
@@ -428,5 +454,89 @@ mod tests {
 
             fs::remove_dir_all(&root).expect("cleanup temp dir");
         }
+    }
+
+    /// Every file under `root`, for a test that must leave nothing behind.
+    fn files_under(root: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let mut folders = vec![root.to_path_buf()];
+        while let Some(folder) = folders.pop() {
+            for entry in fs::read_dir(&folder).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    folders.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn a_test_hardlink_between_two_folders_works_and_leaves_nothing() {
+        let root = unique_temp_dir("link_check");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        fs::create_dir_all(&downloads).expect("downloads");
+        fs::create_dir_all(media.join("Movies")).expect("media");
+        fs::write(media.join("Movies").join("m.mkv"), b"movie").expect("library file");
+
+        let (check, lines) = check_links(&downloads, &media, Vec::new());
+
+        assert_eq!(check, LinkCheck::Hardlinks);
+        assert!(
+            lines[0].contains("m.mkv"),
+            "names the file tried: {lines:?}"
+        );
+        assert!(
+            files_under(&downloads).is_empty(),
+            "the test link is removed"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_test_hardlink_is_made_when_the_library_is_reached_through_a_mount() {
+        let root = unique_temp_dir("link_check_mount");
+        // On the host the library sits inside the data folder; downloads is
+        // the data folder seen through a bind mount.
+        let data = root.join("data");
+        fs::create_dir_all(data.join("media").join("Movies")).expect("library");
+        fs::write(data.join("media").join("Movies").join("m.mkv"), b"movie").expect("file");
+        let downloads = root.join("c").join("downloads");
+        let media = root.join("c").join("media");
+        fs::create_dir_all(&downloads).expect("downloads mount point");
+        fs::create_dir_all(&media).expect("media mount point");
+        let mount = |source: &Path, target: &Path| {
+            std::process::Command::new("mount")
+                .arg("--bind")
+                .arg(source)
+                .arg(target)
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        if !mount(&data, &downloads) {
+            eprintln!("skipped: bind mounts need root");
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let mounted_media = mount(&data.join("media"), &media);
+
+        let result = mounted_media.then(|| check_links(&downloads, &media, Vec::new()));
+        let left = files_under(&data);
+
+        for target in [&media, &downloads] {
+            let _ = std::process::Command::new("umount").arg(target).status();
+        }
+        let _ = fs::remove_dir_all(&root);
+        let Some((check, lines)) = result else {
+            eprintln!("skipped: the second bind mount failed");
+            return;
+        };
+        assert!(matches!(check, LinkCheck::Refused { .. }), "{check:?}");
+        assert!(lines[0].contains("No test hardlink made"), "{lines:?}");
+        assert_eq!(left.len(), 1, "no test file in the library: {left:?}");
     }
 }

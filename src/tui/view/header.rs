@@ -6,7 +6,7 @@ use ratatui::prelude::*;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::pairs::{LinkKind, Tally, short_cause};
+use super::pairs::{LinkKind, Tally};
 use super::{cut, format_bytes, group_digits, line_width, pad_left, rule, take_top, wrap_text};
 use crate::tui::app::{App, LinkCheck};
 use crate::tui::bignum;
@@ -32,7 +32,7 @@ fn split_size(bytes: u64) -> (String, String) {
 
 /// The running job's step in a word or two.
 fn phase_word(app: &App) -> &'static str {
-    if app.mode_label() == "Cancelling" {
+    if app.cancelling() {
         return "cancelling";
     }
     match app.phase() {
@@ -127,14 +127,13 @@ fn stats(app: &App) -> Vec<Stat> {
                     "files found",
                 ));
             }
-        } else {
+        } else if let Some((done, total)) = app.run_progress() {
+            // While linking, the run counts the pairs it has linked of all it
+            // was given.
             stats.push(stat(
                 None,
-                app.applied_actions(),
-                &format!(
-                    "of {} linked",
-                    app.planned_actions() + app.applied_actions()
-                ),
+                group_digits(done),
+                &format!("of {} linked", group_digits(total)),
             ));
         }
         stats.push(stat(None, app.elapsed_label(), "elapsed"));
@@ -148,17 +147,29 @@ fn stats(app: &App) -> Vec<Stat> {
             stats.push(stat(Some(kind), n, &plural(n, one, many)));
         }
     };
+    // Most needed first: four rows fit, and the rest give way.
     if app.showing_link_report() {
         count(LinkKind::Hardlink, "hardlink", "hardlinks", true);
         count(LinkKind::Symlink, "symlink", "symlinks", false);
         count(LinkKind::Failed, "failed", "failed", false);
-        count(LinkKind::Already, "already linked", "already linked", false);
         count(LinkKind::Planned, "not linked yet", "not linked yet", false);
+        count(
+            LinkKind::PlannedSymlink,
+            "not linked yet",
+            "not linked yet",
+            false,
+        );
         count(LinkKind::Skipped, "left alone", "left alone", false);
-    } else if app.has_report() {
-        count(LinkKind::Planned, "to link", "to link", true);
         count(LinkKind::Already, "already linked", "already linked", false);
+    } else if app.has_report() {
+        if tally.count(LinkKind::PlannedSymlink) > 0 {
+            count(LinkKind::Planned, "to hardlink", "to hardlink", false);
+            count(LinkKind::PlannedSymlink, "to symlink", "to symlink", true);
+        } else {
+            count(LinkKind::Planned, "to link", "to link", true);
+        }
         count(LinkKind::Skipped, "left alone", "left alone", false);
+        count(LinkKind::Already, "already linked", "already linked", false);
         stats.push(stat(
             None,
             group_digits(app.files_considered() as u64),
@@ -179,14 +190,9 @@ fn stat_line(stat: &Stat, glyph: bool, value_width: usize) -> Line<'static> {
     };
     let mut spans = Vec::new();
     if glyph {
-        let (drawing, style) = stat.kind.map_or(("   ", Theme::faint()), |kind| {
-            let style = if kind == LinkKind::Already {
-                Theme::faint()
-            } else {
-                kind.style()
-            };
-            (kind.glyph(), style)
-        });
+        let (drawing, style) = stat
+            .kind
+            .map_or(("   ", Theme::faint()), |kind| (kind.glyph(), kind.style()));
         spans.push(Span::styled(drawing, style));
         spans.push(Span::raw("  "));
     }
@@ -257,27 +263,22 @@ fn phase_sentence(app: &App) -> String {
 
 /// What a test hardlink showed, for the line under the bar.
 fn link_check_line(check: &LinkCheck) -> Option<Line<'static>> {
-    match check {
-        LinkCheck::Hardlinks => Some(Line::from(vec![
+    let summary = check.summary()?;
+    Some(match check {
+        LinkCheck::Hardlinks => Line::from(vec![
             Span::styled("✓ ", Theme::hardlinked()),
-            Span::styled(
-                "A test hardlink worked: links will free space",
-                Theme::dim(),
-            ),
-        ])),
-        LinkCheck::Symlinks { cause } => Some(Line::from(Span::styled(
-            format!(
-                "! Hardlinks fail here ({}): links will be symlinks",
-                short_cause(cause)
-            ),
-            Theme::symlinked(),
-        ))),
-        LinkCheck::Testing => Some(Line::from(Span::styled(
-            "Testing a hardlink between the folders…",
-            Theme::dim(),
-        ))),
-        LinkCheck::Untested | LinkCheck::NoLibraryFile => None,
-    }
+            Span::styled(summary, Theme::dim()),
+        ]),
+        LinkCheck::Symlinks { .. } | LinkCheck::SymlinkOnly => {
+            Line::from(Span::styled(format!("! {summary}"), Theme::symlinked()))
+        }
+        LinkCheck::Refused { .. } => {
+            Line::from(Span::styled(format!("! {summary}"), Theme::failed()))
+        }
+        LinkCheck::Untested | LinkCheck::Testing | LinkCheck::NoLibraryFile => {
+            Line::from(Span::styled(summary, Theme::dim()))
+        }
+    })
 }
 
 /// The line under the bar, left and right.
@@ -316,9 +317,17 @@ fn caption(app: &App) -> (Line<'static>, Line<'static>) {
                 ));
             }
         }
-        // Already-linked pairs never took space twice; only failed and
-        // unlinked ones still do.
-        let left_over = tally.bytes(LinkKind::Failed) + tally.bytes(LinkKind::Planned);
+        // Already-linked pairs never took space twice; every other pair the
+        // run did not link still does.
+        let left_over = [
+            LinkKind::Failed,
+            LinkKind::Planned,
+            LinkKind::PlannedSymlink,
+            LinkKind::Skipped,
+        ]
+        .into_iter()
+        .map(|kind| tally.bytes(kind))
+        .sum::<u64>();
         let right = if left_over > 0 {
             Line::from(Span::styled(
                 format!("{} not freed", format_bytes(left_over)),
@@ -472,7 +481,10 @@ pub(super) fn render_full(frame: &mut Frame, area: Rect, app: &App) {
         height: 1,
         ..zone
     };
-    frame.render_widget(Paragraph::new(right).right_aligned(), caption_row);
+    // The right side gives way when the two do not fit apart.
+    if line_width(&left) + 2 + line_width(&right) <= usize::from(caption_row.width) {
+        frame.render_widget(Paragraph::new(right).right_aligned(), caption_row);
+    }
     frame.render_widget(Paragraph::new(left), caption_row);
 }
 
@@ -628,6 +640,97 @@ mod tests {
             text.contains("1.9 GiB hardlinked   1.9 GiB symlinked"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_link_run_with_every_kind_keeps_its_unlinked_pairs_in_view() {
+        let config = crate::config::Config {
+            downloads: Some("/dl".into()),
+            media: Some("/media".into()),
+            ..crate::config::Config::default()
+        };
+        let mut app = App::new(&config, false);
+        let entry = |name: &str, status: &str, method: &str| crate::tui::model::LinkReportEntry {
+            source: format!("/dl/{name}/{name}.mkv"),
+            target: format!("/media/{name}.mkv"),
+            size: 1_073_741_824,
+            status: status.to_string(),
+            method: Some(method.to_string()),
+            ..Default::default()
+        };
+        app.set_report_for_test(crate::protocol::RunReport {
+            mode: "link".to_string(),
+            entries: vec![
+                entry("A", "applied", "hardlink"),
+                entry("B", "applied", "symlink"),
+                entry("C", "failed", "hardlink"),
+                entry("D", "already-linked", "hardlink"),
+                entry("E", "planned", "try-hardlink"),
+                entry("F", "skipped", "hardlink"),
+            ],
+            ..Default::default()
+        });
+        let text = screen(&app, 140, 36);
+        assert!(text.contains("not linked yet"), "{text}");
+        // Failed, unlinked and skipped pairs still take their space twice;
+        // the already-linked one never did.
+        assert!(text.contains("3.0 GiB not freed"), "{text}");
+    }
+
+    #[test]
+    fn a_scan_with_planned_symlinks_counts_them_apart() {
+        let config = crate::config::Config {
+            downloads: Some("/dl".into()),
+            media: Some("/media".into()),
+            ..crate::config::Config::default()
+        };
+        let mut app = App::new(&config, false);
+        let planned = |name: &str, method: &str| crate::tui::model::LinkReportEntry {
+            source: format!("/dl/{name}/{name}.mkv"),
+            target: format!("/media/{name}.mkv"),
+            size: 1,
+            status: "planned".to_string(),
+            method: Some(method.to_string()),
+            ..Default::default()
+        };
+        app.set_report_for_test(crate::protocol::RunReport {
+            mode: "scan".to_string(),
+            planned_actions: 3,
+            total_saved_bytes: 3,
+            entries: vec![
+                planned("A", "try-hardlink"),
+                planned("B", "symlink"),
+                planned("C", "symlink"),
+            ],
+            ..Default::default()
+        });
+        let text = screen(&app, 140, 36);
+        assert!(text.contains("╌○╌  1  to hardlink"), "{text}");
+        assert!(text.contains("╌╌▷  2  to symlink"), "{text}");
+    }
+
+    #[test]
+    fn a_link_run_counts_what_it_linked_of_what_it_was_given() {
+        let mut app = app_with_episodes(10);
+        app.set_running_link_for_test(5, 10);
+        let text = screen(&app, 120, 36);
+        assert!(text.contains("5  of 10 linked"), "{text}");
+        assert!(!text.contains("of 15"), "{text}");
+    }
+
+    #[test]
+    fn a_long_caption_never_runs_into_the_time() {
+        let mut app = app_with_episodes(1);
+        app.set_link_check_for_test(LinkCheck::SymlinkOnly);
+        app.set_last_run_for_test(std::time::Duration::from_secs(61));
+        let text = screen(&app, 120, 36);
+        let line = text
+            .lines()
+            .find(|line| line.contains("symlink-only"))
+            .unwrap_or_else(|| panic!("the caption:\n{text}"));
+        assert!(!line.contains("finished in"), "{line}");
+        let wide = screen(&app, 200, 36);
+        assert!(wide.contains("Scan finished in 01:01"), "{wide}");
     }
 
     #[test]

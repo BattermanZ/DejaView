@@ -56,68 +56,116 @@ fn row_path<'a>(path: &'a str, root: Option<&std::path::Path>, expand: bool) -> 
         .unwrap_or(path)
 }
 
-/// Cut `path` to `width` characters, keeping its file name, which is what
-/// tells one episode from the next: the folders give way first, from the
+/// The cells `text` takes on screen: two for a wide character, such as a
+/// CJK one, none for a combining mark.
+fn width_of(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+fn char_width(ch: char) -> usize {
+    let mut buffer = [0; 4];
+    width_of(ch.encode_utf8(&mut buffer))
+}
+
+/// The longest end of `text` that fits in `room` cells.
+fn tail_fitting(text: &str, room: usize) -> &str {
+    let mut used = 0;
+    let mut start = text.len();
+    for (index, ch) in text.char_indices().rev() {
+        used += char_width(ch);
+        if used > room {
+            break;
+        }
+        start = index;
+    }
+    &text[start..]
+}
+
+/// How many of `chars` fit in `room` cells, from the start.
+fn chars_fitting(chars: &[char], room: usize) -> usize {
+    let mut used = 0;
+    chars
+        .iter()
+        .take_while(|ch| {
+            used += char_width(**ch);
+            used <= room
+        })
+        .count()
+}
+
+/// Cut `path` to `width` cells, keeping its file name, which is what tells
+/// one episode from the next: the folders give way first, whole, from the
 /// left. A file name too long on its own keeps its start, where a release
 /// names its title and episode; its end is a release group the rows share.
 fn trim_keep_name(path: &str, width: usize) -> String {
-    let count = path.chars().count();
-    if count <= width {
+    if width_of(path) <= width {
         return path.to_string();
     }
     if width == 0 {
         return String::new();
     }
     let name = path.rsplit('/').next().unwrap_or(path);
-    if name.chars().count() < width {
+    if width_of(name) < width {
         // The folders that fit whole, so no folder's name shows cut.
-        let tail: String = path.chars().skip(count - (width - 1)).collect();
+        let tail = tail_fitting(path, width - 1);
         let tail = match tail.find('/') {
             Some(slash) if slash > 0 => &tail[slash..],
-            _ => tail.as_str(),
+            _ => tail,
         };
         return format!("…{tail}");
     }
-    let start: String = name.chars().take(width - 1).collect();
-    format!("{start}…")
+    cut(name, width)
 }
 
-/// `text` cut to `width` characters, an ellipsis standing for the rest.
+/// `text` cut to `width` cells, an ellipsis standing for the rest.
 fn cut(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
+    if width_of(text) <= width {
         return text.to_string();
     }
     if width == 0 {
         return String::new();
     }
-    let mut start: String = text.chars().take(width - 1).collect();
+    let chars: Vec<char> = text.chars().collect();
+    let mut start: String = chars[..chars_fitting(&chars, width - 1)].iter().collect();
     start.push('…');
     start
 }
 
-/// `text` cut to `width` and padded with spaces to it.
+/// `text` cut to `width` cells and padded with spaces to it.
 fn pad(text: &str, width: usize) -> String {
     let text = cut(text, width);
-    let fill = width.saturating_sub(text.chars().count());
+    let fill = width.saturating_sub(width_of(&text));
     format!("{text}{}", " ".repeat(fill))
 }
 
-/// `text` cut to `width` and right-aligned in it.
+/// `text` cut to `width` cells and right-aligned in it.
 fn pad_left(text: &str, width: usize) -> String {
     let text = cut(text, width);
-    let fill = width.saturating_sub(text.chars().count());
+    let fill = width.saturating_sub(width_of(&text));
     format!("{}{text}", " ".repeat(fill))
 }
 
-/// The width a line takes on screen, in characters.
+/// The cells a line takes on screen.
 fn line_width(line: &Line) -> usize {
-    line.spans
-        .iter()
-        .map(|span| span.content.chars().count())
-        .sum()
+    line.width()
 }
 
-/// `text` wrapped to `width` columns at spaces; a word longer than a line is
+/// `text` with a capital first letter and a full stop, as the engine's
+/// reasons ("symlink-only mode enabled") read in a sentence.
+fn sentence(text: &str) -> String {
+    let text = text.trim().trim_end_matches('.');
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}.", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+/// What a person should know about every symlink DejaView makes.
+const SYMLINK_BREAKS: &str =
+    "A symlink breaks if its library file is renamed, upgraded or deleted.";
+
+/// `text` wrapped to `width` cells at spaces; a word longer than a line is
 /// cut across lines, and each line of `text` starts a new one, keeping its
 /// indent on every line it wraps to, as JSON needs.
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -131,23 +179,26 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         let mut line = String::new();
         for word in body.split(' ') {
             let mut word: Vec<char> = word.chars().collect();
-            let used = line.chars().count();
-            if used > 0 && used + 1 + word.len() > width {
+            let used = width_of(&line);
+            let word_width: usize = word.iter().map(|ch| char_width(*ch)).sum();
+            if used > 0 && used + 1 + word_width > width {
                 lines.push(std::mem::take(&mut line));
             }
             if !line.is_empty() {
                 line.push(' ');
             }
             loop {
-                let room = width.saturating_sub(line.chars().count());
-                if word.len() <= room {
+                let room = width.saturating_sub(width_of(&line));
+                let fits = chars_fitting(&word, room);
+                if fits == word.len() {
                     break;
                 }
-                if room == 0 {
+                if fits == 0 && !line.is_empty() {
                     lines.push(std::mem::take(&mut line));
                     continue;
                 }
-                line.extend(word.drain(..room));
+                // A character wider than a whole line still goes somewhere.
+                line.extend(word.drain(..fits.max(1)));
                 lines.push(std::mem::take(&mut line));
             }
             line.extend(word);
@@ -461,6 +512,35 @@ mod tests {
             row_path("/elsewhere/b.mkv", Some(root), false),
             "/elsewhere/b.mkv"
         );
+    }
+
+    #[test]
+    fn wide_characters_take_two_cells_in_a_column() {
+        let name = "葬送のフリーレン 01.mkv";
+        assert_eq!(width_of(name), 23);
+        assert_eq!(width_of(&pad(name, 30)), 30);
+        assert_eq!(width_of(&pad_left(name, 30)), 30);
+        let cut_name = cut(name, 10);
+        assert!(width_of(&cut_name) <= 10, "{cut_name}");
+        assert!(cut_name.ends_with('…'), "{cut_name}");
+        let trimmed = trim_keep_name(&format!("/dl/{name}"), 12);
+        assert!(width_of(&trimmed) <= 12, "{trimmed}");
+        for line in wrap_text("葬送のフリーレン 葬送のフリーレン", 9) {
+            assert!(width_of(&line) <= 9, "{line}");
+        }
+    }
+
+    #[test]
+    fn an_engine_reason_reads_as_a_sentence() {
+        assert_eq!(
+            sentence("symlink-only mode enabled"),
+            "Symlink-only mode enabled."
+        );
+        assert_eq!(
+            sentence("cross-device: no hardlink."),
+            "Cross-device: no hardlink."
+        );
+        assert_eq!(sentence(""), "");
     }
 
     #[test]
