@@ -1,7 +1,9 @@
 use ratatui::layout::Alignment;
 use ratatui::prelude::*;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap,
+};
 
 use crate::tui::app::{App, ConfigEditor, ConfigField, ConfirmLinkMode, Overlay};
 use crate::tui::layout;
@@ -610,8 +612,8 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     match app.overlay() {
         Overlay::None => {}
-        Overlay::Help => render_help_overlay(frame),
-        Overlay::JsonPreview(json) => render_json_overlay(frame, json),
+        Overlay::Help => render_help_overlay(frame, app),
+        Overlay::JsonPreview(json) => render_json_overlay(frame, app, json),
         Overlay::ConfigEditor(editor) => render_config_overlay(frame, editor),
         Overlay::ConfirmLink(mode) => render_confirm_link_overlay(frame, app, *mode),
         Overlay::BlockingNotice(message) => render_blocking_notice_overlay(frame, message),
@@ -783,9 +785,11 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
     let show_target = content[1].width >= 110;
     let columns = 3 + u16::from(show_outcome) + u16::from(show_target);
     let fixed = state_width + size_width + if show_outcome { outcome_width } else { 0 };
+    // The selected row's marker takes a column of its own on every row.
+    let marker_width = 2u16;
     let flexible = content[1]
         .width
-        .saturating_sub(fixed + spacing * (columns - 1));
+        .saturating_sub(marker_width + fixed + spacing * (columns - 1));
     let (source_width, target_width) = if show_target {
         let source = flexible * 11 / 20;
         (source, flexible - source)
@@ -793,6 +797,7 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         (flexible, 0)
     };
     let visible_capacity = usize::from(content[1].height.saturating_sub(1));
+    app.view_sizes().result_rows.set(visible_capacity);
     let (start, end) = visible_row_window(app.rows().len(), app.selected_row(), visible_capacity);
     let expand = app.expand_paths();
 
@@ -857,46 +862,75 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         widths.push(Constraint::Length(target_width));
         header.push(Cell::from(Span::styled("TARGET", Theme::title(false))));
     }
+    // A marker and reverse video, so the selected row stands out on any
+    // terminal's colours, not only by a shade of background.
     let table = Table::new(rows, widths)
         .header(Row::new(header))
         .style(Theme::panel())
-        .column_spacing(spacing);
-    frame.render_widget(table, content[1]);
+        .column_spacing(spacing)
+        .highlight_symbol("▶ ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .row_highlight_style(Theme::result_row_selected().add_modifier(Modifier::REVERSED));
+    let mut state = TableState::default().with_selected(app.selected_row().checked_sub(start));
+    frame.render_stateful_widget(table, content[1], &mut state);
 }
 
-const HELP_TEXT: &str = "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\np toggle compact/full paths\nj/k move rows\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nX clear cache and rescan\nl confirm and link selected row\nL confirm and run link-all job\nc cancel the running scan or link\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels";
+const HELP_TEXT: &str = "Keyboard map\n\nGlobal\nq close overlay or quit when idle\n? help\np toggle compact/full paths\nj/k or arrows move rows\nPgUp/PgDn move a page\ng/G or Home/End first and last row\n\nActions\ne edit downloads/media paths\nS scan for duplicates\nX clear cache and rescan\nl confirm and link selected row\nL confirm and run link-all job\nc cancel the running scan or link\nR save report\nJ open JSON preview\n\nConfig editor\ntype directly into the active field\nenter moves forward or saves\ntab switches field\nEsc cancels";
 
-fn render_help_overlay(frame: &mut Frame) {
+fn render_help_overlay(frame: &mut Frame, app: &App) {
     let (area, lines) = dialog_for(frame.area(), 60, HELP_TEXT, 0);
-    frame.render_widget(Clear, area);
-    let help = Paragraph::new(lines.join("\n"))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Line::from(vec![Span::styled(" HELP ", Theme::title(true))]))
-                .style(Theme::popup())
-                .border_style(Theme::accent()),
-        )
-        .style(Theme::popup());
-    frame.render_widget(help, area);
+    render_scrolling_overlay(frame, app, area, lines, " HELP ", " ? or Esc close ");
 }
 
-fn render_json_overlay(frame: &mut Frame, json: &str) {
-    let area = centered_rect(90, 80, frame.area());
+fn render_json_overlay(frame: &mut Frame, app: &App, json: &str) {
+    let screen = frame.area();
+    let (area, lines) = dialog_for(screen, screen.width.saturating_sub(4).min(140), json, 0);
+    render_scrolling_overlay(frame, app, area, lines, " REPORT JSON ", " J or Esc close ");
+}
+
+/// An overlay that may be longer than the screen, scrolled by the app's
+/// keys: the view tells the app how many lines it has and shows at once.
+fn render_scrolling_overlay(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    lines: Vec<String>,
+    title: &str,
+    close: &str,
+) {
+    let shown = usize::from(area.height.saturating_sub(2));
+    let sizes = app.view_sizes();
+    sizes.overlay_rows.set(shown);
+    sizes.overlay_lines.set(lines.len());
+    let scroll = app.overlay_scroll().min(lines.len().saturating_sub(shown));
+    let mut hint = vec![];
+    if lines.len() > shown {
+        hint.push(Span::styled(
+            format!(
+                " {}-{} of {}  j/k PgUp/PgDn scroll ",
+                scroll + 1,
+                (scroll + shown).min(lines.len()),
+                lines.len()
+            ),
+            Theme::muted(),
+        ));
+    }
+    hint.push(Span::styled(close.to_string(), Theme::title(false)));
     frame.render_widget(Clear, area);
-    let body = Paragraph::new(json)
+    let body = Paragraph::new(lines.join("\n"))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(Line::from(vec![Span::styled(
-                    " REPORT JSON ",
+                    title.to_string(),
                     Theme::title(true),
                 )]))
+                .title_bottom(Line::from(hint).right_aligned())
                 .style(Theme::popup())
                 .border_style(Theme::accent()),
         )
         .style(Theme::popup())
-        .wrap(Wrap { trim: false });
+        .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0));
     frame.render_widget(body, area);
 }
 
@@ -1066,13 +1100,18 @@ fn render_blocking_notice_overlay(frame: &mut Frame, message: &str) {
 }
 
 /// `text` wrapped to `width` columns at spaces; a word longer than a line is
-/// cut across lines, and each line of `text` starts a new one.
+/// cut across lines, and each line of `text` starts a new one, keeping its
+/// indent on every line it wraps to, as JSON needs.
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
     for paragraph in text.split('\n') {
+        let body = paragraph.trim_start_matches(' ');
+        let indent = (paragraph.len() - body.len()).min(width / 2);
+        let first = lines.len();
+        let width = width - indent;
         let mut line = String::new();
-        for word in paragraph.split(' ') {
+        for word in body.split(' ') {
             let mut word: Vec<char> = word.chars().collect();
             let used = line.chars().count();
             if used > 0 && used + 1 + word.len() > width {
@@ -1096,6 +1135,9 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
             line.extend(word);
         }
         lines.push(line);
+        for line in &mut lines[first..] {
+            line.insert_str(0, &" ".repeat(indent));
+        }
     }
     lines
 }
@@ -1119,26 +1161,6 @@ fn dialog_for(screen: Rect, max_width: u16, text: &str, extra_rows: u16) -> (Rec
         height,
     };
     (area, lines)
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
 }
 
 #[cfg(test)]
@@ -1736,6 +1758,10 @@ mod layout_tests {
     fn text_wraps_at_spaces_and_cuts_a_word_too_long_for_a_line() {
         assert_eq!(wrap_text("one two three", 7), ["one two", "three"]);
         assert_eq!(wrap_text("a\n\nb", 10), ["a", "", "b"]);
+        assert_eq!(
+            wrap_text("{\n  \"key\": \"one two\"\n}", 12),
+            ["{", "  \"key\":", "  \"one two\"", "}"]
+        );
         assert_eq!(wrap_text("abcdefghij", 4), ["abcd", "efgh", "ij"]);
         for line in wrap_text("media path is inside /a/very/long/path/that/goes/on", 12) {
             assert!(line.chars().count() <= 12, "{line}");
@@ -1756,5 +1782,80 @@ mod layout_tests {
             );
         }
         assert!(footer_line(120).to_string().contains("j/k rows"));
+    }
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::row_tests::{app_with_episodes, screen};
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key_for_test(code, KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn the_selected_row_carries_a_marker() {
+        let mut app = app_with_episodes(3);
+        press(&mut app, KeyCode::Down);
+        let text = screen(&app, 80, 24);
+        let marked: Vec<_> = text.lines().filter(|line| line.contains('▶')).collect();
+        assert_eq!(marked.len(), 1, "{text}");
+        assert!(marked[0].contains("S01E02"), "{text}");
+    }
+
+    #[test]
+    fn paging_keys_move_a_screen_and_to_either_end() {
+        let mut app = app_with_episodes(50);
+        screen(&app, 80, 24);
+        let page = app.view_sizes().result_rows.get();
+        assert!(page > 1);
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.selected_row(), page);
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.selected_row(), 49);
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(app.selected_row(), 49 - page);
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.selected_row(), 0);
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.selected_row(), 49);
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.selected_row(), 0);
+    }
+
+    #[test]
+    fn the_json_preview_scrolls_to_its_last_entry_and_j_does_not_close_it() {
+        let mut app = app_with_episodes(40);
+        press(&mut app, KeyCode::Char('J'));
+        let text = screen(&app, 80, 24);
+        assert!(!text.contains("S01E40"), "the start first:\n{text}");
+        press(&mut app, KeyCode::Char('j'));
+        assert!(
+            matches!(app.overlay(), Overlay::JsonPreview(_)),
+            "j scrolls"
+        );
+        press(&mut app, KeyCode::End);
+        let text = screen(&app, 80, 24);
+        assert!(
+            text.contains("S01E40") && text.lines().any(|line| line.contains("│  ]")),
+            "the end of the report:\n{text}"
+        );
+        press(&mut app, KeyCode::Char('J'));
+        assert!(matches!(app.overlay(), Overlay::None));
+    }
+
+    #[test]
+    fn help_scrolls_to_its_end_on_a_small_terminal() {
+        let mut app = app_with_episodes(1);
+        press(&mut app, KeyCode::Char('?'));
+        let text = screen(&app, 80, 24);
+        assert!(!text.contains("Esc cancels"), "{text}");
+        press(&mut app, KeyCode::Char('G'));
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("Esc cancels"), "{text}");
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.overlay(), Overlay::None));
     }
 }

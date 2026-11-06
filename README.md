@@ -179,13 +179,17 @@ Add `--strict` to run the dashboard's scans and links in strict mode.
 | `l` | Link the selected row to the library file it shows (asks first) |
 | `L` | Link every planned row the last scan showed (asks first) |
 | `c` | Cancel the running scan or link |
-| `j` / `k` or arrows | Move the selection |
+| `j` / `k` or arrows | Move the selection; in Help or the JSON preview, scroll |
+| `PgUp` / `PgDn` | Move the selection a screen at a time, or scroll a screen |
+| `g` / `G` or `Home` / `End` | Go to the first or last row, or the start or end of Help or the JSON preview |
 | `e` | Edit the downloads and media paths |
 | `p` | Show the rows' paths in full, or below their folders |
 | `R` | Save the current report to `.dejaview_tui_report.json` in downloads |
-| `J` | Show the current report as JSON |
+| `J` | Show the current report as JSON; `J` or `Esc` closes it |
 | `?` | Help |
 | `q` | Close an overlay, or quit when no run is active |
+
+After `l` links a row, the selection moves to the next planned row, so a list can be linked row by row.
 
 Cancelling a scan stops it almost at once, even partway through a large file, and keeps every hash already finished in the cache, so the next scan picks up where it stopped. Cancelling a link stops before the next file: files already linked stay linked and the rest stay planned. Quitting is blocked while a run is active, so cancel first.
 

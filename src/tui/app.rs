@@ -71,9 +71,23 @@ impl RunningJob {
     }
 }
 
+/// What the last frame drawn had room for, which paging and scrolling go
+/// by. The view sets it as it draws.
+#[derive(Default)]
+pub struct ViewSizes {
+    /// Result rows the table shows at once.
+    pub result_rows: std::cell::Cell<usize>,
+    /// Lines an open Help or JSON overlay shows at once, and has in all.
+    pub overlay_rows: std::cell::Cell<usize>,
+    pub overlay_lines: std::cell::Cell<usize>,
+}
+
 pub struct App {
     pub strict: bool,
     selected_row: usize,
+    /// How far an open Help or JSON overlay is scrolled, in lines.
+    overlay_scroll: usize,
+    view: ViewSizes,
     pub overlay: Overlay,
     report: Option<RunReport>,
     /// The reviewed report, put aside while a link runs: restored if the run
@@ -112,6 +126,8 @@ impl App {
         Self {
             strict,
             selected_row: 0,
+            overlay_scroll: 0,
+            view: ViewSizes::default(),
             overlay: Overlay::None,
             report: None,
             report_before_link: None,
@@ -260,6 +276,14 @@ impl App {
 
     pub fn overlay(&self) -> &Overlay {
         &self.overlay
+    }
+
+    pub fn overlay_scroll(&self) -> usize {
+        self.overlay_scroll
+    }
+
+    pub fn view_sizes(&self) -> &ViewSizes {
+        &self.view
     }
 
     pub fn config_editor(&self) -> Option<&ConfigEditor> {
@@ -462,13 +486,14 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
                     self.overlay = Overlay::None
                 }
-                _ => {}
+                _ => self.scroll_overlay(code),
             },
+            // j scrolls, as in the table; J, which opened it, closes it.
             Overlay::JsonPreview(_) => match code {
-                KeyCode::Esc | KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Char('q') => {
+                KeyCode::Esc | KeyCode::Char('J') | KeyCode::Char('q') => {
                     self.overlay = Overlay::None
                 }
-                _ => {}
+                _ => self.scroll_overlay(code),
             },
             Overlay::ConfigEditor(_) => self.handle_config_editor_key(code)?,
             Overlay::ConfirmLink(mode) => match code {
@@ -505,9 +530,16 @@ impl App {
     fn handle_main_key(&mut self, code: KeyCode) -> Result<()> {
         match code {
             KeyCode::Char('q') => self.request_quit(),
-            KeyCode::Char('?') => self.overlay = Overlay::Help,
+            KeyCode::Char('?') => {
+                self.overlay_scroll = 0;
+                self.overlay = Overlay::Help;
+            }
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::PageDown => self.move_selection(self.page_rows()),
+            KeyCode::PageUp => self.move_selection(-self.page_rows()),
+            KeyCode::Home | KeyCode::Char('g') => self.move_selection(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => self.move_selection(isize::MAX / 2),
             KeyCode::Char('p') => self.toggle_path_mode(),
             KeyCode::Char('c') => self.request_cancel(),
             KeyCode::Char('e') => self.open_config_editor(),
@@ -563,6 +595,32 @@ impl App {
         });
     }
 
+    /// How far PgUp and PgDn move: the rows the table showed last.
+    fn page_rows(&self) -> isize {
+        isize::try_from(self.view.result_rows.get().max(1)).unwrap_or(1)
+    }
+
+    /// Scroll an open Help or JSON overlay, within what the view drew.
+    fn scroll_overlay(&mut self, code: KeyCode) {
+        let page = self.view.overlay_rows.get().max(1);
+        let last = self
+            .view
+            .overlay_lines
+            .get()
+            .saturating_sub(self.view.overlay_rows.get());
+        let scroll = self.overlay_scroll.min(last);
+        self.overlay_scroll = match code {
+            KeyCode::Down | KeyCode::Char('j') => scroll + 1,
+            KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::Char(' ') => scroll + page,
+            KeyCode::PageUp => scroll.saturating_sub(page),
+            KeyCode::Home | KeyCode::Char('g') => 0,
+            KeyCode::End | KeyCode::Char('G') => last,
+            _ => scroll,
+        }
+        .min(last);
+    }
+
     fn move_selection(&mut self, delta: isize) {
         let rows = self.rows().len();
         if rows == 0 {
@@ -572,7 +630,7 @@ impl App {
 
         let current = self.selected_row as isize;
         let max = rows.saturating_sub(1) as isize;
-        let next = (current + delta).clamp(0, max);
+        let next = current.saturating_add(delta).clamp(0, max);
         self.selected_row = next as usize;
     }
 
@@ -1120,12 +1178,15 @@ impl App {
                     .iter()
                     .filter(|entry| entry.is_applied_symlink())
                     .count();
-                self.selected_row = 0;
                 self.current_path = None;
                 self.active_workers.clear();
                 self.hash_progress_done = None;
                 self.hash_progress_total = None;
                 self.merge_report(kind.clone(), report);
+                self.selected_row = match &kind {
+                    JobKind::LinkSelected(source) => self.next_planned_after(source),
+                    _ => 0,
+                };
                 self.report_before_link = None;
                 self.live_entries.clear();
                 self.running_job = None;
@@ -1158,6 +1219,24 @@ impl App {
         }
     }
 
+    /// The row to select after a single-row link of `source`: the next
+    /// planned row after it, else the first planned row, else where it was,
+    /// so linking a list row by row needs no moving back.
+    fn next_planned_after(&self, source: &str) -> usize {
+        let rows = self.rows();
+        let linked = rows
+            .iter()
+            .position(|row| row.source == source)
+            .unwrap_or(self.selected_row);
+        let planned = |row: &&LinkReportEntry| row.status.eq_ignore_ascii_case("planned");
+        rows.iter()
+            .enumerate()
+            .skip(linked + 1)
+            .find(|(_, row)| planned(row))
+            .or_else(|| rows.iter().enumerate().find(|(_, row)| planned(row)))
+            .map_or(linked.min(rows.len().saturating_sub(1)), |(index, _)| index)
+    }
+
     fn save_report(&mut self) -> Result<()> {
         let Some(report) = &self.report else {
             self.push_log("No report to save yet.".to_string());
@@ -1182,6 +1261,7 @@ impl App {
         };
 
         let json = serde_json::to_string_pretty(report)?;
+        self.overlay_scroll = 0;
         self.overlay = Overlay::JsonPreview(json);
         Ok(())
     }
@@ -1324,6 +1404,10 @@ impl App {
 
     pub(crate) fn toggle_path_mode_for_test(&mut self) {
         self.toggle_path_mode();
+    }
+
+    pub(crate) fn handle_key_for_test(&mut self, code: KeyCode, mods: KeyModifiers) {
+        self.handle_key(code, mods).expect("key handling");
     }
 }
 
@@ -1630,6 +1714,50 @@ mod tests {
         }
         let sources: Vec<_> = app.rows().iter().map(|row| row.source.as_str()).collect();
         assert_eq!(sources, ["/dl/a.mkv", "/dl/b.mkv", "/dl/c.mkv"]);
+    }
+
+    #[test]
+    fn a_single_link_selects_the_next_planned_row() {
+        let mut app = App::new(&Config::default(), false);
+        let row = |source: &str, status: &str| LinkReportEntry {
+            source: source.to_string(),
+            target: format!("/media{source}"),
+            size: 10,
+            status: status.to_string(),
+            method: None,
+            fallback_reason: None,
+            error: None,
+        };
+        let mut scanned = sample_report();
+        scanned.entries = vec![
+            row("/dl/a.mkv", "planned"),
+            row("/dl/b.mkv", "applied"),
+            row("/dl/c.mkv", "planned"),
+            row("/dl/d.mkv", "planned"),
+        ];
+        app.report = Some(scanned);
+        app.selected_row = 2;
+        let mut linked = sample_report();
+        linked.mode = "link".to_string();
+        linked.entries = vec![row("/dl/c.mkv", "applied")];
+
+        app.apply_tui_event(
+            JobKind::LinkSelected("/dl/c.mkv".to_string()),
+            TuiEvent::Done {
+                report: Box::new(linked.clone()),
+            },
+        );
+        assert_eq!(app.selected_row(), 3, "the next planned row, d");
+
+        // From the last row, back to the first still planned.
+        linked.entries = vec![row("/dl/d.mkv", "applied")];
+        app.apply_tui_event(
+            JobKind::LinkSelected("/dl/d.mkv".to_string()),
+            TuiEvent::Done {
+                report: Box::new(linked),
+            },
+        );
+        assert_eq!(app.selected_row(), 0, "a");
     }
 
     #[test]
