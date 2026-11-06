@@ -233,6 +233,9 @@ fn cache_audit_and_cleanup_temp_commands_work() {
         b"temp-artifact",
     )
     .expect("write probe leftover");
+    // A writability probe that a crash left behind.
+    fs::write(downloads.join(".dejaview_validate_write.5.6"), b"dejaview")
+        .expect("write probe leftover");
 
     run_ok(
         &root,
@@ -254,7 +257,7 @@ fn cache_audit_and_cleanup_temp_commands_work() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Temp artifacts: 3"));
+    assert!(stdout.contains("Temp artifacts: 4"), "{stdout}");
 
     let out = run_cmd(&root, &["cache", "cleanup-temp"]);
     assert!(
@@ -263,8 +266,9 @@ fn cache_audit_and_cleanup_temp_commands_work() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Removed temp artifacts: 3"));
+    assert!(stdout.contains("Removed temp artifacts: 4"), "{stdout}");
     assert!(!downloads.join(".dejaview_hardlink.tmp.1").exists());
+    assert!(!downloads.join(".dejaview_validate_write.5.6").exists());
     assert!(!nested.join(".dejaview_link.tmp.2").exists());
 }
 

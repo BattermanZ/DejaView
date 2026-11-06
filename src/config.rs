@@ -196,7 +196,7 @@ pub fn check(config: &Config) -> std::result::Result<Folders, Problems> {
         && let Err(err) = probe_directory_writable(downloads)
     {
         problems.push(format!(
-            "downloads path is not writable: {} ({err}); every run writes its cache there, and a link run its links. Let the user DejaView runs as write to it",
+            "downloads path is not writable: {} ({err}); every run writes its cache there, and a link run its links. Free space on it, or let the user DejaView runs as write to it",
             downloads.display()
         ));
     }
@@ -256,24 +256,40 @@ fn check_folder(
 }
 
 /// Create and remove a file in `path`, to learn whether this user may write
-/// there. The name starts with `.dejaview_`, which scans skip, in case a
-/// crash leaves it behind.
+/// there.
 fn probe_directory_writable(path: &Path) -> std::io::Result<()> {
+    write_probe(&path.join(probe_name()))
+}
+
+/// A fresh name for the probe file: `.dejaview_validate_write.<pid>.<ns>`.
+/// Scans skip `.dejaview_` names, and `dejaview cache cleanup-temp` removes
+/// one a crash left behind.
+fn probe_name() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let probe = path.join(format!(
-        ".dejaview_validate_{}.{}",
+    format!(
+        ".dejaview_validate_write.{}.{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos()
-    ));
-    // create_new: never open, let alone truncate, a file that is there.
-    fs::OpenOptions::new()
+    )
+}
+
+/// Create `probe`, write a few bytes to it and remove it again. A full
+/// disk or a spent quota still takes an empty file, but not the bytes. No
+/// fsync: every run makes this check, and on a network drive each sync is a
+/// round trip. `create_new` never opens a file that is there, so a symlink
+/// at the name is refused, not followed.
+fn write_probe(probe: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let written = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&probe)?;
-    fs::remove_file(&probe)
+        .open(probe)?
+        .write_all(b"dejaview");
+    let removed = fs::remove_file(probe);
+    written.and(removed)
 }
 
 /// Downloads and media must be separate trees. If one sits inside the other, the
@@ -510,27 +526,80 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The probe never opens a file that is there, so a symlink planted at
+    /// its exact name cannot make it write, or remove, anything else.
     #[test]
-    fn probe_directory_writable_does_not_follow_existing_symlink() {
-        #[cfg(not(unix))]
-        {
+    fn the_probe_refuses_a_symlink_at_its_name_and_leaves_its_target_alone() {
+        let root = TempDir::new("probe_symlink");
+        let victim = root.join("victim");
+        fs::write(&victim, b"keep").expect("write victim");
+        let probe = root.join(probe_name());
+        std::os::unix::fs::symlink(&victim, &probe).expect("plant symlink");
+
+        let err = write_probe(&probe).expect_err("the name is taken");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&victim).expect("read victim"), b"keep");
+        assert!(
+            fs::symlink_metadata(&probe).is_ok(),
+            "the symlink is left as it was"
+        );
+        // The probe of the folder picks a fresh name each time and works.
+        probe_directory_writable(&root).expect("probe the folder");
+        let names: Vec<_> = fs::read_dir(&root)
+            .expect("read root")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names.len(), 2, "the probe removed its file: {names:?}");
+    }
+
+    /// A mount this process may make, gone again on drop; None where it may
+    /// not mount (not root, or no CAP_SYS_ADMIN), as on CI.
+    struct Mount(PathBuf);
+
+    impl Mount {
+        fn tmpfs(target: &Path, size: &str) -> Option<Self> {
+            std::process::Command::new("mount")
+                .args(["-t", "tmpfs", "-o", &format!("size={size}"), "tmpfs"])
+                .arg(target)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .ok()?
+                .success()
+                .then(|| Mount(target.to_path_buf()))
+        }
+    }
+
+    impl Drop for Mount {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("umount").arg(&self.0).status();
+        }
+    }
+
+    /// A downloads folder with no space left takes an empty file but no
+    /// bytes, and a run there would hash for hours and then fail to save its
+    /// cache: the check writes a few bytes, so it says so first. Runs where
+    /// the test may mount a small tmpfs.
+    #[test]
+    fn check_refuses_a_downloads_folder_with_no_space_left() {
+        let root = TempDir::new("check_full");
+        let downloads = root.join("downloads");
+        let media = root.join("media");
+        fs::create_dir_all(&downloads).expect("create downloads");
+        fs::create_dir_all(&media).expect("create media");
+        let Some(_mount) = Mount::tmpfs(&downloads, "8k") else {
             return;
-        }
+        };
+        // Fill it: the write stops when the space runs out.
+        let _ = fs::write(downloads.join("fill"), vec![0u8; 64 * 1024]);
 
-        #[cfg(unix)]
-        {
-            let root = TempDir::new("probe_symlink");
-            let victim = root.join("victim");
-            fs::write(&victim, b"keep").expect("write victim");
-            let link = root.join(format!(".dejaview_validate_{}.{}", std::process::id(), 1u8));
-            std::os::unix::fs::symlink(&victim, &link).expect("create symlink");
-
-            for _ in 0..16 {
-                probe_directory_writable(&root).expect("probe should succeed");
-            }
-
-            assert_eq!(fs::read(&victim).expect("read victim"), b"keep");
-        }
+        let Problems(problems) =
+            check(&config_for(&downloads, &media)).expect_err("no space in downloads");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("downloads path is not writable")
+                && problems[0].contains("No space left"),
+            "{problems:?}"
+        );
     }
 
     #[test]

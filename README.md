@@ -281,7 +281,7 @@ Files whose name starts with `.dejaview_` are never treated as duplicates.
 
 **A pair failed with "source changed since planning".** The download changed between the scan and the link, usually because a client was still writing it. Run again later, or raise `min_age`.
 
-**Files named `.dejaview_hardlink.tmp.*` or `.dejaview_link.tmp.*` in downloads.** A link run was killed in the middle of a replacement. `dejaview cache audit-temp` lists them and `dejaview cache cleanup-temp` deletes them.
+**Files named `.dejaview_hardlink.tmp.*` or `.dejaview_link.tmp.*` in downloads.** A link run was killed in the middle of a replacement. A `.dejaview_validate_write.*` file is the check every run makes that it can write there, left by a run killed at that moment. `dejaview cache audit-temp` lists them and `dejaview cache cleanup-temp` deletes them.
 
 **A scan reads a file it read before.** A cache entry is valid only while the file's size, modification time, change time and inode stay the same. A link run or a `chmod` changes the change time, so that file is hashed once more.
 

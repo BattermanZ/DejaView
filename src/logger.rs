@@ -248,12 +248,16 @@ mod tests {
         let path = root.join("dejaview.log");
         let contents = write_test_log(
             &path,
-            "link",
+            "escape_check",
             "first\nsecond \"quoted\" back\\slash\ttab\u{7}",
         )
         .expect("write test log");
-        assert_eq!(contents.lines().count(), 2, "{contents}");
-        let line = contents.lines().next().expect("the entry");
+        // Found by its op: other tests running at once log through the same
+        // global logger, so their lines may land in this file too.
+        let line = contents
+            .lines()
+            .find(|line| line.contains(" op=escape_check "))
+            .unwrap_or_else(|| panic!("the entry: {contents}"));
         assert!(
             line.ends_with(r#"msg="first\nsecond \"quoted\" back\\slash\ttab\u{7}""#),
             "{line}"
