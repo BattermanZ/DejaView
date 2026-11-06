@@ -119,11 +119,12 @@ Add/adjust rows so this becomes the single source of truth for â€œwhat to testâ€
 | TUI | `src/tui/` | `cargo test tui::` | Engine, Shared |
 | CLI | `src/main.rs` | `cargo test` (main wires every component) | Engine, TUI, Shared |
 | Shared | `src/protocol.rs`, `src/config.rs`, `src/fsutil.rs`, `src/logger.rs` | `cargo test -- config:: fsutil:: logger::` (then see dependents) | none |
-| Build | `Cargo.toml`, `Cargo.lock` | `cargo test` | all |
+| Build | `Cargo.toml`, `Cargo.lock`, `.github/workflows/` | `cargo test` | all |
 | Docs | `README.md`, `docs/`, `AGENTS.md`, `LICENSE` | none (rule 4) | none |
 
 Notes:
-- This is one crate, so `cargo fmt --check` and `cargo clippy --all-targets` cover everything; run both for any code change. Clippy is expected to stay warning-free.
+- This is one crate, so `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` cover everything; run both for any code change.
+- CI (`.github/workflows/ci.yml`) runs fmt, clippy with `-D warnings` and `cargo test` on every push and pull request.
 - Run the perf harness when hashing, caching or collection changes (`src/engine/hashing.rs`, `cache.rs`, `collect.rs`).
 - Keep commands short and copy/pasteable.
 
