@@ -1100,7 +1100,8 @@ mod tests {
             files_considered: 2,
             planned_actions: 2,
             applied_actions: 1,
-            total_saved_bytes: 30,
+            freed_bytes: 10,
+            total_saved_bytes: 10,
             skipped_by_min_age: 0,
             skipped_by_min_size: 0,
             skipped_by_exclude: 0,
@@ -1133,6 +1134,7 @@ mod tests {
                     error: None,
                 },
             ],
+            ..Default::default()
         });
 
         assert_eq!(format_bytes(app.saved_bytes()), "10.00 B");
@@ -1172,6 +1174,7 @@ mod tests {
                 link_errors: 0,
             },
             entries: vec![planned("/downloads/a.mkv"), planned("/downloads/b.mkv")],
+            ..Default::default()
         });
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
@@ -1222,6 +1225,7 @@ mod tests {
                 fallback_reason: None,
                 error: None,
             }],
+            ..Default::default()
         });
         for mode in [ConfirmLinkMode::All, ConfirmLinkMode::Selected] {
             let backend = ratatui::backend::TestBackend::new(80, 24);

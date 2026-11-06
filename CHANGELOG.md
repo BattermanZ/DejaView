@@ -4,6 +4,9 @@
 
 ### After upgrading
 
+- A scan or link that finishes with a file it could not read, hash or link now exits with code 2, where it exited 0, and a link run stopped partway by Ctrl+C, SIGTERM or the dashboard's cancel exits 1. A cron line that alerts on any non-zero code now alerts on those runs; the report and the log say which file failed and why. [#5]
+- `total_saved_bytes` in a link run's report is what the run freed, where it was every planned path's size, failed ones included; in a scan's it counts a cross-seeded download once. `planned_bytes` and `freed_bytes` give both. [#5]
+- A link run that planned nothing leaves `.dejaview_link_report.json` as it was, so it keeps the last run that did something. Before, every link run overwrote it, with an empty report when there was nothing to do. A path given with `--report` is still always written. [#5]
 - A scan, link or `cache cleanup-temp` that finds another run going exits with code 3 and changes nothing. A cron line that alerts on any non-zero code should treat 3 as nothing to report; the README's cron example does. [#3]
 - A report entry's `status` can now also be `already-linked` (the download already was the library file, so nothing changed; such pairs used to be reported as `applied`) or `skipped` (left alone on purpose, with the reason in `error`). A script that counts statuses should know both. [#3]
 - A pair that mergerfs's `link-exdev` option turned into a symlink is reported with `method` `symlink`, where it used to say `hardlink`. [#3]
@@ -15,6 +18,7 @@
 
 ### Added
 
+- The report says how its run ended (`outcome`: `complete`, `cancelled` or `failed`), when (`started_at`, `finished_at`), with what (`version`, `downloads`, `media`, `link_mode`), how many downloads became symlinks (`symlinked`) and how many pairs already were one file (`already_linked`, `already_linked_bytes`). [#5]
 - `dejaview config set-full-threads N` sets how many files are read in full at once. [#4]
 - `dejaview config set-exclude [PATTERN]...` sets the file and folder names every walk leaves out, as globs, with everything under them. The report counts what the list left out in `skipped_by_exclude`, the summary says how many, and the log names each. [#4]
 - `DEJAVIEW_CONFIG` sets the config file's path and `DEJAVIEW_LOG` the log's, or `-` for stderr, for containers and services run as a user with no home folder. [#3]
@@ -38,6 +42,9 @@
 
 ### Fixed
 
+- A failed pair's `error` in the report keeps the OS error, such as "Read-only file system", where it said only which step failed, and its `method` and `fallback_reason` no longer claim the planned hardlink. [#5]
+- `--json --strict` prints the report before stopping on a failure. Before, it printed nothing on stdout. [#5]
+- Planned pairs come in download path order in the table, the report, `--json` and the dashboard. Before, the order changed on every run, so two reports could not be compared, and the dashboard's rows reshuffled when a scan finished. [#5]
 - Ctrl+C, SIGTERM (a cron timeout, `docker stop`) or SIGHUP stops a scan or link before its next file and keeps the hashes it finished; a second Ctrl+C stops at once. Before, it ended the process on the spot and every hash of the run was lost, so a first run over a network drive that was interrupted started over from nothing. A run started under `nohup` still ignores hang-ups. [#4]
 - While hashing, the cache is saved every five minutes, so a run killed outright (SIGKILL, a power cut, a container stopped without grace) loses at most that much hashing. Before, it was saved only once hashing ended. [#4]
 - A cache file that cannot be read or parsed is named in the log with the reason before DejaView starts over with an empty one. Before, it was replaced silently, and the next run hashed the whole library again with no explanation. [#4]
@@ -57,3 +64,4 @@
 
 [#3]: https://github.com/BattermanZ/DejaView/pull/3
 [#4]: https://github.com/BattermanZ/DejaView/pull/4
+[#5]: https://github.com/BattermanZ/DejaView/pull/5

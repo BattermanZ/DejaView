@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct WarningSummary {
     pub walk_errors: u64,
     pub metadata_errors: u64,
@@ -37,14 +37,60 @@ impl LinkReportEntry {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// How a run ended. Fields added after the first release default when a
+/// report written before them is read.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RunReport {
     pub mode: String,
+    /// `complete` (the run reached its end, whatever failed on the way, which
+    /// `warnings` counts), `cancelled` (stopped on request; pairs not reached
+    /// stay `planned`) or `failed` (stopped by `--strict` on a failure).
+    #[serde(default)]
+    pub outcome: String,
+    /// The DejaView version that wrote the report.
+    #[serde(default)]
+    pub version: String,
+    /// When the run started and ended, in UTC, as RFC 3339
+    /// (`2026-11-06T03:17:00Z`).
+    #[serde(default)]
+    pub started_at: String,
+    #[serde(default)]
+    pub finished_at: String,
+    /// The downloads and media folders the run used.
+    #[serde(default)]
+    pub downloads: String,
+    #[serde(default)]
+    pub media: String,
+    /// `best` (hardlink, else symlink) or `symlink-only`.
+    #[serde(default)]
+    pub link_mode: String,
     pub dry_run: bool,
     pub strict: bool,
     pub files_considered: usize,
     pub planned_actions: usize,
+    /// Pairs this run replaced with a link. Pairs found to be one file
+    /// already are counted in `already_linked`, not here.
     pub applied_actions: usize,
+    /// Applied pairs whose download became a symlink, which breaks if its
+    /// library file is upgraded, renamed or deleted.
+    #[serde(default)]
+    pub symlinked: usize,
+    /// Pairs found at link time to be one file already; nothing changed.
+    #[serde(default)]
+    pub already_linked: usize,
+    /// The bytes those pairs hold.
+    #[serde(default)]
+    pub already_linked_bytes: u64,
+    /// What the planned pairs would free, each download file counted once
+    /// however many of its paths are planned (cross-seeded downloads are
+    /// hardlinks of each other).
+    #[serde(default)]
+    pub planned_bytes: u64,
+    /// What this run freed: a download's bytes come back only when its last
+    /// path is replaced. 0 for a scan.
+    #[serde(default)]
+    pub freed_bytes: u64,
+    /// `planned_bytes` for a scan, `freed_bytes` for a link run.
     pub total_saved_bytes: u64,
     pub skipped_by_min_age: u64,
     /// Files under the size floor, empty files included. Missing in reports
@@ -98,7 +144,7 @@ pub enum TuiEvent {
         message: String,
     },
     Done {
-        report: RunReport,
+        report: Box<RunReport>,
     },
     Error {
         message: String,

@@ -198,7 +198,7 @@ impl From<LinkModeArg> for LinkMode {
 
 fn main() -> ExitCode {
     match run_cli() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(err) if err.is::<engine::Cancelled>() => {
             eprintln!(
                 "{} Stopped before changing anything. The hashes finished so far are saved in the cache, so the next run starts from there.",
@@ -219,7 +219,18 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_cli() -> Result<()> {
+/// The exit code of a scan or link that returned (ADR 0003): 0 when nothing
+/// failed, 2 when it finished with failures `--strict` would have stopped on,
+/// and 1 for a link stopped on request partway, which did not finish.
+fn exit_code_of(end: engine::RunEnd) -> ExitCode {
+    match end {
+        engine::RunEnd::Clean => ExitCode::SUCCESS,
+        engine::RunEnd::WithFailures => ExitCode::from(2),
+        engine::RunEnd::Cancelled => ExitCode::FAILURE,
+    }
+}
+
+fn run_cli() -> Result<ExitCode> {
     let cli = Cli::parse();
     let command_name = command_name(&cli.command);
     let (_log_session, log_place) = logger::init(command_name);
@@ -240,7 +251,7 @@ fn run_cli() -> Result<()> {
             if min_size.is_some() {
                 config.min_size = min_size;
             }
-            engine::run_scan_with_options(
+            let end = engine::run_scan_with_options(
                 &config,
                 engine::ScanRunOptions {
                     dry_run: true,
@@ -260,7 +271,8 @@ fn run_cli() -> Result<()> {
                     only_pairs: &[],
                     cancel: run_cancel_token(output.tui_events),
                 },
-            )?
+            )?;
+            return Ok(exit_code_of(end));
         }
         Commands::Link {
             strict,
@@ -284,7 +296,7 @@ fn run_cli() -> Result<()> {
             if min_size.is_some() {
                 config.min_size = min_size;
             }
-            engine::run_scan_with_options(
+            let end = engine::run_scan_with_options(
                 &config,
                 engine::ScanRunOptions {
                     dry_run: false,
@@ -304,7 +316,8 @@ fn run_cli() -> Result<()> {
                     only_pairs: &only_pairs,
                     cancel: run_cancel_token(output.tui_events),
                 },
-            )?
+            )?;
+            return Ok(exit_code_of(end));
         }
         Commands::Config(args) => match args.command {
             ConfigCommands::SetDownloads { path } => {
@@ -408,7 +421,7 @@ fn run_cli() -> Result<()> {
             tui::run_logo_preview()?;
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn command_name(command: &Commands) -> &'static str {
@@ -555,7 +568,7 @@ fn validate_config(config: &config::Config) -> Result<()> {
         )
     {
         if let Err(err) = config::ensure_roots_disjoint(&downloads, &media) {
-            failures.push(err.to_string());
+            failures.push(format!("{err:#}"));
         } else if let Err(err) =
             engine::ensure_roots_not_mounted_inside(&downloads, &media, config.effective_exclude())
         {

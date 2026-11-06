@@ -1106,7 +1106,8 @@ fn run_scan_non_strict_link_failure_continues() {
             cancel: CancelToken::default(),
         },
     );
-    assert!(result.is_ok());
+    // ADR 0003: exit code 2, finished with a failure.
+    assert_eq!(result.expect("the run finishes"), RunEnd::WithFailures);
     let meta = fs::symlink_metadata(&src).expect("source metadata");
     assert!(meta.file_type().is_file());
 
@@ -1157,7 +1158,8 @@ fn run_scan_strict_link_failure_returns_error() {
     assert!(result.is_err());
     let err = result.expect_err("strict link failure expected");
     assert!(
-        err.to_string().contains("strict mode link failure"),
+        err.to_string()
+            .contains("--strict stopped the run at its first failed link"),
         "unexpected strict error: {err}"
     );
 
@@ -2509,4 +2511,210 @@ fn the_cache_does_not_vouch_for_a_download_that_is_a_library_file_through_a_moun
     assert!(why.contains("seen through a second mount"), "{why}");
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+/// A link run over `downloads` and `media` that writes its report to
+/// `report`, which it returns parsed.
+fn link_and_read_report(downloads: &Path, media: &Path, report: &Path) -> serde_json::Value {
+    run_scan(
+        &make_config(downloads, media, 0),
+        false,
+        false,
+        Some(report),
+    );
+    serde_json::from_str(&fs::read_to_string(report).expect("read report")).expect("parse report")
+}
+
+#[test]
+fn a_failed_pair_names_the_os_error_and_drops_the_planned_method() {
+    let root = unique_temp_dir("failed_pair_chain");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let src = downloads.join("movie.mkv");
+    let tgt = media.join("movie.mkv");
+    write_file(&src, b"same-content");
+    write_file(&tgt, b"same-content");
+    let action = super::types::LinkAction {
+        src: src.clone(),
+        tgt: tgt.clone(),
+        size: 12,
+        src_snapshot: snapshot_of(&src),
+        tgt_snapshot: snapshot_of(&tgt),
+    };
+    let mut entry = planned_entry_for(&action);
+    entry.method = Some("try-hardlink".to_string());
+    entry.fallback_reason = Some("tries hardlink first; may fall back to symlink".to_string());
+    // Gone between the plan and the link, as when a torrent is removed.
+    fs::remove_file(&src).expect("remove download");
+
+    let mut warnings = RunWarnings::default();
+    let mut report_entries = vec![entry];
+    apply_actions(
+        &[action],
+        &media,
+        &ApplyOptions {
+            downloads: &downloads,
+            strict: false,
+            json_output: true,
+            tui_events: false,
+            link_mode: LinkMode::Best,
+            cancel: &CancelToken::default(),
+        },
+        &mut warnings,
+        &mut report_entries,
+    );
+
+    let entry = &report_entries[0];
+    assert_eq!(entry.status, "failed");
+    let error = entry.error.as_deref().expect("error");
+    assert!(error.contains("cannot look up"), "{error}");
+    assert!(
+        error.contains("No such file or directory"),
+        "the OS error is kept: {error}"
+    );
+    assert_eq!(entry.method, None, "nothing was linked");
+    assert_eq!(entry.fallback_reason, None);
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn freed_bytes_count_a_cross_seeded_download_once() {
+    let root = unique_temp_dir("freed_bytes");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    // Two torrents seed one 18-byte file; a third download is its own file.
+    let first = downloads.join("t1").join("movie.mkv");
+    let second = downloads.join("t2").join("movie.mkv");
+    write_file(&first, b"cross-seeded-bytes");
+    fs::create_dir_all(second.parent().expect("t2")).expect("create t2");
+    fs::hard_link(&first, &second).expect("cross-seed hardlink");
+    write_file(&media.join("movie.mkv"), b"cross-seeded-bytes");
+    write_file(&downloads.join("show.mkv"), b"an episode");
+    write_file(&media.join("show.mkv"), b"an episode");
+
+    let report = link_and_read_report(&downloads, &media, &root.join("report.json"));
+
+    assert_eq!(report["applied_actions"], 3);
+    assert_eq!(report["planned_bytes"], 18 + 10);
+    assert_eq!(report["freed_bytes"], 18 + 10, "{report}");
+    assert_eq!(report["total_saved_bytes"], 18 + 10);
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_scan_counts_a_cross_seeded_download_once() {
+    let root = unique_temp_dir("planned_bytes");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let first = downloads.join("t1").join("movie.mkv");
+    let second = downloads.join("t2").join("movie.mkv");
+    write_file(&first, b"cross-seeded-bytes");
+    fs::create_dir_all(second.parent().expect("t2")).expect("create t2");
+    fs::hard_link(&first, &second).expect("cross-seed hardlink");
+    write_file(&media.join("movie.mkv"), b"cross-seeded-bytes");
+    let report = root.join("report.json");
+
+    run_scan(
+        &make_config(&downloads, &media, 0),
+        true,
+        false,
+        Some(&report),
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report).expect("read report"))
+            .expect("parse report");
+    assert_eq!(report["planned_actions"], 2);
+    assert_eq!(report["planned_bytes"], 18);
+    assert_eq!(report["total_saved_bytes"], 18);
+    assert_eq!(report["freed_bytes"], 0);
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_link_run_that_planned_nothing_leaves_the_last_report_alone() {
+    let root = unique_temp_dir("report_left_alone");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_file(&downloads.join("unique.mkv"), b"only in downloads");
+    write_file(&media.join("other.mkv"), b"only in the library");
+    let last_report = downloads.join(".dejaview_link_report.json");
+    fs::write(&last_report, b"the last run that linked something").expect("write report");
+    let config = make_config(&downloads, &media, 0);
+
+    run_scan(&config, false, false, None);
+    assert_eq!(
+        fs::read(&last_report).expect("read report"),
+        b"the last run that linked something"
+    );
+
+    // A path given with --report is always written.
+    let asked = root.join("asked.json");
+    run_scan(&config, false, false, Some(&asked));
+    assert!(asked.exists());
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_report_says_when_and_how_its_run_ended() {
+    let root = unique_temp_dir("report_fields");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_file(&downloads.join("movie.mkv"), b"same-content");
+    write_file(&media.join("movie.mkv"), b"same-content");
+
+    let report = link_and_read_report(&downloads, &media, &root.join("report.json"));
+
+    assert_eq!(report["outcome"], "complete");
+    assert_eq!(report["version"], env!("CARGO_PKG_VERSION"));
+    for field in ["started_at", "finished_at"] {
+        let stamp = report[field].as_str().expect(field);
+        assert!(
+            stamp.len() == 20 && stamp.ends_with('Z') && stamp.as_bytes()[10] == b'T',
+            "{field}: {stamp}"
+        );
+    }
+    assert!(report["started_at"].as_str() <= report["finished_at"].as_str());
+    assert_eq!(report["downloads"], downloads.display().to_string());
+    assert_eq!(report["media"], media.display().to_string());
+    assert_eq!(report["link_mode"], "best");
+    assert_eq!(report["symlinked"], 0);
+    assert_eq!(report["already_linked"], 0);
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn report_times_are_rfc_3339_in_utc() {
+    let at = |secs| super::report::rfc3339_utc(UNIX_EPOCH + Duration::from_secs(secs));
+    assert_eq!(at(0), "1970-01-01T00:00:00Z");
+    assert_eq!(at(951_782_400), "2000-02-29T00:00:00Z");
+    assert_eq!(at(1_762_399_020), "2025-11-06T03:17:00Z");
+    assert_eq!(at(4_102_444_799), "2099-12-31T23:59:59Z");
+}
+
+#[test]
+fn a_plan_comes_out_in_download_path_order() {
+    let mut groups = Vec::new();
+    // Many groups of one pair each: a hash map's order would show.
+    for n in 0..40u64 {
+        let mut library = sample_file_info(&format!("/media/{n:02}.mkv"), 1, 1000 + n, false);
+        let mut download = sample_file_info(&format!("/downloads/{n:02}.mkv"), 2, 2000 + n, true);
+        library.hash = Some(format!("h{n}"));
+        download.hash = Some(format!("h{n}"));
+        library.size = 10 + n;
+        download.size = 10 + n;
+        groups.push(vec![library, download]);
+    }
+    groups.reverse();
+
+    let plan = super::linking::plan_actions(&groups);
+
+    let sources: Vec<_> = plan
+        .actions
+        .iter()
+        .map(|action| action.src.clone())
+        .collect();
+    let mut sorted = sources.clone();
+    sorted.sort();
+    assert_eq!(sources, sorted);
 }

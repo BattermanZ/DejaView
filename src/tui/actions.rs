@@ -12,8 +12,11 @@ use crate::fsutil::safe_write_bytes;
 use super::model::{RunReport, TuiEvent};
 use crate::protocol::PlannedPair;
 
-fn should_forward_terminal_error(status_success: bool, saw_error_event: bool) -> bool {
-    !status_success && !saw_error_event
+/// A child that already ended its stream with a done, error or cancelled
+/// event has said how it ended; its exit code (2 for a run with failures, 1
+/// for a link cancelled partway) adds nothing to show.
+fn should_forward_terminal_error(status_success: bool, saw_final_event: bool) -> bool {
+    !status_success && !saw_final_event
 }
 
 /// Ask the child to stop when the UI sends a cancel. If the sender is dropped
@@ -121,7 +124,7 @@ fn stream_subcommand_events(
 
     if !status.success() {
         let message = child_failure_message(subcommand, &status.to_string(), &stderr);
-        if should_forward_terminal_error(status.success(), saw_error_event) {
+        if should_forward_terminal_error(status.success(), saw_done || saw_error_event) {
             let _ = tx.send(Err(anyhow!(message.clone())));
         }
         return Err(anyhow!(message));

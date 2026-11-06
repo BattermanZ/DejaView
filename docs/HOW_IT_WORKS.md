@@ -143,10 +143,10 @@ flowchart TD
     A[Run command] --> B{--json?}
     B -- yes --> C[Emit JSON to stdout]
     B -- no --> D[Emit human table + summary]
-    C --> E{--report given or default link report?}
+    C --> E{--report given, or a link run that planned something?}
     D --> E
     E -- yes --> F[Write JSON report file]
-    E -- no --> G[No report file written]
+    E -- no --> G[No report file written; the last one stays]
 ```
 
 ## 7) First-Run Checklist

@@ -23,8 +23,8 @@ use collect::{CollectOptions, collect_run_files, group_files_by_size};
 use hashing::{CHECKPOINT_EVERY, Checkpoint, HashOptions, Hashed, hash_groups_and_update_cache};
 use linking::{ApplyOptions, ApplyOutcome, apply_actions, plan_actions};
 use report::{
-    RunReportInput, build_report_entries, build_run_report, maybe_confirm_apply,
-    maybe_return_strict_errors, print_run_summary, print_space_summary, resolve_report_path,
+    Outcome, RunReportInput, build_report_entries, build_run_report, maybe_confirm_apply,
+    planned_bytes, print_run_summary, print_space_summary, resolve_report_path, strict_failure,
     try_write_run_report,
 };
 use types::{Cache, LinkAction, RunMetrics, RunWarnings};
@@ -131,7 +131,19 @@ pub fn probe_hardlink(downloads: &std::path::Path, media: &std::path::Path) -> H
     }
 }
 
-pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
+/// How a scan or link that returned ended, for its exit code (ADR 0003).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunEnd {
+    /// It finished and nothing failed, including a run with nothing to do.
+    Clean,
+    /// It finished, but a file could not be read, hashed or linked: what
+    /// `--strict` would have stopped on.
+    WithFailures,
+    /// A link stopped on request partway; the pairs it linked stay linked.
+    Cancelled,
+}
+
+pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
     let tui_events = options.tui_events;
     let result = run(config, options);
     if let Err(err) = &result
@@ -145,7 +157,8 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
     result
 }
 
-fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
+fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
+    let started_at = std::time::SystemTime::now();
     if options.json_output && options.tui_events {
         return Err(anyhow!("--json cannot be combined with --tui-events"));
     }
@@ -199,7 +212,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
     let Planned {
         files_seen,
         groups_found,
-        actions,
+        mut actions,
     } = match from_cache {
         Some(planned) => planned,
         None => plan_by_walking(
@@ -216,6 +229,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
             &mut metrics,
         )?,
     };
+    linking::sort_actions(&mut actions);
     if actions.len() < options.only_pairs.len() {
         let message = format!(
             "{} of the {} reviewed row(s) are no longer planned as shown, because a file changed since the scan; they are left alone. Scan again to review them.",
@@ -229,7 +243,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
             eprintln!("{} {message}", "⚠".yellow());
         }
     }
-    let total_saved_space = actions.iter().map(|action| action.size).sum();
+    let total_saved_space = planned_bytes(&actions);
     let planned_actions = actions.len();
     logger::info(
         "run",
@@ -260,12 +274,14 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         println!("{}", linking::action_table(&actions));
         print_space_summary(actions.is_empty(), total_saved_space);
     }
-    let out_path = resolve_report_path(downloads, &options);
+    let out_path = resolve_report_path(downloads, &options, planned_actions);
     let mut report_entries = build_report_entries(&actions, options.link_mode);
 
     let ApplyOutcome {
         applied: applied_actions,
         already_linked,
+        already_linked_bytes,
+        freed_bytes,
         skipped,
         strict_error: strict_link_error,
         cancelled: apply_cancelled,
@@ -340,13 +356,28 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         );
     }
 
+    let strict_error = strict_failure(strict_link_error, options.strict, &warnings);
+    let outcome = if strict_error.is_some() {
+        Outcome::Failed
+    } else if apply_cancelled {
+        Outcome::Cancelled
+    } else {
+        Outcome::Complete
+    };
     let report = build_run_report(
         &options,
         RunReportInput {
+            outcome,
+            started_at,
+            downloads,
+            media,
             files_seen,
             planned_actions,
             applied_actions,
-            total_saved_space,
+            already_linked,
+            already_linked_bytes,
+            planned_bytes: total_saved_space,
+            freed_bytes,
             metrics: metrics.clone(),
             warnings: warnings.clone(),
             entries: report_entries,
@@ -356,40 +387,49 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
         logger::info("run", format!("writing report to {}", path.display()));
         try_write_run_report(path, &report);
     }
+    // A script reading --json gets the report of a run --strict stopped too.
+    if options.json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    }
+    logger::info(
+        "run",
+        format!(
+            "finished mode={} outcome={} planned={} applied={} warnings={}",
+            report.mode,
+            report.outcome,
+            report.planned_actions,
+            report.applied_actions,
+            report.warning_total()
+        ),
+    );
 
-    if let Err(err) = maybe_return_strict_errors(strict_link_error, options.strict, &warnings) {
+    if let Some(err) = strict_error {
         if options.tui_events {
             let _ = types::emit_tui_event(&TuiEvent::Error {
-                message: err.to_string(),
+                message: format!("{err:#}"),
             });
         }
         return Err(err);
     }
 
-    let finished_mode = report.mode.clone();
-    let finished_planned = report.planned_actions;
-    let finished_applied = report.applied_actions;
-    let finished_warnings = report.warning_total();
-
-    if options.json_output {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else if options.tui_events {
-        let _ = types::emit_tui_event(&TuiEvent::Done { report });
-    } else if options.dry_run {
+    let failures = report.warning_total() > 0;
+    if options.tui_events {
+        let _ = types::emit_tui_event(&TuiEvent::Done {
+            report: Box::new(report),
+        });
+    } else if options.dry_run && !machine_output {
         println!("{} Dry-run; no changes.", "ℹ".yellow());
     }
-
     if !machine_output {
         println!("{} Done.", "✔".green());
     }
-    logger::info(
-        "run",
-        format!(
-            "finished mode={} planned={} applied={} warnings={}",
-            finished_mode, finished_planned, finished_applied, finished_warnings
-        ),
-    );
-    Ok(())
+    Ok(if apply_cancelled {
+        RunEnd::Cancelled
+    } else if failures {
+        RunEnd::WithFailures
+    } else {
+        RunEnd::Clean
+    })
 }
 
 /// The two roots of a run, as the filesystem knows them.

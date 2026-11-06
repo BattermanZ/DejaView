@@ -1490,3 +1490,81 @@ fn a_run_under_nohup_keeps_running_when_the_terminal_hangs_up() {
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+/// `dir` bind-mounted read-only onto itself, so nothing in it can be
+/// replaced, even by root. None where this process may not mount.
+fn read_only(dir: &Path) -> Option<BindMount> {
+    let mount = BindMount::new(dir, dir)?;
+    let status = Command::new("mount")
+        .args(["-o", "remount,ro,bind"])
+        .arg(dir)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    status.success().then_some(mount)
+}
+
+/// One pair that links and one in a read-only folder that cannot.
+fn tree_with_one_pair_that_cannot_link(root: &Path) -> Option<(PathBuf, BindMount)> {
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("ok").join("b.mkv"), 3000, 1);
+    write_seeded(&media.join("b.mkv"), 3000, 1);
+    write_seeded(&downloads.join("ro").join("a.mkv"), 2000, 2);
+    write_seeded(&media.join("a.mkv"), 2000, 2);
+    configure_small_files(root, &downloads, &media);
+    let mount = read_only(&downloads.join("ro"))?;
+    Some((downloads, mount))
+}
+
+#[test]
+fn a_link_run_with_a_failed_pair_exits_2_and_says_why() {
+    let root = unique_temp_dir("exit_2");
+    let Some((_downloads, mount)) = tree_with_one_pair_that_cannot_link(&root) else {
+        eprintln!("skipped: this process may not mount");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    };
+
+    let out = run_cmd(&root, &["link", "--json", "--no-progress"]);
+    drop(mount);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse report");
+    assert_eq!(report["outcome"], "complete");
+    assert_eq!(report["applied_actions"], 1);
+    assert_eq!(report["freed_bytes"], 3000);
+    let failed = &report["entries"][1];
+    assert_eq!(failed["status"], "failed", "{report}");
+    assert!(
+        failed["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("Read-only file system")),
+        "the OS error is kept: {failed}"
+    );
+    assert_eq!(failed["method"], serde_json::Value::Null);
+    assert_eq!(failed["fallback_reason"], serde_json::Value::Null);
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_strict_json_run_prints_its_report_before_the_error() {
+    let root = unique_temp_dir("strict_json");
+    let Some((_downloads, mount)) = tree_with_one_pair_that_cannot_link(&root) else {
+        eprintln!("skipped: this process may not mount");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    };
+
+    let out = run_cmd(&root, &["link", "--json", "--strict", "--no-progress"]);
+    drop(mount);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr={stderr}");
+    assert!(stderr.contains("--strict stopped the run"), "{stderr}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse report");
+    assert_eq!(report["outcome"], "failed");
+    assert_eq!(report["applied_actions"], 1);
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}

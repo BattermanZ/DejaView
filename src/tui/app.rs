@@ -220,21 +220,13 @@ impl App {
             .unwrap_or(0)
     }
 
+    /// What link runs freed: a download's bytes come back only once its
+    /// last path is replaced, which the run counts as it links.
     pub fn saved_bytes(&self) -> u64 {
         self.report
             .as_ref()
-            .map(|report| {
-                if report.mode != "link" {
-                    return 0;
-                }
-                report
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.status.eq_ignore_ascii_case("applied"))
-                    .map(|entry| entry.size)
-                    .sum()
-            })
-            .unwrap_or(0)
+            .filter(|report| report.mode == "link")
+            .map_or(0, |report| report.freed_bytes)
     }
 
     pub fn potential_saved_bytes(&self) -> u64 {
@@ -1031,6 +1023,13 @@ impl App {
             TuiEvent::PlannedEntries { entries } => {
                 if !entries.is_empty() {
                     self.live_entries.extend(entries);
+                    // Groups finish in any order; keep the rows in the order
+                    // the finished report lists them, so they do not jump.
+                    self.live_entries.sort_by(|a, b| {
+                        a.source
+                            .cmp(&b.source)
+                            .then_with(|| a.target.cmp(&b.target))
+                    });
                     self.live_planned_actions = Some(self.live_entries.len());
                     self.latest_activity_message = Some(format!(
                         "Planning actions: {} queued",
@@ -1075,9 +1074,11 @@ impl App {
                 true
             }
             TuiEvent::Done { report } => {
+                let report = *report;
                 let planned = report.planned_actions;
                 let applied = report.applied_actions;
                 let link_failures = report.warnings.link_errors;
+                let cancelled = report.outcome == "cancelled";
                 let symlinked = report
                     .entries
                     .iter()
@@ -1095,6 +1096,9 @@ impl App {
                 self.finish_live_run();
                 let line = match kind {
                     JobKind::Scan => format!("Scan finished. Planned actions: {planned}"),
+                    _ if cancelled => format!(
+                        "Link cancelled after {applied} of {planned} action(s); the rest stay planned."
+                    ),
                     JobKind::LinkAll => format!("Link finished. Applied actions: {applied}"),
                     JobKind::LinkSelected(_) => {
                         format!("Selected link finished. Applied actions: {applied}")
@@ -1182,6 +1186,12 @@ impl App {
         match kind {
             JobKind::LinkSelected(_) => {
                 if let Some(existing) = &mut self.report {
+                    // A scan's report freed nothing; a link's adds up.
+                    let freed_before = if existing.mode == "link" {
+                        existing.freed_bytes
+                    } else {
+                        0
+                    };
                     for entry in &report.entries {
                         if let Some(current) = existing.entries.iter_mut().find(|current| {
                             current.source == entry.source && current.target == entry.target
@@ -1206,8 +1216,13 @@ impl App {
                         .iter()
                         .filter(|entry| entry.status.eq_ignore_ascii_case("planned"))
                         .count();
-                    existing.total_saved_bytes =
-                        existing.entries.iter().map(|entry| entry.size).sum();
+                    existing.freed_bytes = freed_before + report.freed_bytes;
+                    existing.total_saved_bytes = existing.freed_bytes;
+                    existing.symlinked = existing
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.is_applied_symlink())
+                        .count();
                     existing.warnings.link_errors = existing
                         .entries
                         .iter()
@@ -1336,6 +1351,7 @@ mod tests {
                 link_errors: 0,
             },
             entries: vec![],
+            ..Default::default()
         }
     }
 
@@ -1353,7 +1369,8 @@ mod tests {
             files_considered: 2,
             planned_actions: 2,
             applied_actions: 1,
-            total_saved_bytes: 30,
+            freed_bytes: 10,
+            total_saved_bytes: 10,
             skipped_by_min_age: 0,
             skipped_by_min_size: 0,
             skipped_by_exclude: 0,
@@ -1386,6 +1403,7 @@ mod tests {
                     error: Some("boom".to_string()),
                 },
             ],
+            ..Default::default()
         });
 
         assert_eq!(app.saved_bytes(), 10);
@@ -1440,7 +1458,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.running_job = Some(RunningJob::new(JobKind::Scan, rx, mpsc::channel().0));
         tx.send(Ok(TuiEvent::Done {
-            report: sample_report(),
+            report: Box::new(sample_report()),
         }))
         .expect("send result");
 
@@ -1460,7 +1478,10 @@ mod tests {
         let mut report = sample_report();
         report.mode = "link".to_string();
         report.warnings.link_errors = 2;
-        tx.send(Ok(TuiEvent::Done { report })).expect("send result");
+        tx.send(Ok(TuiEvent::Done {
+            report: Box::new(report),
+        }))
+        .expect("send result");
 
         app.poll_running_job();
 
@@ -1545,6 +1566,30 @@ mod tests {
                 .and_then(|entry| entry.method.as_deref()),
             Some("try-hardlink")
         );
+    }
+
+    #[test]
+    fn live_rows_stay_in_download_path_order() {
+        let mut app = App::new(&Config::default(), false);
+        let entry = |source: &str| LinkReportEntry {
+            source: source.to_string(),
+            target: "/media/a.mkv".to_string(),
+            size: 10,
+            status: "planned".to_string(),
+            method: None,
+            fallback_reason: None,
+            error: None,
+        };
+        for source in ["/dl/c.mkv", "/dl/a.mkv", "/dl/b.mkv"] {
+            app.apply_tui_event(
+                JobKind::Scan,
+                TuiEvent::PlannedEntries {
+                    entries: vec![entry(source)],
+                },
+            );
+        }
+        let sources: Vec<_> = app.rows().iter().map(|row| row.source.as_str()).collect();
+        assert_eq!(sources, ["/dl/a.mkv", "/dl/b.mkv", "/dl/c.mkv"]);
     }
 
     #[test]
@@ -1897,7 +1942,12 @@ mod tests {
         let mut linked = sample_report();
         linked.files_considered = 3;
 
-        assert!(app.apply_tui_event(JobKind::LinkAll, TuiEvent::Done { report: linked }));
+        assert!(app.apply_tui_event(
+            JobKind::LinkAll,
+            TuiEvent::Done {
+                report: Box::new(linked)
+            }
+        ));
 
         assert_eq!(app.live_files_seen, Some(7));
         assert_eq!(app.report.as_ref().map(|r| r.files_considered), Some(7));
@@ -2039,6 +2089,7 @@ mod tests {
                     error: None,
                 },
             ],
+            ..Default::default()
         });
 
         let (tx, rx) = mpsc::channel();
@@ -2048,7 +2099,7 @@ mod tests {
             mpsc::channel().0,
         ));
         tx.send(Ok(TuiEvent::Done {
-            report: RunReport {
+            report: Box::new(RunReport {
                 mode: "link".to_string(),
                 dry_run: false,
                 strict: false,
@@ -2077,7 +2128,8 @@ mod tests {
                     fallback_reason: None,
                     error: None,
                 }],
-            },
+                ..Default::default()
+            }),
         }))
         .expect("send result");
 

@@ -115,7 +115,7 @@ dejaview link --confirm
 | Option | Effect |
 |---|---|
 | `--json` | Print the run summary as JSON on stdout. Turns progress output off. |
-| `--report PATH` | Also write the summary to PATH. Without it, `link` writes `.dejaview_link_report.json` in downloads and `scan` writes nothing. |
+| `--report PATH` | Also write the summary to PATH. Without it, a `link` run that planned something writes `.dejaview_link_report.json` in downloads, one that planned nothing leaves that report as it was, and `scan` writes nothing. |
 | `--progress auto\|on\|off` | Progress bars. `auto` (the default) shows them on a terminal. |
 | `--no-progress` | Same as `--progress off`. |
 | `--strict` | Exit with an error if any file could not be read, hashed or linked. |
@@ -132,9 +132,37 @@ For a cron job, give the binary's absolute path (cron's `PATH` is short), drop s
 
 The line keeps what DejaView writes to stderr, which is warnings and errors, and prints it unless the run exited with 3; cron mails whatever is printed.
 
-Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder. A run that finds another one going does nothing and exits with code 3, so a cron run that overlaps a long first run, or a run from the dashboard, skips its turn. Exit code 0 means the run finished, and 1 that it could not start or stopped on an error (with `--strict`, on the first failure), or was stopped on request before it linked anything.
+Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder. A run that finds another one going does nothing and exits with code 3, so a cron run that overlaps a long first run, or a run from the dashboard, skips its turn.
 
-Ctrl+C, SIGTERM (a cron timeout, `docker stop`) or SIGHUP stops a scan or link before its next file, or partway through a large one, keeps every hash already finished in the cache and changes nothing more; a second Ctrl+C stops at once. While hashing, the cache is also saved every five minutes, so even a run killed outright loses at most that much work. A link run stopped this way while linking keeps the files it already linked, writes its report and exits 0; the report shows which pairs stayed planned. A run started under `nohup`, or with any of those signals ignored, keeps every signal as it was given.
+| Exit code | Meaning |
+|---|---|
+| 0 | The run finished and nothing failed, including a run with nothing to do. |
+| 1 | The run could not start, stopped on an error, was stopped on request, or `--strict` stopped it on a failure. |
+| 2 | The run finished, but a file could not be read, hashed or linked: what `--strict` would have stopped on. The report and the log say which. |
+| 3 | Another run holds the lock on the downloads folder, so this one did nothing. |
+
+Ctrl+C, SIGTERM (a cron timeout, `docker stop`) or SIGHUP stops a scan or link before its next file, or partway through a large one, keeps every hash already finished in the cache and changes nothing more; a second Ctrl+C stops at once. While hashing, the cache is also saved every five minutes, so even a run killed outright loses at most that much work. A link run stopped this way while linking keeps the files it already linked, writes its report with `outcome` `cancelled` and exits 1; the report shows which pairs stayed planned. A run started under `nohup`, or with any of those signals ignored, keeps every signal as it was given.
+
+### The report
+
+`--json` prints it and `--report` (or a link run's default) writes it; both are the same JSON object. A script can rely on these fields:
+
+| Field | Meaning |
+|---|---|
+| `mode` | `scan` or `link`. |
+| `outcome` | `complete` (the run reached its end, whatever failed on the way), `cancelled` (stopped on request) or `failed` (`--strict` stopped it). |
+| `started_at`, `finished_at` | When the run started and ended, UTC, as RFC 3339. |
+| `version`, `downloads`, `media`, `link_mode` | The DejaView version and the settings the run used. |
+| `planned_actions`, `applied_actions` | Pairs planned, and pairs this run replaced with a link. |
+| `symlinked` | Applied pairs whose download became a symlink. |
+| `already_linked`, `already_linked_bytes` | Pairs found to be one file already, which changed nothing, and their size. |
+| `planned_bytes` | What the planned pairs would free, each download file counted once however many of its paths are planned. |
+| `freed_bytes` | What this run freed. A download's bytes come back only once its last path is replaced, so a cross-seeded file counts when its last copy is linked. |
+| `total_saved_bytes` | `planned_bytes` for a scan, `freed_bytes` for a link run. |
+| `files_considered`, `skipped_by_min_age`, `skipped_by_min_size`, `skipped_by_exclude`, `skipped_as_library_file` | Files the run looked at, and those it left out and why. |
+| `dangling_symlinks` | Symlinks in downloads that point into the library and no longer resolve. |
+| `warnings` | Counts of files that could not be walked, read, hashed or linked. |
+| `entries` | One per planned pair, in download path order: `source`, `target`, `size`, `status` (`planned`, `applied`, `already-linked`, `skipped` or `failed`), `method`, `fallback_reason` and `error`, which keeps the OS error. |
 
 ### Terminal dashboard
 
@@ -192,7 +220,7 @@ If the log cannot be written, DejaView warns once, naming the path, and runs wit
 | File | When |
 |---|---|
 | `<downloads>/.dejaview_cache.json` | Every scan and link that learns a hash or drops an entry. Each entry is keyed by its folder (`downloads` or `media`) and its path below it, so the same share mounted at another path, as in a Docker container, uses the same entries. Entries for files that no longer exist are dropped after each complete run. |
-| `<downloads>/.dejaview_link_report.json` | Every link run without `--report`. |
+| `<downloads>/.dejaview_link_report.json` | Every link run without `--report` that planned something. |
 | `<downloads>/.dejaview_tui_report.json` | When you press `R` in the dashboard. |
 | `<downloads>/.dejaview_lock` | Every scan, link and `cache cleanup-temp`, which lock it while they run. It stays, empty; deleting it between runs is harmless. |
 | `~/.local/state/dejaview/dejaview.log` | Every command (under `$XDG_STATE_HOME` when set, or at `$DEJAVIEW_LOG`). Once it passes 5 MiB it moves to `dejaview.log.1`, replacing the previous one, so the two together stay near 10 MiB. |

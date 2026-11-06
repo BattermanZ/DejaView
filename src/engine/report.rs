@@ -169,17 +169,56 @@ pub(super) fn try_write_run_report(path: &Path, report: &RunReport) {
     }
 }
 
+/// Where this run's report goes: the `--report` path whenever one is given,
+/// else, for a link run that planned something, the one fixed report in
+/// downloads. A run that planned nothing leaves that report as it was, so
+/// the record of the last run that did something survives (ADR 0003).
 pub(super) fn resolve_report_path(
     downloads: &Path,
     options: &ScanRunOptions<'_>,
+    planned_actions: usize,
 ) -> Option<PathBuf> {
     options.report_path.map(PathBuf::from).or_else(|| {
-        if options.dry_run {
+        if options.dry_run || planned_actions == 0 {
             None
         } else {
             Some(downloads.join(".dejaview_link_report.json"))
         }
     })
+}
+
+/// What the planned actions would free, each download file counted once
+/// however many of its paths are planned: cross-seeded downloads are
+/// hardlinks of each other, and their bytes come back only once.
+pub(super) fn planned_bytes(actions: &[LinkAction]) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    actions
+        .iter()
+        .filter(|action| seen.insert((action.src_snapshot.dev, action.src_snapshot.inode)))
+        .map(|action| action.size)
+        .sum()
+}
+
+/// `time` in UTC as RFC 3339, to the second: `2026-11-06T03:17:00Z`.
+pub(super) fn rfc3339_utc(time: std::time::SystemTime) -> String {
+    let secs = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let (days, rest) = (secs / 86_400, secs % 86_400);
+    let (hour, minute, second) = (rest / 3600, rest % 3600 / 60, rest % 60);
+    // Days since 1970-01-01 to a civil date, after Howard Hinnant's
+    // days_from_civil inverse; every value here is non-negative.
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 pub(super) fn build_report_entries(
@@ -222,12 +261,32 @@ pub(super) fn build_run_report(options: &ScanRunOptions<'_>, input: RunReportInp
         } else {
             "link".to_string()
         },
+        outcome: input.outcome.as_str().to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        started_at: rfc3339_utc(input.started_at),
+        finished_at: rfc3339_utc(std::time::SystemTime::now()),
+        downloads: input.downloads.display().to_string(),
+        media: input.media.display().to_string(),
+        link_mode: match options.link_mode {
+            LinkMode::Best => "best",
+            LinkMode::SymlinkOnly => "symlink-only",
+        }
+        .to_string(),
         dry_run: options.dry_run,
         strict: options.strict,
         files_considered: input.files_seen,
         planned_actions: input.planned_actions,
         applied_actions: input.applied_actions,
-        total_saved_bytes: input.total_saved_space,
+        symlinked: symlinked_count(&input.entries),
+        already_linked: input.already_linked,
+        already_linked_bytes: input.already_linked_bytes,
+        planned_bytes: input.planned_bytes,
+        freed_bytes: input.freed_bytes,
+        total_saved_bytes: if options.dry_run {
+            input.planned_bytes
+        } else {
+            input.freed_bytes
+        },
         skipped_by_min_age: input.metrics.skipped_by_min_age,
         skipped_by_min_size: input.metrics.skipped_by_min_size,
         skipped_by_exclude: input.metrics.skipped_by_exclude,
@@ -249,26 +308,58 @@ pub(super) fn build_run_report(options: &ScanRunOptions<'_>, input: RunReportInp
     }
 }
 
-pub(super) struct RunReportInput {
+/// How a run that built its report ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Outcome {
+    /// It reached its end, whatever failed on the way.
+    Complete,
+    /// Stopped on request between pairs.
+    Cancelled,
+    /// `--strict` stopped it on a failure.
+    Failed,
+}
+
+impl Outcome {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Complete => "complete",
+            Outcome::Cancelled => "cancelled",
+            Outcome::Failed => "failed",
+        }
+    }
+}
+
+pub(super) struct RunReportInput<'a> {
+    pub(super) outcome: Outcome,
+    pub(super) started_at: std::time::SystemTime,
+    pub(super) downloads: &'a Path,
+    pub(super) media: &'a Path,
     pub(super) files_seen: usize,
     pub(super) planned_actions: usize,
     pub(super) applied_actions: usize,
-    pub(super) total_saved_space: u64,
+    pub(super) already_linked: usize,
+    pub(super) already_linked_bytes: u64,
+    pub(super) planned_bytes: u64,
+    pub(super) freed_bytes: u64,
     pub(super) metrics: RunMetrics,
     pub(super) warnings: RunWarnings,
     pub(super) entries: Vec<LinkReportEntry>,
 }
 
-pub(super) fn maybe_return_strict_errors(
+/// The error `--strict` turns this run's failures into, if any.
+pub(super) fn strict_failure(
     strict_link_error: Option<anyhow::Error>,
     strict: bool,
     warnings: &RunWarnings,
-) -> Result<()> {
-    if let Some(err) = strict_link_error {
-        return Err(err);
+) -> Option<anyhow::Error> {
+    if strict_link_error.is_some() {
+        return strict_link_error;
     }
     if strict && warning_total(warnings) > 0 {
-        return Err(anyhow!("strict mode failed due to scan/hash warnings"));
+        return Some(anyhow!(
+            "--strict stopped the run: {} file(s) could not be read, hashed or linked; the log names each",
+            warning_total(warnings)
+        ));
     }
-    Ok(())
+    None
 }
