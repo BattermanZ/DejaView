@@ -332,7 +332,9 @@ fn run_cli() -> Result<()> {
             }
             ConfigCommands::SetThreads { count } => {
                 if count == 0 {
-                    return Err(anyhow::anyhow!("threads must be greater than 0"));
+                    return Err(anyhow::anyhow!(
+                        "threads must be at least 1: it is how many files are walked and quick-hashed at once; 16 suits a network drive"
+                    ));
                 }
                 config.threads = Some(count);
                 save_config(&config)?;
@@ -340,7 +342,9 @@ fn run_cli() -> Result<()> {
             }
             ConfigCommands::SetFullThreads { count } => {
                 if count == 0 {
-                    return Err(anyhow::anyhow!("full threads must be greater than 0"));
+                    return Err(anyhow::anyhow!(
+                        "full threads must be at least 1: it is how many files are read in full at once; use 2, or 1 for a single spinning disk"
+                    ));
                 }
                 config.full_threads = Some(count);
                 save_config(&config)?;

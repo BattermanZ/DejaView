@@ -1557,7 +1557,7 @@ fn full_digest_stops_when_cancelled() {
     let cancel = CancelToken::default();
     cancel.cancel();
 
-    let err = super::hashing::full_digest(&path, &cancel).expect_err("cancelled digest");
+    let err = super::hashing::full_digest(&path, 4096, &cancel).expect_err("cancelled digest");
 
     assert!(err.is::<Cancelled>());
     fs::remove_dir_all(&root).expect("cleanup temp dir");
@@ -2450,6 +2450,63 @@ fn the_cache_vouches_only_for_rows_the_walk_would_plan_the_same() {
     fs::hard_link(media.join("a.mkv"), downloads.join("a.mkv")).expect("hardlink");
     let why = vouch(&downloads.join("a.mkv"), &media.join("a.mkv")).expect_err("hardlinked");
     assert!(why.contains("other hardlinks"), "{why}");
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn the_cache_does_not_vouch_for_a_download_that_is_a_library_file_through_a_mount() {
+    let root = unique_temp_dir("vouch_mount");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_file(&downloads.join("a.mkv"), b"same-content");
+    write_file(&media.join("A/a.mkv"), b"same-content");
+    let config = make_config(&downloads, &media, 0);
+    run_scan(&config, true, false, None);
+    let mut cache = load_cache(&downloads.join(".dejaview_cache.json"));
+    let keys = super::cache::CacheKeys::new(&downloads, &media);
+    let roots = (
+        RootId::of("downloads", &downloads).expect("downloads"),
+        RootId::of("media", &media).expect("media"),
+    );
+    let exclude = Exclude::default();
+    let filters = super::reviewed::Filters {
+        min_size: 1,
+        deadline: SystemTime::now(),
+        exclude: &exclude,
+    };
+    let pair = [(downloads.join("a.mkv"), media.join("A/a.mkv"))];
+    let vouch = |cache: &Cache| {
+        super::reviewed::plan_from_cache(&pair, &roots.0, &roots.1, cache, &keys, &filters)
+            .expect("no refusal")
+    };
+    assert!(vouch(&cache).is_ok(), "a plain copy is vouched for");
+    let download = cache["downloads/a.mkv"].clone();
+
+    // A library folder bind-mounted inside downloads: one device, one inode.
+    let mut bind = cache.clone();
+    bind.insert(
+        "media/B/a.mkv".into(),
+        CacheEntry {
+            hash: download.hash.clone(),
+            ..download.clone()
+        },
+    );
+    let why = vouch(&bind).expect_err("bind mount");
+    assert!(why.contains("seen through a second mount"), "{why}");
+
+    // A mergerfs branch and the pool: another device and inode, the same
+    // size and timestamps.
+    cache.insert(
+        "media/B/a.mkv".into(),
+        CacheEntry {
+            dev: download.dev + 1,
+            inode: download.inode + 1,
+            ..download
+        },
+    );
+    let why = vouch(&cache).expect_err("second device");
+    assert!(why.contains("seen through a second mount"), "{why}");
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

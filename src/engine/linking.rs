@@ -101,7 +101,12 @@ pub(super) fn snapshot_from_file_info(file: &FileInfo) -> FileSnapshot {
 
 /// The file at `path` itself, not what a symlink there points to.
 fn lstat(path: &Path) -> Result<fs::Metadata> {
-    fs::symlink_metadata(path).with_context(|| format!("metadata {}", path.display()))
+    fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "cannot look up {}; it may have been moved or deleted since the scan, so scan again",
+            path.display()
+        )
+    })
 }
 
 /// The source must be the file the plan saw. One exception: when this run has
@@ -433,8 +438,12 @@ fn check_temp_link(tmp: &Path, req: &LinkRequest<'_>) -> Result<TempLink> {
 /// earlier checks went by path; this one is what the rename will replace. The
 /// ctime may differ when this run replaced a hardlinked sibling (C1).
 fn ensure_pinned_source_unchanged(dir: &PinnedDir, req: &LinkRequest<'_>) -> Result<()> {
-    let meta = fs::symlink_metadata(dir.join(file_name_of(req.src)?))
-        .with_context(|| format!("metadata {}", req.src.display()))?;
+    let meta = fs::symlink_metadata(dir.join(file_name_of(req.src)?)).with_context(|| {
+        format!(
+            "cannot look up {} right before replacing it; nothing was replaced, scan again",
+            req.src.display()
+        )
+    })?;
     let expected = req.src_snapshot;
     let unchanged = meta.file_type().is_file()
         && meta.dev() == expected.dev

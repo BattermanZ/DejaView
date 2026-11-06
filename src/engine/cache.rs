@@ -55,6 +55,15 @@ pub(super) fn save_cache(path: &Path, cache: &Cache) -> Result<()> {
     safe_write_bytes(path, &json)
 }
 
+/// The first part of the key of every file under the media root.
+const MEDIA_KEY_ROOT: &str = "media";
+
+/// Whether a key names a file under the media root.
+pub(super) fn is_media_key(key: &str) -> bool {
+    key.strip_prefix(MEDIA_KEY_ROOT)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// How cache keys name paths: by root and the path below it, such as
 /// `media/Movies/Arrival (2016).mkv`. The same share mounted at two paths, say
 /// in a Docker cron job and on the host the dashboard runs on, then keys its
@@ -80,7 +89,7 @@ impl CacheKeys {
         let (name, root) = if in_downloads {
             ("downloads", &self.downloads)
         } else {
-            ("media", &self.media)
+            (MEDIA_KEY_ROOT, &self.media)
         };
         match path.strip_prefix(root) {
             Ok(rel) => format!("{name}/{}", rel.to_string_lossy()),

@@ -336,7 +336,7 @@ impl<'a> Walk<'a> {
         found.walk_errors += 1;
         if self.options.strict {
             shared.stop.set(anyhow!(
-                "walk error under {}: cannot read {}: {err}",
+                "walk error under {}: cannot read {}: {err}. Make it readable, add its name to the exclude list (`dejaview config set-exclude`), or run without --strict, which skips it with a warning",
                 self.root.path.display(),
                 path.display()
             ));
@@ -422,7 +422,10 @@ impl<'a> Walk<'a> {
                 if self.options.strict {
                     shared
                         .stop
-                        .set(anyhow!("metadata error for {}: {err}", path.display()));
+                        .set(anyhow!(
+                            "metadata error for {}: {err}. Make it readable, or run without --strict, which skips it with a warning",
+                            path.display()
+                        ));
                 }
                 return;
             }

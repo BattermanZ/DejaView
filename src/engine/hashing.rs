@@ -132,24 +132,35 @@ fn emit_hash_progress(done: usize, total: usize, tui_events: bool) {
     }
 }
 
-/// Full BLAKE3 of a file, checking for cancellation between chunks so a
-/// cancel does not wait for a large file to finish.
-pub(super) fn full_digest(path: &Path, cancel: &CancelToken) -> Result<String> {
+/// Full BLAKE3 of a file of `size` bytes, checking for cancellation between
+/// chunks so a cancel does not wait for a large file to finish.
+pub(super) fn full_digest(path: &Path, size: u64, cancel: &CancelToken) -> Result<String> {
     #[cfg(test)]
     read_log::record(path);
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    full_digest_from(&mut file, size, cancel)
+}
+
+/// Hash exactly the `size` bytes the walk saw. The size is known, so no read
+/// is spent finding the end of the file. A file that ends sooner changed
+/// since the walk, and is an error rather than the hash of less.
+fn full_digest_from<R: Read>(reader: &mut R, size: u64, cancel: &CancelToken) -> Result<String> {
     let mut hasher = Hasher::new();
     FULL_BUF.with_borrow_mut(|buf| -> Result<()> {
-        loop {
+        let mut done = 0u64;
+        while done < size {
             cancel.check()?;
-            let n = read_up_to(&mut file, buf)?;
+            let want = (size - done).min(buf.len() as u64) as usize;
+            let n = read_up_to(reader, &mut buf[..want])?;
             hasher.update(&buf[..n]);
-            // read_up_to stops short only at end of file: no read is spent
-            // asking again.
-            if n < buf.len() {
-                return Ok(());
+            done += n as u64;
+            if n < want {
+                return Err(anyhow!(
+                    "the file ended after {done} of the {size} bytes the walk found: it changed since, so scan again"
+                ));
             }
         }
+        Ok(())
     })?;
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -571,7 +582,7 @@ pub(super) fn hash_groups_and_update_cache(
                             sample_hash_errors.fetch_add(1, Ordering::Relaxed);
                             if strict {
                                 stop.set(anyhow!(
-                                    "sample hash error for {}: {err:#}",
+                                    "sample hash error for {}: {err:#}. Check that DejaView can read it and nothing is still writing it, or run without --strict, which skips it with a warning",
                                     file.path.display()
                                 ));
                             }
@@ -636,14 +647,15 @@ pub(super) fn hash_groups_and_update_cache(
                             return None;
                         }
                         let worker = worker_id();
-                        let path = &group[work.files[idx].members[0]].path;
+                        let file = &group[work.files[idx].members[0]];
+                        let path = &file.path;
                         emit_worker_activity(
                             "hashing_full",
                             worker,
                             Some(path.display().to_string()),
                             tui_events,
                         );
-                        let digest_result = full_digest(path, options.cancel);
+                        let digest_result = full_digest(path, file.size, options.cancel);
                         let done = full_done.fetch_add(1, Ordering::Relaxed) + 1;
                         emit_hash_progress(done as usize, total_full_files, tui_events);
                         if let Some(progress_bar) = &bar {
@@ -669,7 +681,7 @@ pub(super) fn hash_groups_and_update_cache(
                                 full_hash_errors.fetch_add(1, Ordering::Relaxed);
                                 if strict {
                                     stop.set(anyhow!(
-                                        "full hash error for {}: {err:#}",
+                                        "full hash error for {}: {err:#}. Check that DejaView can read it and nothing is still writing it, or run without --strict, which skips it with a warning",
                                         path.display()
                                     ));
                                 }
@@ -849,6 +861,29 @@ mod tests {
                 assert_eq!(digest, *blake3::hash(&data).as_bytes());
             }
         }
+    }
+
+    #[test]
+    fn a_full_hash_reads_exactly_the_size_the_walk_found() {
+        let size = 2 * FULL_CHUNK + 4096;
+        let data: Vec<u8> = (0..size).map(|i| (i % 241) as u8).collect();
+        let mut counted = CountedReads {
+            inner: std::io::Cursor::new(data.clone()),
+            reads: 0,
+        };
+        let hash = full_digest_from(&mut counted, size as u64, &CancelToken::default())
+            .expect("full hash");
+        assert_eq!(hash, blake3::hash(&data).to_hex().to_string());
+        assert_eq!(counted.reads, 3, "no read is spent finding the end");
+
+        // A file shorter than the walk saw changed since: an error, not the
+        // hash of what is left.
+        let short = full_digest_from(
+            &mut std::io::Cursor::new(data),
+            size as u64 + 1,
+            &CancelToken::default(),
+        );
+        assert!(short.is_err());
     }
 
     #[test]
