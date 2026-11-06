@@ -566,9 +566,27 @@ impl App {
         self.selected_row = next as usize;
     }
 
+    /// Open the path editor when a scan has nowhere to look, saying so in
+    /// the editor, and return false; true when both paths are set.
+    fn paths_are_set_or_ask(&mut self) -> bool {
+        if self.downloads.is_some() && self.media.is_some() {
+            return true;
+        }
+        self.open_config_editor();
+        self.set_config_editor_error(
+            "Set the downloads and media folders first: type each path, Tab to switch, Enter to save."
+                .to_string(),
+        );
+        self.push_log("Set the downloads and media folders before scanning.".to_string());
+        false
+    }
+
     fn start_scan_job(&mut self) {
         if self.running_job.is_some() {
             self.push_log("A run is already in progress.".to_string());
+            return;
+        }
+        if !self.paths_are_set_or_ask() {
             return;
         }
         self.reset_live_run_state();
@@ -598,6 +616,9 @@ impl App {
     {
         if self.running_job.is_some() {
             self.push_log("A run is already in progress.".to_string());
+            return Ok(());
+        }
+        if !self.paths_are_set_or_ask() {
             return Ok(());
         }
 
@@ -963,8 +984,10 @@ impl App {
                 if let Some(phase) = phase {
                     self.current_phase = Some(phase);
                 }
-                self.current_path = Some(path.clone());
-                self.latest_activity_message = Some(format!("Working on {path}"));
+                // The current-file line shows it; the activity line keeps
+                // what the phase is doing, so it never names a file the run
+                // has long moved past.
+                self.current_path = Some(path);
                 false
             }
             TuiEvent::Count {
@@ -975,13 +998,11 @@ impl App {
                 hash_progress_done,
                 hash_progress_total,
             } => {
+                // Progress goes to the activity line and the counters, never
+                // the Run Log: a line per step would push out what a person
+                // needs to read there, such as why a run failed.
                 if let Some(files_seen) = files_seen {
                     self.live_files_seen = Some(files_seen);
-                    if matches!(self.current_phase.as_deref(), Some("collecting"))
-                        && (files_seen == 1 || files_seen % 25 == 0)
-                    {
-                        self.push_log(format!("Collected {files_seen} file(s)"));
-                    }
                 }
                 if let Some(groups_found) = groups_found {
                     self.live_groups_found = Some(groups_found);
@@ -991,10 +1012,6 @@ impl App {
                 }
                 if let Some(applied_actions) = applied_actions {
                     self.live_applied_actions = Some(applied_actions);
-                    if matches!(self.current_phase.as_deref(), Some("applying")) {
-                        let planned = self.live_planned_actions.unwrap_or(applied_actions);
-                        self.push_log(format!("Applied {applied_actions} / {planned} action(s)"));
-                    }
                 }
                 if let Some(done) = hash_progress_done {
                     self.hash_progress_done = Some(done);
@@ -1014,9 +1031,6 @@ impl App {
                         }
                         _ => format!("Hashing files: {done} / {total}"),
                     });
-                    if done == 1 || done == total || done % 10 == 0 {
-                        self.push_log(self.latest_activity_message.clone().unwrap_or_default());
-                    }
                 }
                 false
             }
@@ -1767,9 +1781,100 @@ mod tests {
         );
     }
 
+    /// A config whose paths are set, so a scan may start.
+    fn config_with_paths() -> Config {
+        Config {
+            downloads: Some(PathBuf::from("/nonexistent/downloads")),
+            media: Some(PathBuf::from("/nonexistent/media")),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn scanning_without_paths_opens_the_path_editor() {
+        let mut app = App::new(&Config::default(), false);
+
+        app.handle_main_key(KeyCode::Char('S')).expect("key");
+
+        assert!(app.running_job.is_none(), "nowhere to scan");
+        let editor = app.config_editor().expect("the path editor opens");
+        assert!(
+            editor
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("Set the downloads and media folders")),
+            "{editor:?}"
+        );
+    }
+
+    #[test]
+    fn progress_stays_out_of_the_run_log() {
+        let mut app = App::new(&Config::default(), false);
+        let (tx, rx) = mpsc::channel();
+        app.running_job = Some(RunningJob::new(JobKind::Scan, rx, mpsc::channel().0));
+        let count = |files_seen, done, applied| TuiEvent::Count {
+            files_seen,
+            groups_found: None,
+            planned_actions: None,
+            applied_actions: applied,
+            hash_progress_done: done,
+            hash_progress_total: done.map(|_| 10),
+        };
+        tx.send(Ok(TuiEvent::Phase {
+            phase: "collecting".to_string(),
+        }))
+        .expect("send");
+        for n in [1, 25, 50] {
+            tx.send(Ok(count(Some(n), None, None))).expect("send");
+        }
+        tx.send(Ok(TuiEvent::Phase {
+            phase: "hashing_sample".to_string(),
+        }))
+        .expect("send");
+        for n in [1, 10] {
+            tx.send(Ok(count(None, Some(n), None))).expect("send");
+        }
+        tx.send(Ok(TuiEvent::Phase {
+            phase: "applying".to_string(),
+        }))
+        .expect("send");
+        tx.send(Ok(count(None, None, Some(1)))).expect("send");
+        let before = app.logs.len();
+
+        app.poll_running_job();
+
+        let added: Vec<_> = app.logs.iter().skip(before).collect();
+        assert!(
+            added.iter().all(|line| line.starts_with("Phase:")),
+            "only the phases: {added:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_event_leaves_the_activity_line_to_the_phase() {
+        let mut app = App::new(&Config::default(), false);
+        app.set_running_scan_for_test();
+        app.apply_tui_event(
+            JobKind::Scan,
+            TuiEvent::Phase {
+                phase: "collecting".to_string(),
+            },
+        );
+        app.apply_tui_event(
+            JobKind::Scan,
+            TuiEvent::File {
+                phase: Some("collecting".to_string()),
+                path: "/downloads/a.mkv".to_string(),
+            },
+        );
+
+        assert_eq!(app.activity_message(), "Phase: COLLECTING FILES");
+        assert_eq!(app.current_path(), Some("/downloads/a.mkv"));
+    }
+
     #[test]
     fn starting_run_clears_stale_report_rows() {
-        let config = Config::default();
+        let config = config_with_paths();
         let mut app = App::new(&config, false);
         app.report = Some(sample_report());
         app.selected_row = 1;
@@ -1783,7 +1888,7 @@ mod tests {
 
     #[test]
     fn rescan_clears_cache_then_starts_scan() {
-        let config = Config::default();
+        let config = config_with_paths();
         let mut app = App::new(&config, false);
 
         app.start_rescan_job_with(|| Ok(()))
@@ -1799,7 +1904,7 @@ mod tests {
 
     #[test]
     fn rescan_failure_does_not_start_job() {
-        let config = Config::default();
+        let config = config_with_paths();
         let mut app = App::new(&config, false);
 
         let err = app.start_rescan_job_with(|| Err(anyhow::anyhow!("boom")));

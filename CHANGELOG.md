@@ -44,6 +44,7 @@
 
 ### Fixed
 
+- The dashboard's Run Log keeps to what a person needs to read: progress counts ("Collected 25 file(s)", "Hashing files: 10 / 40", "Applied 3 / 8") stay on the activity line, which no longer names a file the run has moved past. Scanning before the paths are set opens the path editor, where it used to fail with "downloads path not set". [#5]
 - In the dashboard, a scan or link that fails, from a missing path to `--strict` stopping on a file it could not read, shows its error in one line, and a link `--strict` stopped partway shows which rows it linked and which failed. Before, a failure while hashing showed the run's raw error output, a backtrace included, and a link stopped partway left every row planned. [#5]
 - A dashboard left open while DejaView is upgraded keeps working: it runs scans and links with the binary it was started from, and refuses, asking to be restarted, a binary that speaks another version of its event stream. Before, once the binary was replaced on disk, every run failed. [#5]
 - A failed pair's `error` in the report keeps the OS error, such as "Read-only file system", where it said only which step failed, and its `method` and `fallback_reason` no longer claim the planned hardlink. [#5]

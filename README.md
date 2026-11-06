@@ -174,7 +174,7 @@ Add `--strict` to run the dashboard's scans and links in strict mode.
 
 | Key | Action |
 |---|---|
-| `S` | Scan |
+| `S` | Scan. Before the paths are set, this opens the path editor. |
 | `X` | Clear the cache, then scan |
 | `l` | Link the selected row to the library file it shows (asks first) |
 | `L` | Link every planned row the last scan showed (asks first) |
