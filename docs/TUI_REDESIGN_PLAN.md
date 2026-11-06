@@ -1,5 +1,7 @@
 # DejaView TUI Redesign Plan
 
+> **Status: implemented in March 2026.** This plan was carried out in commit `c13a8ec` (`feat(tui): rebuild visual dashboard`) and the fixes after it. The progress strip it calls out as out of scope was added afterwards with live engine events. The [README](../README.md#terminal-dashboard) lists the current keys and behaviour.
+
 ## Purpose
 This document captures the proposed second-pass visual redesign for the DejaView TUI before implementation.
 

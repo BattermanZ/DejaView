@@ -1,5 +1,7 @@
 # DejaView TUI Blueprint (Ratatui)
 
+> **Status: design history, not a reference.** This is the plan the TUI started from in March 2026. The TUI that shipped differs: each row is one planned link rather than one duplicate group, there is no filter, sort, command palette or focus cycling, and several keys mean something else (`S` scans, `X` rescans with a cleared cache, `l` links the selected row, `p` toggles path display, `c` cancels a run). The [README](../README.md#terminal-dashboard) lists the current keys and behaviour.
+
 ## 1) Design Goal
 Build a fast, keyboard-first terminal UI that lets users:
 - run scans and linking safely,

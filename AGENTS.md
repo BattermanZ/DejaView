@@ -1,7 +1,7 @@
 # agent.md — Minimal AI Agent Protocol
 
 Version: 2.2
-Last updated: 2026-03-03
+Last updated: 2026-11-06
 Scope: Entire repository (unless a subdirectory explicitly overrides this file)
 
 This protocol exists to:
@@ -111,14 +111,20 @@ Rule:
 ### 4.2 Component → paths → commands (fill this table for YOUR repo)
 Add/adjust rows so this becomes the single source of truth for “what to test”.
 
-| Component | Path prefixes (examples) | Commands to run (examples) | Depends on |
+| Component | Path prefixes | Commands to run | Depends on |
 |---|---|---|---|
-| Frontend | `apps/web/`, `frontend/` | `pnpm -C apps/web lint && pnpm -C apps/web test` | Shared |
-| Backend | `services/api/`, `backend/` | `cargo test -p api` | Shared |
-| Shared | `libs/`, `shared/` | (see dependents) | — |
+| Perf harness | `tests/perf_harness.rs` | `cargo test --release --test perf_harness -- --ignored --nocapture` | Engine |
+| CLI tests | `tests/` | `cargo test --test cli_integration` | CLI |
+| Engine | `src/engine/` | `cargo test engine::` and `cargo test --test cli_integration` | Shared |
+| TUI | `src/tui/` | `cargo test tui::` | Engine, Shared |
+| CLI | `src/main.rs` | `cargo test` (main wires every component) | Engine, TUI, Shared |
+| Shared | `src/protocol.rs`, `src/config.rs`, `src/fsutil.rs`, `src/logger.rs` | `cargo test -- config:: fsutil:: logger::` (then see dependents) | none |
+| Build | `Cargo.toml`, `Cargo.lock` | `cargo test` | all |
+| Docs | `README.md`, `docs/`, `AGENTS.md`, `LICENSE` | none (rule 4) | none |
 
 Notes:
-- Prefer repo scripts / CI / Make / justfile commands if they exist.
+- This is one crate, so `cargo fmt --check` and `cargo clippy --all-targets` cover everything; run both for any code change. Clippy is expected to stay warning-free.
+- Run the perf harness when hashing, caching or collection changes (`src/engine/hashing.rs`, `cache.rs`, `collect.rs`).
 - Keep commands short and copy/pasteable.
 
 ### 4.3 Default behaviour when the table is incomplete
