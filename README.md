@@ -168,7 +168,7 @@ The configuration lives in `~/.config/dejaview/config.json` (under `$XDG_CONFIG_
 | `<downloads>/.dejaview_cache.json` | Every scan and link. Entries for files that no longer exist are dropped after each complete run. |
 | `<downloads>/.dejaview_link_report.json` | Every link run without `--report`. |
 | `<downloads>/.dejaview_tui_report.json` | When you press `R` in the dashboard. |
-| `~/.local/state/dejaview/dejaview.log` | Every command (under `$XDG_STATE_HOME` when set). It only appends and is never rotated, so delete it when it gets large. |
+| `~/.local/state/dejaview/dejaview.log` | Every command (under `$XDG_STATE_HOME` when set). Once it passes 5 MiB it moves to `dejaview.log.1`, replacing the previous one, so the two together stay near 10 MiB. |
 
 Files whose name starts with `.dejaview_` are never treated as duplicates.
 

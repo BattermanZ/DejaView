@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,11 +39,33 @@ pub fn default_log_path() -> Result<PathBuf> {
     Ok(base.join("dejaview").join("dejaview.log"))
 }
 
+/// Past this size the log moves to `dejaview.log.1` and a new one starts, so the
+/// log never takes more than about twice this.
+const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Move a log that has reached `max_bytes` to `<path>.1`, replacing the previous
+/// rotation. A missing log is not an error.
+fn rotate_if_large(path: &Path, max_bytes: u64) -> Result<()> {
+    match fs::metadata(path) {
+        Ok(meta) if meta.len() >= max_bytes => {
+            let mut rotated = path.as_os_str().to_owned();
+            rotated.push(".1");
+            fs::rename(path, PathBuf::from(rotated))?;
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn init_at_path(path: &PathBuf, command: &str) -> Result<Session> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("log path has no parent: {}", path.display()))?;
     fs::create_dir_all(parent)?;
+    // Best effort: a log that cannot rotate must not stop the command.
+    let _ = rotate_if_large(path, MAX_LOG_BYTES);
 
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     let run_id = format!("{}-{}", std::process::id(), timestamp_nanos());
@@ -120,9 +142,6 @@ impl Drop for Session {
 }
 
 #[cfg(test)]
-use std::path::Path;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -138,6 +157,44 @@ mod tests {
             write_test_log(&path, "link", "temp cleanup attempted").expect("write test log");
         assert!(contents.contains("op=link"));
         assert!(contents.contains("temp cleanup attempted"));
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn log_past_the_limit_moves_to_dot_one() {
+        let root = std::env::temp_dir().join(format!(
+            "dejaview_logger_rotate_{}_{}",
+            std::process::id(),
+            timestamp_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("dejaview.log");
+        let rotated = root.join("dejaview.log.1");
+        fs::write(&rotated, b"oldest").expect("write previous rotation");
+        fs::write(&path, vec![b'x'; 100]).expect("write full log");
+
+        rotate_if_large(&path, 100).expect("rotate");
+
+        assert!(!path.exists(), "the full log moves out of the way");
+        assert_eq!(fs::read(&rotated).expect("read rotated").len(), 100);
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn log_under_the_limit_stays() {
+        let root = std::env::temp_dir().join(format!(
+            "dejaview_logger_keep_{}_{}",
+            std::process::id(),
+            timestamp_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("dejaview.log");
+        fs::write(&path, vec![b'x'; 99]).expect("write log");
+
+        rotate_if_large(&path, 100).expect("rotate");
+
+        assert_eq!(fs::read(&path).expect("read log").len(), 99);
+        assert!(!root.join("dejaview.log.1").exists());
         fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
