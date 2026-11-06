@@ -18,6 +18,13 @@ impl Theme {
     const YELLOW: Color = Color::Rgb(249, 226, 175);
     const RED: Color = Color::Rgb(243, 139, 168);
     const LINE: Color = Color::Rgb(84, 89, 115);
+    const PEACH: Color = Color::Rgb(250, 179, 135);
+    // The logo's shades of teal, lightest to darkest.
+    const MINT: Color = Color::Rgb(206, 247, 240);
+    const TEAL_DEEP: Color = Color::Rgb(104, 196, 186);
+    const TEAL_DEEPER: Color = Color::Rgb(80, 168, 160);
+    const TEAL_SHADE: Color = Color::Rgb(52, 98, 106);
+    const TEAL_SHADE_FAR: Color = Color::Rgb(30, 52, 64);
 
     pub fn canvas() -> Style {
         Style::default().fg(Self::TEXT).bg(Self::BASE)
@@ -114,22 +121,32 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
-    pub fn wordmark() -> Style {
-        Style::default()
-            .fg(Self::TEAL)
-            .bg(Self::BASE)
-            .add_modifier(Modifier::BOLD)
+    /// The logo's letters at pixel row `row` of ten: mint at the top,
+    /// shading to deep teal at the foot.
+    pub fn wordmark_face(row: usize) -> Style {
+        let color = match row {
+            0..=3 => Self::MINT,
+            4..=5 => Self::TEAL,
+            6..=7 => Self::TEAL_DEEP,
+            _ => Self::TEAL_DEEPER,
+        };
+        Style::default().fg(color).bg(Self::BASE)
     }
 
-    pub fn wordmark_highlight() -> Style {
-        Style::default()
-            .fg(Self::SKY)
-            .bg(Self::BASE)
-            .add_modifier(Modifier::BOLD)
+    /// The logo's depth, `layer` pixels behind its letters: the farther,
+    /// the darker.
+    pub fn wordmark_depth(layer: usize) -> Style {
+        let color = if layer <= 1 {
+            Self::TEAL_SHADE
+        } else {
+            Self::TEAL_SHADE_FAR
+        };
+        Style::default().fg(color).bg(Self::BASE)
     }
 
-    pub fn subtitle() -> Style {
-        Style::default().fg(Self::LAVENDER).bg(Self::BASE)
+    /// The logo's two accents, its one warm colour.
+    pub fn wordmark_accent() -> Style {
+        Style::default().fg(Self::PEACH).bg(Self::BASE)
     }
 
     pub fn inspector_value() -> Style {

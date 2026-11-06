@@ -491,46 +491,12 @@ fn footer_line(width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum WordmarkVariant {
-    Large,
-    Compact,
-    Minimal,
-}
-
-fn wordmark_variant(width: u16) -> WordmarkVariant {
-    if width >= 56 {
-        WordmarkVariant::Large
-    } else if width >= 24 {
-        WordmarkVariant::Compact
-    } else {
-        WordmarkVariant::Minimal
-    }
-}
-
-fn large_wordmark_lines() -> Vec<Line<'static>> {
-    wordmark::filled_block_lines()
-}
-
-fn compact_wordmark_lines() -> Vec<Line<'static>> {
-    vec![
-        Line::from(Span::styled("DEJAVIEW", Theme::wordmark())),
-        Line::from(Span::styled("duplicate workspace", Theme::subtitle())),
-    ]
-}
-
-fn minimal_wordmark_lines() -> Vec<Line<'static>> {
-    vec![
-        Line::from(Span::styled("DEJAVIEW", Theme::wordmark())),
-        Line::from(Span::styled("media duplicate workspace", Theme::subtitle())),
-    ]
-}
-
+/// The logo, or the name in text where `width` is too narrow for it.
 fn wordmark_lines(width: u16) -> Vec<Line<'static>> {
-    match wordmark_variant(width) {
-        WordmarkVariant::Large => large_wordmark_lines(),
-        WordmarkVariant::Compact => compact_wordmark_lines(),
-        WordmarkVariant::Minimal => minimal_wordmark_lines(),
+    if width >= wordmark::WIDTH {
+        wordmark::lines()
+    } else {
+        vec![Line::from(Span::styled("DejaView", Theme::accent()))]
     }
 }
 
@@ -677,10 +643,13 @@ fn metric_widths(width: u16) -> [u16; 5] {
     widths
 }
 
+/// Columns of canvas on either side of the logo.
+const BRAND_MARGIN: u16 = 2;
+
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-    // The cards need 59 columns for their titles; the wordmark takes what
-    // is left, within reason.
-    let brand_width = area.width.saturating_sub(62).clamp(24, 60);
+    // The logo takes its own width, the line to its right included, and the
+    // cards the rest: they need 59 columns for their titles.
+    let brand_width = (wordmark::WIDTH + 2 * BRAND_MARGIN + 1).min(area.width.saturating_sub(59));
     let split = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(brand_width), Constraint::Min(59)])
@@ -1557,38 +1526,13 @@ mod tests {
     }
 
     #[test]
-    fn wordmark_uses_large_variant_for_wide_headers() {
-        let combined = wordmark_lines(60)
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(matches!(wordmark_variant(60), WordmarkVariant::Large));
-        assert!(combined.contains("████"));
-    }
-
-    #[test]
-    fn wordmark_uses_compact_variant_for_medium_headers() {
-        let combined = wordmark_lines(28)
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(matches!(wordmark_variant(28), WordmarkVariant::Compact));
-        assert!(combined.contains("DEJAVIEW"));
-        assert!(combined.contains("duplicate workspace"));
-    }
-
-    #[test]
-    fn wordmark_uses_minimal_variant_for_narrow_headers() {
-        let combined = wordmark_lines(18)
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(matches!(wordmark_variant(18), WordmarkVariant::Minimal));
-        assert!(combined.contains("DEJAVIEW"));
-        assert!(combined.contains("media duplicate workspace"));
+    fn the_header_shows_the_logo_where_it_fits_and_the_name_where_not() {
+        let logo = wordmark_lines(wordmark::WIDTH);
+        assert_eq!(logo.len(), usize::from(wordmark::HEIGHT));
+        assert!(logo.iter().any(|line| line.to_string().contains('█')));
+        let name = wordmark_lines(wordmark::WIDTH - 1);
+        assert_eq!(name.len(), 1);
+        assert_eq!(name[0].to_string(), "DejaView");
     }
 
     #[test]
@@ -1766,6 +1710,16 @@ mod row_tests {
 mod layout_tests {
     use super::row_tests::{app_with_episodes, screen};
     use super::*;
+
+    #[test]
+    fn the_logo_shows_from_the_narrowest_full_header() {
+        let app = app_with_episodes(1);
+        for cols in [layout::SIDEBAR_COLUMNS, 160] {
+            let text = screen(&app, cols, layout::FULL_HEADER_ROWS);
+            assert!(text.contains('▀'), "{cols} columns:\n{text}");
+            assert!(!text.contains("DejaView"), "{cols} columns:\n{text}");
+        }
+    }
 
     #[test]
     fn a_short_terminal_keeps_counts_log_and_help_and_drops_the_wordmark() {

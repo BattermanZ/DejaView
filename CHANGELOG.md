@@ -42,6 +42,7 @@
 - A repeat scan reads only files it has not hashed before: the cache now keeps each file's quick hash too, so a file whose quick hash matched no other is not read again. Before, every file sharing its size with a new or changed one was read again on every run. [#4]
 - A file of 1 MiB or less is read once, not twice: its quick hash reads it whole and stands as its full hash. [#4]
 - Files of a size that no download shares with a library file are no longer read, nor are those where every download already is a library file: no link can come of them. [#4]
+- The dashboard's logo is "déjàview" in lowercase pixel letters with depth, teal with two orange accents, and shows whenever the full header does, from 100 columns. Before, it was block capitals, and below 119 columns the header showed the name as plain text instead. `dejaview tui-logo-preview` shows the logo on its own.
 
 ### Fixed
 
