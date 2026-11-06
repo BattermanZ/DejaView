@@ -14,9 +14,9 @@ Written for the next session that works on this repo. It holds every open findin
 
 `AGENTS.md` holds them: the contracts DejaView keeps, the setup to weigh changes against, branching, commits, the changelog, and the `just` recipes for checks and the live run. For this list in particular:
 
-- A finding is built from a GitHub issue. File it first (`docs/agents/issue-tracker.md`; one issue per finding, or per tight group such as S2 with P1), labelled `needs-triage`, and build it once the owner has moved it to `ready-for-agent`. The four decisions below come before the findings that hang on them.
-- New report fields (C3), cache format changes (P2, P7) and the golden JSON (M1) touch the public formats `AGENTS.md` lists: the ticket says so, and the change carries a changelog line.
-- A new dependency (decision 3) goes to the owner before it is added.
+- This first round works the findings straight from this file, with no GitHub issue for each. Take them in the suggested order at the end, one branch and pull request per finding or tight group (S2 with P1), naming the findings in the pull request and marking them done here in the same pull request. The four decisions below are settled, and the findings follow them.
+- New report fields (C3), cache format changes (P2, P7) and the golden JSON (M1) touch the public formats `AGENTS.md` lists: the pull request says so, and the change carries a changelog line.
+- A dependency beyond the ones decision 3 allows goes to the owner before it is added.
 
 ## Already done on this branch (do not redo)
 
@@ -24,7 +24,7 @@ Dependencies updated to latest (ratatui 0.30, crossterm 0.29, comfy-table 8, ind
 
 ## Decisions for the owner
 
-Ask before acting on these:
+All four are settled:
 
 1. Decided: the symlink fallback stays the default (`docs/adr/0001-a-download-that-cannot-be-hardlinked-becomes-a-symlink.md`). S3's other fixes stand.
 2. Decided: files under 1 MiB are skipped by default, empty files always (`docs/adr/0002-files-under-1-mib-are-left-alone.md`). This settles the size floor in S2 and P1.
