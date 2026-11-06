@@ -90,7 +90,7 @@ pub fn acquire(downloads: &Path) -> Result<RunLock> {
                 path.display()
             );
             logger::warn("lock", &message);
-            eprintln!("warning: {message}");
+            super::report::print_err(format_args!("warning: {message}"));
             Ok(RunLock { _file: None })
         }
     }

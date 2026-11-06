@@ -12,24 +12,51 @@ use crate::protocol::{
 use super::linking::Applied;
 use super::types::{Audience, LinkAction, LinkMode, RunMetrics, ScanRunOptions};
 
+/// A line on stdout: for a person, or the report a script reads with
+/// `--json`. With `--tui-events` stdout is the dashboard's event stream, so
+/// nothing goes there. The engine denies printing anywhere else, so every
+/// line it writes to stdout passes this check.
+#[allow(clippy::print_stdout)]
+pub(super) fn print_out(audience: Audience, line: impl std::fmt::Display) {
+    if audience != Audience::Dashboard {
+        println!("{line}");
+    }
+}
+
+/// A line on stderr, which no audience parses: warnings and the paths
+/// listed under them.
+#[allow(clippy::print_stderr)]
+pub(super) fn print_err(line: impl std::fmt::Display) {
+    eprintln!("{line}");
+}
+
+/// A warning for a person on stderr: `⚠ message`.
+pub(super) fn print_warning(message: impl std::fmt::Display) {
+    print_err(format_args!("{} {message}", "⚠".yellow()));
+}
+
 /// The plan for a person: the two folders once, then one row per pair with
 /// paths below them, or that there is nothing to do.
-pub(super) fn print_plan(actions: &[LinkAction], downloads: &Path, media: &Path, bytes: u64) {
-    println!("Downloads: {}", downloads.display());
-    println!("Media:     {}", media.display());
+pub(super) fn print_plan(
+    audience: Audience,
+    actions: &[LinkAction],
+    downloads: &Path,
+    media: &Path,
+    bytes: u64,
+) {
+    let say = |line: String| print_out(audience, line);
+    say(format!("Downloads: {}", downloads.display()));
+    say(format!("Media:     {}", media.display()));
     if actions.is_empty() {
-        println!("{} No duplicates found.", "✔".green());
+        say(format!("{} No duplicates found.", "✔".green()));
         return;
     }
-    println!(
-        "{}",
-        super::linking::action_table(actions, downloads, media)
-    );
-    println!(
+    say(super::linking::action_table(actions, downloads, media).to_string());
+    say(format!(
         "Found {} duplicate(s): {} could be freed.",
         actions.len(),
         format_size(bytes)
-    );
+    ));
 }
 
 /// What the run looked at and what went wrong, for a person. A quiet run
@@ -62,18 +89,27 @@ pub(super) fn print_run_summary(
             ));
         }
         if left_out.is_empty() {
-            println!("{} Considered {files_seen} file(s).", "ℹ".cyan());
+            print_out(
+                audience,
+                format!("{} Considered {files_seen} file(s).", "ℹ".cyan()),
+            );
         } else {
-            println!(
-                "{} Considered {files_seen} file(s); left out {}.",
-                "ℹ".cyan(),
-                left_out.join(", ")
+            print_out(
+                audience,
+                format!(
+                    "{} Considered {files_seen} file(s); left out {}.",
+                    "ℹ".cyan(),
+                    left_out.join(", ")
+                ),
             );
         }
         if symlinked > 0 {
-            println!(
-                "{} {symlinked} download(s) became symlinks: each points at its library file and breaks if Sonarr or Radarr upgrades, renames or deletes that file. `fallback_reason` in the report says why each is not a hardlink.",
-                "⚠".yellow()
+            print_out(
+                audience,
+                format!(
+                    "{} {symlinked} download(s) became symlinks: each points at its library file and breaks if Sonarr or Radarr upgrades, renames or deletes that file. `fallback_reason` in the report says why each is not a hardlink.",
+                    "⚠".yellow()
+                ),
             );
         }
     }
@@ -92,10 +128,9 @@ pub(super) fn print_run_summary(
         .map(|(what, count)| format!("{what} {count}"))
         .collect::<Vec<_>>()
         .join(", ");
-        eprintln!(
-            "{} {total} file(s) could not be read, hashed or linked ({counts}); the log names each.",
-            "⚠".yellow()
-        );
+        print_warning(format_args!(
+            "{total} file(s) could not be read, hashed or linked ({counts}); the log names each."
+        ));
     }
 }
 
@@ -155,7 +190,7 @@ impl Verdict<'_> {
         } else {
             "✔".green()
         };
-        println!("{mark} {}", self.line());
+        print_out(audience, format_args!("{mark} {}", self.line()));
     }
 }
 
@@ -165,23 +200,26 @@ pub(super) fn print_dangling_symlinks(dangling: &[PathBuf]) {
     if dangling.is_empty() {
         return;
     }
-    eprintln!(
-        "{} {} symlink(s) in downloads point into the library and no longer resolve, so their torrents cannot seed. The library file was probably upgraded, renamed or deleted; re-download or remove them:",
-        "⚠".yellow(),
+    print_warning(format_args!(
+        "{} symlink(s) in downloads point into the library and no longer resolve, so their torrents cannot seed. The library file was probably upgraded, renamed or deleted; re-download or remove them:",
         dangling.len()
-    );
+    ));
     const SHOWN: usize = 10;
     for path in dangling.iter().take(SHOWN) {
-        eprintln!("    {}", path.display());
+        print_err(format_args!("    {}", path.display()));
     }
     if dangling.len() > SHOWN {
-        eprintln!(
+        print_err(format_args!(
             "    and {} more; `dangling_symlinks` in the --json report lists them all",
             dangling.len() - SHOWN
-        );
+        ));
     }
 }
 
+/// Ask a person at a terminal before linking. Only `--confirm` asks, which
+/// refuses a run that is not interactive and is never given with
+/// `--tui-events`, so the prompt cannot reach the dashboard's stream.
+#[allow(clippy::print_stdout)]
 pub(super) fn maybe_confirm_apply(require_confirm: bool, planned_actions: usize) -> Result<()> {
     if !require_confirm || planned_actions == 0 {
         return Ok(());
@@ -229,12 +267,10 @@ pub(super) fn try_write_run_report(path: &Path, report: &RunReport) {
             "report",
             format!("failed to write run report {}: {}", path.display(), err),
         );
-        eprintln!(
-            "{} Failed to write link report at {}: {}",
-            "⚠".yellow(),
-            path.display(),
-            err
-        );
+        print_warning(format_args!(
+            "Failed to write link report at {}: {err}",
+            path.display()
+        ));
     }
 }
 

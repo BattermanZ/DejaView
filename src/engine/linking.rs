@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, anyhow};
-use colored::*;
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use pathdiff::diff_paths;
 use std::collections::HashSet;
@@ -983,12 +982,11 @@ pub(super) fn apply_actions(
                     ));
                     break;
                 } else {
-                    eprintln!(
-                        "{} Failed to apply {} -> {}: {err}",
-                        "⚠".yellow(),
+                    super::report::print_warning(format_args!(
+                        "Failed to apply {} -> {}: {err}",
                         action.src.display(),
                         action.tgt.display(),
-                    );
+                    ));
                     continue;
                 }
             }
