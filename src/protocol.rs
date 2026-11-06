@@ -323,6 +323,188 @@ mod tests {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
+    /// Compare `actual` with the checked-in golden file `name` under
+    /// `tests/golden/`. With `DEJAVIEW_BLESS=1` the file is written instead,
+    /// for a format change made on purpose: the diff of the golden file is
+    /// then the change a script reading the report sees.
+    fn assert_golden(name: &str, actual: &str) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden")
+            .join(name);
+        if std::env::var_os("DEJAVIEW_BLESS").is_some() {
+            std::fs::write(&path, actual).expect("write golden file");
+            return;
+        }
+        let expected = std::fs::read_to_string(&path).expect("read golden file");
+        assert!(
+            expected == actual,
+            "{name} no longer matches what DejaView writes. A script reading it would see this change; if it is meant, rerun with DEJAVIEW_BLESS=1 and add an `### After upgrading` changelog line.\n--- expected\n{expected}\n--- actual\n{actual}"
+        );
+    }
+
+    fn golden_entry(name: &str, status: &str, method: Option<&str>) -> LinkReportEntry {
+        LinkReportEntry {
+            source: format!("/srv/downloads/{name}.mkv"),
+            target: format!("/srv/media/Movies/{name}.mkv"),
+            source_raw: None,
+            target_raw: None,
+            size: 4_194_304,
+            status: status.to_string(),
+            method: method.map(str::to_string),
+            fallback_reason: None,
+            error: None,
+        }
+    }
+
+    /// A link run's report with every field set and a row of every status:
+    /// what a cron script parses.
+    fn golden_report() -> RunReport {
+        let planned = golden_entry("Planned", "planned", Some("try-hardlink"));
+        let applied = golden_entry("Applied", "applied", Some("hardlink"));
+        let symlinked = LinkReportEntry {
+            fallback_reason: Some("cross-device: no hardlink is possible".to_string()),
+            ..golden_entry("Symlinked", "applied", Some("symlink"))
+        };
+        let already = LinkReportEntry {
+            fallback_reason: Some("already this library file; nothing changed".to_string()),
+            ..golden_entry("Already", "already-linked", Some("hardlink"))
+        };
+        let skipped = LinkReportEntry {
+            error: Some("left alone: its owner could no longer read it".to_string()),
+            ..golden_entry("Skipped", "skipped", None)
+        };
+        let failed = LinkReportEntry {
+            source: "/srv/downloads/Bad\u{fffd}.mkv".to_string(),
+            source_raw: Some("2f7372762f646f776e6c6f6164732f426164ff2e6d6b76".to_string()),
+            error: Some("rename: Read-only file system (os error 30)".to_string()),
+            ..golden_entry("Failed", "failed", None)
+        };
+        RunReport {
+            mode: "link".to_string(),
+            outcome: Outcome::Complete,
+            version: "0.1.0".to_string(),
+            started_at: "2026-11-06T03:17:00Z".to_string(),
+            finished_at: "2026-11-06T03:17:42Z".to_string(),
+            downloads: "/srv/downloads".to_string(),
+            media: "/srv/media".to_string(),
+            link_mode: LinkMode::Best,
+            dry_run: false,
+            strict: false,
+            files_considered: 120,
+            planned_actions: 6,
+            applied_actions: 2,
+            symlinked: 1,
+            already_linked: 1,
+            already_linked_bytes: 4_194_304,
+            planned_bytes: 25_165_824,
+            freed_bytes: 8_388_608,
+            total_saved_bytes: 8_388_608,
+            skipped_by_min_age: 3,
+            skipped_by_min_size: 40,
+            skipped_by_exclude: 2,
+            skipped_as_library_file: 1,
+            dangling_symlinks: vec!["/srv/downloads/Gone.mkv".to_string()],
+            warnings: WarningSummary {
+                walk_errors: 1,
+                metadata_errors: 0,
+                sample_hash_errors: 0,
+                full_hash_errors: 0,
+                link_errors: 1,
+            },
+            entries: vec![planned, applied, symlinked, already, skipped, failed],
+        }
+    }
+
+    #[test]
+    fn the_report_json_is_what_scripts_parse() {
+        let json = serde_json::to_string_pretty(&golden_report()).expect("serialise report");
+        assert_golden("run_report.json", &json);
+        // What a script wrote back is read the same.
+        let read: RunReport = serde_json::from_str(&json).expect("parse report");
+        assert_eq!(serde_json::to_string_pretty(&read).expect("again"), json);
+    }
+
+    #[test]
+    fn the_event_stream_is_what_the_dashboard_parses() {
+        let mut scan = golden_report();
+        scan.mode = "scan".to_string();
+        scan.dry_run = true;
+        scan.entries.truncate(1);
+        let events = vec![
+            TuiEvent::Hello {
+                protocol: PROTOCOL_VERSION,
+                version: "0.1.0".to_string(),
+            },
+            TuiEvent::Phase {
+                phase: "collecting".to_string(),
+            },
+            TuiEvent::File {
+                phase: Some("collecting".to_string()),
+                path: "/srv/downloads/Planned.mkv".to_string(),
+            },
+            TuiEvent::Count {
+                files_seen: Some(120),
+                groups_found: None,
+                planned_actions: None,
+                applied_actions: None,
+                hash_progress_done: None,
+                hash_progress_total: None,
+            },
+            TuiEvent::Phase {
+                phase: "hashing_sample".to_string(),
+            },
+            TuiEvent::WorkerActivity {
+                phase: "hashing_sample".to_string(),
+                worker: 3,
+                path: Some("/srv/media/Movies/Planned.mkv".to_string()),
+            },
+            TuiEvent::Phase {
+                phase: "hashing_full".to_string(),
+            },
+            TuiEvent::HashBytes {
+                done: 1_048_576,
+                total: 8_388_608,
+            },
+            TuiEvent::PlannedEntries {
+                entries: scan.entries.clone(),
+            },
+            TuiEvent::Phase {
+                phase: "planning".to_string(),
+            },
+            TuiEvent::Phase {
+                phase: "applying".to_string(),
+            },
+            TuiEvent::File {
+                phase: Some("applying".to_string()),
+                path: "/srv/downloads/Planned.mkv".to_string(),
+            },
+            TuiEvent::Log {
+                message: "Planning complete. 1 action(s) queued.".to_string(),
+            },
+            TuiEvent::Done {
+                report: Box::new(scan.clone()),
+            },
+            TuiEvent::Error {
+                message: "--strict stopped the run".to_string(),
+                report: Some(Box::new(scan)),
+            },
+            TuiEvent::Error {
+                message: "Downloads path not set".to_string(),
+                report: None,
+            },
+            TuiEvent::Cancelled,
+        ];
+        let mut stream = String::new();
+        for event in &events {
+            let line = serde_json::to_string(event).expect("serialise event");
+            let read: TuiEvent = serde_json::from_str(&line).expect("parse event");
+            assert_eq!(serde_json::to_string(&read).expect("again"), line);
+            stream.push_str(&line);
+            stream.push('\n');
+        }
+        assert_golden("tui_events.ndjson", &stream);
+    }
+
     #[test]
     fn a_path_that_is_not_utf8_comes_back_whole_from_its_raw_bytes() {
         let path = PathBuf::from(OsStr::from_bytes(b"/dl/a\xff.mkv"));
