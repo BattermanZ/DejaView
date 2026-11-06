@@ -26,7 +26,7 @@ Dependencies updated to latest (ratatui 0.30, crossterm 0.29, comfy-table 8, ind
 
 Ask before acting on these:
 
-1. Make `hardlink-only` the default link mode (skip a pair, with the reason, instead of falling back to a symlink)? Recommended for *arr setups; see S3.
+1. Decided: the symlink fallback stays the default (`docs/adr/0001-a-download-that-cannot-be-hardlinked-becomes-a-symlink.md`). S3's other fixes stand.
 2. Default minimum file size: 1 byte (skip only empty files) or 1 MiB (also skips .nfo, .srt, thumbnails)? See S2 and P1.
 3. New dependencies need approval (AGENTS.md): a signal handler for Ctrl+C/SIGTERM (`signal-hook` or `ctrlc`, P5), optionally `jwalk` for the parallel walk (P3, can be done with rayon instead), optionally `libc` for `flock`/`fadvise` (C2; note `std::fs::File::try_lock` exists from Rust 1.89 while the MSRV is 1.88).
 4. Change what the CLI returns: a distinct exit code for "finished with failures", and timestamped reports instead of one overwritten file.
@@ -54,7 +54,7 @@ Severity: High, Medium, Low. Evidence tags: **[verified]** reproduced in the mai
 - The hardlink fails, and DejaView quietly makes a symlink, when: the cron user does not own the library file and `fs.protected_hardlinks=1` (default on Debian/Ubuntu; EPERM); Docker mounts downloads and media separately or media is `:ro` (EXDEV even on one device); mergerfs path-preserving policies put the two files on different disks (EXDEV).
 - Why it hurts: the symlink dangles when Sonarr/Radarr upgrades or deletes the library file, and the torrent breaks; a client re-downloading the missing file writes through the dangling link and creates a file in the library; a category move in the client breaks the relative link; container paths may not exist on the host.
 - The planned row says "TRY HARDLINK" and the report's `fallback_reason` loses the errno (see C3).
-- Fix: add `link_mode = hardlink-only` (skip the pair and record why); make `config validate` try one real hardlink from media into downloads and explain EPERM (ownership, protected_hardlinks) separately from EXDEV (filesystem, mount or mergerfs branch); print "N linked as symlinks" in the summary; add a check that lists symlinks under downloads pointing into media that no longer resolve (scan warning or a `check` command).
+- Fix: the symlink fallback stays the default (ADR 0001), so make it visible: make `config validate` try one real hardlink from media into downloads and explain EPERM (ownership, protected_hardlinks) separately from EXDEV (filesystem, mount or mergerfs branch); print "N linked as symlinks" in the summary; add a check that lists symlinks under downloads pointing into media that no longer resolve (scan warning or a `check` command).
 
 **S4. Medium (High with separate users). A hardlinked download takes on the library file's owner, mode, ACLs, xattrs and SELinux label.** **[reproduced]**
 - Where: `linking.rs:465-470` and `194-256`; nothing compares ownership.
