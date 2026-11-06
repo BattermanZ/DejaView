@@ -114,6 +114,10 @@ pub struct App {
     live_applied_actions: Option<usize>,
     hash_progress_done: Option<usize>,
     hash_progress_total: Option<usize>,
+    /// Bytes the full pass has read, of all it will read, and when it began:
+    /// speed and time left come from them.
+    hash_bytes: Option<(u64, u64)>,
+    full_pass_started_at: Option<Instant>,
     active_workers: BTreeMap<usize, String>,
     job_started_at: Option<Instant>,
     last_run_duration: Option<Duration>,
@@ -152,6 +156,8 @@ impl App {
             live_applied_actions: None,
             hash_progress_done: None,
             hash_progress_total: None,
+            hash_bytes: None,
+            full_pass_started_at: None,
             active_workers: BTreeMap::new(),
             job_started_at: None,
             last_run_duration: None,
@@ -390,7 +396,14 @@ impl App {
         if self.running_job.is_some() {
             if let (Some(done), Some(total)) = (self.hash_progress_done, self.hash_progress_total) {
                 return match self.current_phase.as_deref() {
-                    Some("hashing_full") => format!("{done} / {total} duplicate files verified"),
+                    Some("hashing_full") => {
+                        let mut label = format!("{done} / {total} duplicate files verified");
+                        if let Some(bytes) = self.full_pass_progress() {
+                            label.push_str("  |  ");
+                            label.push_str(&bytes);
+                        }
+                        label
+                    }
                     _ => format!("{done} / {total} files hashed"),
                 };
             }
@@ -424,6 +437,26 @@ impl App {
             self.planned_actions(),
             self.applied_actions()
         )
+    }
+
+    /// How far the full pass has read, how fast and how long it has left:
+    /// `12.3 GiB of 40.0 GiB  |  150.0 MiB/s  |  ETA 03:05`. Speed and time
+    /// left wait for a second of reading.
+    fn full_pass_progress(&self) -> Option<String> {
+        let (done, total) = self.hash_bytes?;
+        let format_bytes = super::view::format_bytes;
+        let mut label = format!("{} of {}", format_bytes(done), format_bytes(total));
+        let elapsed = self.full_pass_started_at?.elapsed();
+        if elapsed >= Duration::from_secs(1) && done > 0 {
+            let rate = done as f64 / elapsed.as_secs_f64();
+            let left = Duration::from_secs_f64(total.saturating_sub(done) as f64 / rate);
+            label.push_str(&format!(
+                "  |  {}/s  |  ETA {}",
+                format_bytes(rate as u64),
+                format_duration(left)
+            ));
+        }
+        Some(label)
     }
 
     pub fn last_log_line(&self) -> String {
@@ -1042,6 +1075,8 @@ impl App {
     fn apply_tui_event(&mut self, kind: JobKind, event: TuiEvent) -> bool {
         match event {
             TuiEvent::Phase { phase } => {
+                self.hash_bytes = None;
+                self.full_pass_started_at = (phase == "hashing_full").then(Instant::now);
                 self.current_phase = Some(phase.clone());
                 self.current_path = None;
                 if phase.starts_with("hashing_") {
@@ -1190,6 +1225,10 @@ impl App {
                 self.restore_reviewed_rows();
                 true
             }
+            TuiEvent::HashBytes { done, total } => {
+                self.hash_bytes = Some((done, total));
+                false
+            }
             // The runner checks it before passing anything on.
             TuiEvent::Hello { .. } => false,
             TuiEvent::Done { report } => {
@@ -1309,6 +1348,8 @@ impl App {
         self.live_entries.clear();
         self.hash_progress_done = None;
         self.hash_progress_total = None;
+        self.hash_bytes = None;
+        self.full_pass_started_at = None;
         self.active_workers.clear();
         self.last_run_duration = None;
         self.job_started_at = None;
@@ -1414,6 +1455,11 @@ impl App {
     pub(crate) fn set_hash_progress_for_test(&mut self, done: usize, total: usize) {
         self.hash_progress_done = Some(done);
         self.hash_progress_total = Some(total);
+    }
+
+    pub(crate) fn set_full_pass_for_test(&mut self, done: u64, total: u64, elapsed: Duration) {
+        self.hash_bytes = Some((done, total));
+        self.full_pass_started_at = Instant::now().checked_sub(elapsed);
     }
 
     pub(crate) fn set_running_scan_for_test(&mut self) -> Receiver<()> {
@@ -1977,6 +2023,51 @@ mod tests {
 
         app.handle_main_key(KeyCode::Char('X')).expect("key");
         assert!(matches!(app.overlay, Overlay::ConfirmRescan));
+    }
+
+    #[test]
+    fn the_full_pass_shows_bytes_speed_and_time_left() {
+        let mut app = App::new(&Config::default(), false);
+        app.set_running_scan_for_test();
+        app.apply_tui_event(
+            JobKind::Scan,
+            TuiEvent::Phase {
+                phase: "hashing_full".to_string(),
+            },
+        );
+        app.set_hash_progress_for_test(0, 2);
+        app.set_full_pass_for_test(500 << 20, 2000 << 20, Duration::from_secs(10));
+
+        let label = app.throughput_label();
+
+        assert!(
+            label.starts_with("0 / 2 duplicate files verified"),
+            "{label}"
+        );
+        assert!(label.contains("500.0 MiB of 2.0 GiB"), "{label}");
+        assert!(label.contains("50.0 MiB/s"), "{label}");
+        assert!(label.contains("ETA 00:30"), "{label}");
+    }
+
+    #[test]
+    fn hash_bytes_events_feed_the_full_pass_progress() {
+        let mut app = App::new(&Config::default(), false);
+        app.set_running_scan_for_test();
+        app.apply_tui_event(
+            JobKind::Scan,
+            TuiEvent::Phase {
+                phase: "hashing_full".to_string(),
+            },
+        );
+        app.set_hash_progress_for_test(0, 1);
+        app.apply_tui_event(
+            JobKind::Scan,
+            TuiEvent::HashBytes {
+                done: 1 << 30,
+                total: 4 << 30,
+            },
+        );
+        assert!(app.throughput_label().contains("1.0 GiB of 4.0 GiB"));
     }
 
     #[test]

@@ -152,6 +152,13 @@ pub enum TuiEvent {
     PlannedEntries {
         entries: Vec<LinkReportEntry>,
     },
+    /// Bytes read in full so far, of all the full pass will read: what a
+    /// 60 GB file's progress is measured in while the file count stands
+    /// still.
+    HashBytes {
+        done: u64,
+        total: u64,
+    },
     Log {
         message: String,
     },

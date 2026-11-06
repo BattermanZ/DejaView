@@ -1915,3 +1915,29 @@ fn setting_a_folder_that_does_not_exist_names_it() {
     );
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+#[test]
+fn the_full_pass_reports_its_progress_in_bytes() {
+    let root = unique_temp_dir("hash_bytes");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    // Bigger than the quick hash's sample, so the pair is read in full.
+    write_seeded(&downloads.join("big.mkv"), 3 << 20, 7);
+    write_seeded(&media.join("big.mkv"), 3 << 20, 7);
+    configure_small_files(&root, &downloads, &media);
+
+    let events = events_of(&root, &["scan"]);
+
+    let bytes: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "hash_bytes")
+        .collect();
+    assert_eq!(
+        bytes.first().map(|event| event["done"].clone()),
+        Some(0.into())
+    );
+    let last = bytes.last().expect("hash_bytes events");
+    assert_eq!(last["total"], 2 * (3 << 20), "{events:?}");
+    assert_eq!(last["done"], last["total"], "the pass ends complete");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}

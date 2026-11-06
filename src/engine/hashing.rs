@@ -133,18 +133,29 @@ fn emit_hash_progress(done: usize, total: usize, tui_events: bool) {
 }
 
 /// Full BLAKE3 of a file of `size` bytes, checking for cancellation between
-/// chunks so a cancel does not wait for a large file to finish.
-pub(super) fn full_digest(path: &Path, size: u64, cancel: &CancelToken) -> Result<String> {
+/// chunks so a cancel does not wait for a large file to finish, and telling
+/// `on_chunk` how many bytes each chunk read.
+pub(super) fn full_digest(
+    path: &Path,
+    size: u64,
+    cancel: &CancelToken,
+    on_chunk: &dyn Fn(u64),
+) -> Result<String> {
     #[cfg(test)]
     read_log::record(path);
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    full_digest_from(&mut file, size, cancel)
+    full_digest_from(&mut file, size, cancel, on_chunk)
 }
 
 /// Hash exactly the `size` bytes the walk saw. The size is known, so no read
 /// is spent finding the end of the file. A file that ends sooner changed
 /// since the walk, and is an error rather than the hash of less.
-fn full_digest_from<R: Read>(reader: &mut R, size: u64, cancel: &CancelToken) -> Result<String> {
+fn full_digest_from<R: Read>(
+    reader: &mut R,
+    size: u64,
+    cancel: &CancelToken,
+    on_chunk: &dyn Fn(u64),
+) -> Result<String> {
     let mut hasher = Hasher::new();
     FULL_BUF.with_borrow_mut(|buf| -> Result<()> {
         let mut done = 0u64;
@@ -154,6 +165,7 @@ fn full_digest_from<R: Read>(reader: &mut R, size: u64, cancel: &CancelToken) ->
             let n = read_up_to(reader, &mut buf[..want])?;
             hasher.update(&buf[..n]);
             done += n as u64;
+            on_chunk(n as u64);
             if n < want {
                 return Err(anyhow!(
                     "the file ended after {done} of the {size} bytes the walk found: it changed since, so scan again"
@@ -611,6 +623,12 @@ pub(super) fn hash_groups_and_update_cache(
         })
         .collect();
     let total_full_files = full_candidates.iter().map(Vec::len).sum::<usize>();
+    // A size group's files share their size.
+    let total_full_bytes: u64 = full_candidates
+        .iter()
+        .zip(groups.iter())
+        .map(|(candidates, group)| candidates.len() as u64 * group.first().map_or(0, |f| f.size))
+        .sum();
     if tui_events && total_full_files > 0 {
         let _ = emit_tui_event(&TuiEvent::Phase {
             phase: "hashing_full".to_string(),
@@ -619,13 +637,39 @@ pub(super) fn hash_groups_and_update_cache(
             message: format!("Verifying {total_full_files} duplicate candidate file(s)"),
         });
         emit_hash_progress(0, total_full_files, true);
+        let _ = emit_tui_event(&TuiEvent::HashBytes {
+            done: 0,
+            total: total_full_bytes,
+        });
     }
-    if let Some(progress_bar) = &bar {
-        progress_bar.set_length(total_sample_u64 + total_full_files as u64);
-        if total_full_files > 0 {
-            progress_bar.set_message("Verifying duplicates".bold().to_string());
+    // Full reads are measured in bytes: one large file can take minutes,
+    // during which a count of files stands still.
+    if let Some(progress_bar) = &bar
+        && total_full_files > 0
+    {
+        progress_bar.set_style(
+            ProgressStyle::with_template(
+                "{msg} {bytes}/{total_bytes} [{wide_bar:.cyan/blue}] {binary_bytes_per_sec} ETA {eta}",
+            )
+            .unwrap(),
+        );
+        progress_bar.reset();
+        progress_bar.set_length(total_full_bytes);
+        progress_bar.set_message("Verifying duplicates".bold().to_string());
+    }
+    let bytes_done = AtomicU64::new(0);
+    let on_chunk = |n: u64| {
+        let done = bytes_done.fetch_add(n, Ordering::Relaxed) + n;
+        if let Some(progress_bar) = &bar {
+            progress_bar.inc(n);
         }
-    }
+        if tui_events && progress_due() {
+            let _ = emit_tui_event(&TuiEvent::HashBytes {
+                done,
+                total: total_full_bytes,
+            });
+        }
+    };
 
     // Phase 2: the full hash of each physical file whose quick hash collides
     // with another's, again split per file. A group's rows go to the TUI as
@@ -655,11 +699,18 @@ pub(super) fn hash_groups_and_update_cache(
                             Some(path.display().to_string()),
                             tui_events,
                         );
-                        let digest_result = full_digest(path, file.size, options.cancel);
-                        let done = full_done.fetch_add(1, Ordering::Relaxed) + 1;
-                        emit_hash_progress(done as usize, total_full_files, tui_events);
-                        if let Some(progress_bar) = &bar {
-                            progress_bar.inc(1);
+                        let digest_result =
+                            full_digest(path, file.size, options.cancel, &on_chunk);
+                        // A read a cancel stopped did not verify anything.
+                        if !matches!(&digest_result, Err(err) if err.is::<Cancelled>()) {
+                            let done = full_done.fetch_add(1, Ordering::Relaxed) + 1;
+                            emit_hash_progress(done as usize, total_full_files, tui_events);
+                            if tui_events && done as usize == total_full_files {
+                                let _ = emit_tui_event(&TuiEvent::HashBytes {
+                                    done: bytes_done.load(Ordering::Relaxed),
+                                    total: total_full_bytes,
+                                });
+                            }
                         }
                         emit_worker_activity("hashing_full", worker, None, tui_events);
                         match digest_result {
@@ -871,10 +922,18 @@ mod tests {
             inner: std::io::Cursor::new(data.clone()),
             reads: 0,
         };
-        let hash = full_digest_from(&mut counted, size as u64, &CancelToken::default())
-            .expect("full hash");
+        let chunks = Mutex::new(Vec::new());
+        let hash = full_digest_from(&mut counted, size as u64, &CancelToken::default(), &|n| {
+            chunks.lock().expect("chunks").push(n)
+        })
+        .expect("full hash");
         assert_eq!(hash, blake3::hash(&data).to_hex().to_string());
         assert_eq!(counted.reads, 3, "no read is spent finding the end");
+        // Progress is told chunk by chunk, so a large file's moves.
+        assert_eq!(
+            chunks.into_inner().expect("chunks"),
+            [FULL_CHUNK as u64, FULL_CHUNK as u64, 4096]
+        );
 
         // A file shorter than the walk saw changed since: an error, not the
         // hash of what is left.
@@ -882,6 +941,7 @@ mod tests {
             &mut std::io::Cursor::new(data),
             size as u64 + 1,
             &CancelToken::default(),
+            &|_| {},
         );
         assert!(short.is_err());
     }

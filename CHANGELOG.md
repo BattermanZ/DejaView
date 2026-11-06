@@ -44,6 +44,7 @@
 
 ### Fixed
 
+- Verifying large files shows progress in bytes, with the speed and the time left, in the dashboard (`12.3 GiB of 40.0 GiB  |  150.0 MiB/s  |  ETA 03:05`) and on the CLI's progress bar. Before, both counted whole files, so a 60 GB remux sat at "0 / 8" for minutes, and a read stopped by a cancel was counted as verified. [#5]
 - `config set-downloads` and `config set-media` name the path they could not use, where they said only "No such file or directory". The dashboard's path editor reads `~` as the home folder, says which field an error is about, shows a long error whole, and names the config file it saves to. [#5]
 - In the dashboard, `x` and `X` ask before clearing the cache, which means reading every file again. Before, `x`, next to `c` and in no list of keys, cleared it at once. [#5]
 - In the dashboard, the selected row carries a marker and reverse video, `PgUp`, `PgDn`, `g`, `G`, `Home` and `End` move through the rows, and Help and the JSON preview scroll with the same keys, so a report of hundreds of entries can be read to its end; `j` no longer closes the preview. After `l` links a row, the selection moves to the next planned row instead of back to the first. [#5]

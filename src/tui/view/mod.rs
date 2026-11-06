@@ -12,7 +12,7 @@ use crate::tui::theme::Theme;
 use crate::tui::wordmark;
 
 /// A size in binary units, as the CLI prints it: `4.9 KiB`.
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
     let mut value = bytes as f64;
     let mut idx = 0usize;

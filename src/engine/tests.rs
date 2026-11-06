@@ -1560,7 +1560,8 @@ fn full_digest_stops_when_cancelled() {
     let cancel = CancelToken::default();
     cancel.cancel();
 
-    let err = super::hashing::full_digest(&path, 4096, &cancel).expect_err("cancelled digest");
+    let err =
+        super::hashing::full_digest(&path, 4096, &cancel, &|_| {}).expect_err("cancelled digest");
 
     assert!(err.is::<Cancelled>());
     fs::remove_dir_all(&root).expect("cleanup temp dir");
