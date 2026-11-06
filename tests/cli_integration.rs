@@ -1356,3 +1356,36 @@ fn reviewed_rows_the_cache_vouches_for_are_linked_without_a_walk() {
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+#[test]
+fn a_walk_paces_its_progress_events() {
+    let root = unique_temp_dir("paced_events");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    for folder in 0..20 {
+        for file in 0..100 {
+            write_seeded(
+                &downloads.join(format!("f{folder}/{file}.mkv")),
+                64,
+                (folder * 100 + file) as u8,
+            );
+        }
+    }
+    fs::create_dir_all(&media).expect("create media");
+    configure_small_files(&root, &downloads, &media);
+
+    let events = events_of(&root, &["scan"]);
+    let file_events = events.iter().filter(|e| e["type"] == "file").count();
+    assert!(
+        file_events < 200,
+        "2000 files found, {file_events} file events: one per 100 ms at most"
+    );
+    let last_count = events
+        .iter()
+        .rev()
+        .find_map(|e| e["files_seen"].as_u64())
+        .expect("a count event");
+    assert_eq!(last_count, 2000, "the final count is never paced away");
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}

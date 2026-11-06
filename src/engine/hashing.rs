@@ -17,8 +17,8 @@ use super::cache::CacheKeys;
 use super::cancel::{CancelToken, Cancelled};
 use super::linking::plan_hashed_group_actions;
 use super::report::build_report_entries;
-use super::types::emit_tui_event;
 use super::types::{Cache, CacheEntry, FileInfo, LinkMode, RunWarnings};
+use super::types::{emit_tui_event, progress_due};
 use crate::logger;
 use crate::protocol::TuiEvent;
 
@@ -118,8 +118,9 @@ fn emit_worker_activity(phase: &str, worker: usize, path: Option<String>, tui_ev
     }
 }
 
+/// Hashing progress for the TUI, paced except at a phase's start and end.
 fn emit_hash_progress(done: usize, total: usize, tui_events: bool) {
-    if tui_events {
+    if tui_events && (done == 0 || done == total || progress_due()) {
         let _ = emit_tui_event(&TuiEvent::Count {
             files_seen: None,
             groups_found: None,

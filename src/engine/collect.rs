@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime};
 use walkdir::WalkDir;
 
 use super::cancel::CancelToken;
-use super::types::emit_tui_event;
 use super::types::{FileInfo, RunMetrics, RunWarnings};
+use super::types::{emit_tui_event, progress_due};
 use crate::logger;
 use crate::protocol::TuiEvent;
 
@@ -419,11 +419,11 @@ impl<'a> Walk<'a> {
             .as_nanos();
         if self.options.tui_events {
             let seen = shared.files_seen.fetch_add(1, Ordering::Relaxed) + 1;
-            let _ = emit_tui_event(&TuiEvent::File {
-                phase: Some("collecting".to_string()),
-                path: path.display().to_string(),
-            });
-            if seen == 1 || seen.is_multiple_of(25) {
+            if progress_due() {
+                let _ = emit_tui_event(&TuiEvent::File {
+                    phase: Some("collecting".to_string()),
+                    path: path.display().to_string(),
+                });
                 let _ = emit_tui_event(&TuiEvent::Count {
                     files_seen: Some(seen),
                     groups_found: None,

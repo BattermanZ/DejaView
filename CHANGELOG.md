@@ -25,6 +25,7 @@
 
 ### Changed
 
+- A scan or link run from the dashboard reports which file it is on and how many it has found or hashed up to ten times a second, instead of once for every file, which on a large library sent the dashboard hundreds of thousands of updates.
 - Hashing and linking make fewer round trips to a network drive: a quick hash reads exactly the bytes it hashes, where it spent one more read finding the end of each file; a full hash reads 8 MiB at a time instead of 1 MiB; and each link looks up the library file once instead of four times.
 - In the dashboard, `l` and `L` link the reviewed rows without walking both folders again when neither file of any row has changed since the scan hashed it; a row that changed sends the run back to the walk, which checks every row as before. Before, every link from the dashboard walked both folders first, which takes minutes on a network drive.
 - The same share mounted at two paths, such as in a Docker cron job and on the host the dashboard runs on, now uses one set of cache entries. Before, each run pruned the other's entries as gone and the next one hashed them again.

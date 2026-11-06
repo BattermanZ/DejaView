@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use super::cancel::CancelToken;
 use crate::protocol::TuiEvent;
@@ -160,6 +163,32 @@ impl ScanRunOptions<'_> {
                     .iter()
                     .any(|(src, tgt)| src == &action.src && tgt == &action.tgt))
     }
+}
+
+/// Per-file progress events (a file found, a count) go at most once per this
+/// interval. A walk of a hundred thousand files would otherwise send the TUI
+/// one line per file, each flushed, faster than anyone can read them.
+const PROGRESS_EVERY_MS: u64 = 100;
+static PROGRESS_CLOCK: OnceLock<Instant> = OnceLock::new();
+/// When the last progress event went, in milliseconds on PROGRESS_CLOCK;
+/// u64::MAX before the first.
+static LAST_PROGRESS_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Whether a per-file progress event may go now. Workers on every thread ask;
+/// at most one of them gets a yes per interval. Events that close a phase
+/// (its last count, a phase change, a log line) are not paced.
+pub(super) fn progress_due() -> bool {
+    let now = PROGRESS_CLOCK
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis() as u64;
+    let last = LAST_PROGRESS_MS.load(Ordering::Relaxed);
+    if last != u64::MAX && now < last.saturating_add(PROGRESS_EVERY_MS) {
+        return false;
+    }
+    LAST_PROGRESS_MS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
 pub(super) fn emit_tui_event(event: &TuiEvent) -> io::Result<()> {
