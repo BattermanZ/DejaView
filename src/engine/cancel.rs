@@ -4,8 +4,8 @@
 
 use std::fmt;
 use std::io::{BufRead, BufReader, Read};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 #[derive(Clone, Debug, Default)]
@@ -44,6 +44,51 @@ impl CancelToken {
                 }
             }
         })
+    }
+}
+
+/// The first error that stops a phase many workers run at once (a strict
+/// failure, another root reached, a cancel), shared so the others stop
+/// before their next step.
+#[derive(Default)]
+pub(super) struct FirstError {
+    stopped: AtomicBool,
+    error: Mutex<Option<anyhow::Error>>,
+}
+
+impl FirstError {
+    pub(super) fn is_set(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Keep `err` unless an earlier error is already kept.
+    pub(super) fn set(&self, err: anyhow::Error) {
+        self.stopped.store(true, Ordering::Relaxed);
+        if let Ok(mut slot) = self.error.lock()
+            && slot.is_none()
+        {
+            *slot = Some(err);
+        }
+    }
+
+    /// Whether a worker should stop before its next step: an error is kept,
+    /// or the run was cancelled, which is then kept as the error.
+    pub(super) fn should_stop(&self, cancel: &CancelToken) -> bool {
+        if self.is_set() {
+            return true;
+        }
+        if let Err(cancelled) = cancel.check() {
+            self.set(cancelled.into());
+            return true;
+        }
+        false
+    }
+
+    pub(super) fn into_result(self) -> anyhow::Result<()> {
+        match self.error.into_inner() {
+            Ok(Some(err)) => Err(err),
+            _ => Ok(()),
+        }
     }
 }
 

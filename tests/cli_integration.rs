@@ -634,13 +634,16 @@ fn scans_skip_hardlinked_files_and_reuse_cache_for_every_path() {
         !cold.iter().any(|p| p.contains("show.mkv")),
         "a group that is one physical file must not be read: {cold:?}"
     );
-    let full_reads = cold
-        .iter()
-        .filter(|p| p.starts_with("hashing_full"))
-        .count();
+    // Every file here is under the 1 MiB sample, so its quick hash reads it
+    // whole and is its full hash: one read per physical file, none in full.
     assert_eq!(
-        full_reads, 4,
-        "one full read per physical file in a duplicate group: {cold:?}"
+        cold.len(),
+        4,
+        "one read per physical file in a duplicate group: {cold:?}"
+    );
+    assert!(
+        cold.iter().all(|p| p.starts_with("hashing_sample")),
+        "a file no bigger than the sample is never read twice: {cold:?}"
     );
 
     let warm = paths_read_by_scan(&root);
@@ -1212,5 +1215,278 @@ fn link_with_a_plan_links_only_the_reviewed_pairs() {
         "an empty plan links nothing, not everything"
     );
     assert_ne!(ino(downloads.join("new.mkv")), ino(media.join("new.mkv")));
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_signal_stops_a_scan_and_keeps_the_hashes_it_finished() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let root = unique_temp_dir("signal");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    // A small pair is hashed whole by its quick hash, before the full pass.
+    write_seeded(&media.join("small.mkv"), 300_000, 1);
+    write_seeded(&downloads.join("small.mkv"), 300_000, 1);
+    // A pair of sparse files: they take no disk, and their full hashes take
+    // long enough that the signal lands while they are being read.
+    for path in [media.join("big.mkv"), downloads.join("big.mkv")] {
+        let file = fs::File::create(&path).expect("create sparse file");
+        file.set_len(4 << 30).expect("size sparse file");
+    }
+    configure_small_files(&root, &downloads, &media);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dejaview"))
+        .args(["scan", "--tui-events", "--no-progress"])
+        .env("XDG_CONFIG_HOME", root.join("xdg"))
+        .env("HOME", root.join("home"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start scan");
+    let mut events = Vec::new();
+    let mut signalled = false;
+    for line in BufReader::new(child.stdout.take().expect("stdout")).lines() {
+        let line = line.expect("read event");
+        let event: serde_json::Value = serde_json::from_str(&line).expect("parse event");
+        if !signalled && event["type"] == "phase" && event["phase"] == "hashing_full" {
+            let status = Command::new("kill")
+                .args(["-INT", &child.id().to_string()])
+                .status()
+                .expect("send SIGINT");
+            assert!(status.success());
+            signalled = true;
+        }
+        events.push(event);
+    }
+    let out = child.wait_with_output().expect("wait for scan");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(signalled, "the scan reached its full pass: {events:?}");
+    assert_eq!(out.status.code(), Some(1), "stderr={stderr}");
+    assert_eq!(events.last().expect("events")["type"], "cancelled");
+    assert!(stderr.contains("Stopping before the next file"), "{stderr}");
+    let cache: serde_json::Value = serde_json::from_slice(
+        &fs::read(downloads.join(".dejaview_cache.json")).expect("cache saved"),
+    )
+    .expect("parse cache");
+    assert!(
+        cache.get("downloads/small.mkv").is_some() && cache.get("media/small.mkv").is_some(),
+        "the hashes finished before the signal are kept: {cache}"
+    );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+/// The events of a `--tui-events` run, which must succeed.
+fn events_of(root: &Path, args: &[&str]) -> Vec<serde_json::Value> {
+    let mut args = args.to_vec();
+    args.extend(["--tui-events", "--no-progress"]);
+    let out = run_cmd(root, &args);
+    assert!(
+        out.status.success(),
+        "args={args:?} stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse event"))
+        .collect()
+}
+
+fn walked(events: &[serde_json::Value]) -> bool {
+    events
+        .iter()
+        .any(|event| event["type"] == "phase" && event["phase"] == "collecting")
+}
+
+fn logged(events: &[serde_json::Value], text: &str) -> bool {
+    events.iter().any(|event| {
+        event["type"] == "log" && event["message"].as_str().is_some_and(|m| m.contains(text))
+    })
+}
+
+#[test]
+fn reviewed_rows_the_cache_vouches_for_are_linked_without_a_walk() {
+    let root = unique_temp_dir("plan_from_cache");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("Movie/movie.mkv"), 5000, 1);
+    write_seeded(&media.join("Movies/movie.mkv"), 5000, 1);
+    write_seeded(&downloads.join("Show/ep.mkv"), 6000, 2);
+    write_seeded(&media.join("TV/ep.mkv"), 6000, 2);
+    configure_small_files(&root, &downloads, &media);
+    let scan = events_of(&root, &["scan"]);
+    assert!(walked(&scan));
+
+    let plan = root.join("plan.json");
+    let write_plan = |pairs: serde_json::Value| {
+        fs::write(&plan, serde_json::to_vec(&pairs).expect("encode plan")).expect("write plan");
+    };
+    write_plan(serde_json::json!([
+        {"source": downloads.join("Movie/movie.mkv"), "target": media.join("Movies/movie.mkv")},
+    ]));
+    let link = events_of(&root, &["link", "--plan", plan.to_str().expect("plan str")]);
+    assert!(!walked(&link), "the cache vouched, so no walk: {link:?}");
+    assert!(
+        logged(&link, "The cache vouches for all 1 reviewed row(s)"),
+        "{link:?}"
+    );
+    let ino = |path: PathBuf| fs::metadata(path).expect("metadata").ino();
+    assert_eq!(
+        ino(downloads.join("Movie/movie.mkv")),
+        ino(media.join("Movies/movie.mkv"))
+    );
+
+    // A download changed since the scan: the run walks and checks it again.
+    let episode = downloads.join("Show/ep.mkv");
+    write_seeded(&episode, 6000, 2);
+    write_plan(serde_json::json!([
+        {"source": episode, "target": media.join("TV/ep.mkv")},
+    ]));
+    let link = events_of(&root, &["link", "--plan", plan.to_str().expect("plan str")]);
+    assert!(walked(&link), "{link:?}");
+    assert!(
+        logged(&link, "changed since it was hashed"),
+        "the log says why the cache could not vouch: {link:?}"
+    );
+    assert_eq!(ino(episode), ino(media.join("TV/ep.mkv")));
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_walk_paces_its_progress_events() {
+    let root = unique_temp_dir("paced_events");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    for folder in 0..20 {
+        for file in 0..100 {
+            write_seeded(
+                &downloads.join(format!("f{folder}/{file}.mkv")),
+                64,
+                (folder * 100 + file) as u8,
+            );
+        }
+    }
+    fs::create_dir_all(&media).expect("create media");
+    configure_small_files(&root, &downloads, &media);
+
+    let events = events_of(&root, &["scan"]);
+    let file_events = events.iter().filter(|e| e["type"] == "file").count();
+    assert!(
+        file_events < 200,
+        "2000 files found, {file_events} file events: one per 100 ms at most"
+    );
+    // The walk's own last count, before hashing starts; the planning count
+    // later carries the same number and must not stand in for it.
+    let walk_ends = events
+        .iter()
+        .position(|e| e["type"] == "phase" && e["phase"] == "hashing_sample")
+        .expect("the walk ends");
+    let last_count = events[..walk_ends]
+        .iter()
+        .rev()
+        .find_map(|e| e["files_seen"].as_u64())
+        .expect("a count event from the walk");
+    assert_eq!(last_count, 2000, "the final count is never paced away");
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_reviewed_download_hardlinked_into_the_library_since_the_scan_is_left_alone() {
+    let root = unique_temp_dir("plan_hardlinked_since");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let download = downloads.join("movie.mkv");
+    write_seeded(&download, 5000, 1);
+    write_seeded(&media.join("A/movie.mkv"), 5000, 1);
+    // Another copy, so later scans read the group again.
+    write_seeded(&downloads.join("copy/movie.mkv"), 5000, 1);
+    configure_small_files(&root, &downloads, &media);
+    events_of(&root, &["scan"]);
+
+    // Sonarr imports the download by hardlinking it into the library, and a
+    // scan from cron refreshes the download's cache entry.
+    fs::create_dir_all(media.join("B")).expect("create B");
+    fs::hard_link(&download, media.join("B/movie.mkv")).expect("hardlink into library");
+    events_of(&root, &["scan"]);
+
+    let plan = root.join("plan.json");
+    fs::write(
+        &plan,
+        serde_json::to_vec(&serde_json::json!([
+            {"source": download, "target": media.join("A/movie.mkv")},
+        ]))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+    let link = events_of(&root, &["link", "--plan", plan.to_str().expect("plan str")]);
+    assert!(
+        walked(&link),
+        "a download with other hardlinks is checked by the walk: {link:?}"
+    );
+    let ino = |path: PathBuf| fs::metadata(path).expect("metadata").ino();
+    assert_eq!(
+        ino(download.clone()),
+        ino(media.join("B/movie.mkv")),
+        "the hardlink Sonarr made is kept"
+    );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_run_under_nohup_keeps_running_when_the_terminal_hangs_up() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let root = unique_temp_dir("nohup");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    fs::create_dir_all(&downloads).expect("create downloads");
+    fs::create_dir_all(&media).expect("create media");
+    for path in [media.join("big.mkv"), downloads.join("big.mkv")] {
+        let file = fs::File::create(&path).expect("create sparse file");
+        file.set_len(1 << 30).expect("size sparse file");
+    }
+    configure_small_files(&root, &downloads, &media);
+
+    // nohup ignores SIGHUP and then runs DejaView in its own place.
+    let mut child = Command::new("nohup")
+        .arg(env!("CARGO_BIN_EXE_dejaview"))
+        .args(["scan", "--tui-events", "--no-progress"])
+        .env("XDG_CONFIG_HOME", root.join("xdg"))
+        .env("HOME", root.join("home"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start scan under nohup");
+    let mut events = Vec::new();
+    for line in BufReader::new(child.stdout.take().expect("stdout")).lines() {
+        let event: serde_json::Value =
+            serde_json::from_str(&line.expect("read event")).expect("parse event");
+        if event["type"] == "phase" && event["phase"] == "hashing_full" {
+            let status = Command::new("kill")
+                .args(["-HUP", &child.id().to_string()])
+                .status()
+                .expect("send SIGHUP");
+            assert!(status.success());
+        }
+        events.push(event);
+    }
+    let out = child.wait_with_output().expect("wait for scan");
+
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(events.last().expect("events")["type"], "done");
+
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

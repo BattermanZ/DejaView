@@ -51,6 +51,10 @@ pub struct RunReport {
     /// written before the floor existed.
     #[serde(default)]
     pub skipped_by_min_size: u64,
+    /// Files and folders left out because their name is on the exclude list.
+    /// A folder counts once, whatever it holds, since it is never read.
+    #[serde(default)]
+    pub skipped_by_exclude: u64,
     /// Downloads left alone because they are a library file seen through a
     /// second mount (a bind mount or a mergerfs branch). Non-zero means the
     /// downloads folder reaches into the library.

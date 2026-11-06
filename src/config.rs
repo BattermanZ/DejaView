@@ -15,12 +15,46 @@ pub struct Config {
     /// [`DEFAULT_MIN_SIZE`]; empty files are skipped whatever it says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_size: Option<u64>,
+    /// How many files are walked and quick-hashed at once. Unset means
+    /// [`DEFAULT_THREADS`].
     pub threads: Option<usize>,
+    /// How many files are read in full at once. Unset means
+    /// [`DEFAULT_FULL_THREADS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_threads: Option<usize>,
+    /// Names of files and folders every walk leaves out, as globs. Unset means
+    /// [`DEFAULT_EXCLUDE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<Vec<String>>,
     pub link_mode: Option<LinkMode>,
 }
 
 /// The size floor when the config sets none: 1 MiB (ADR 0002).
 pub const DEFAULT_MIN_SIZE: u64 = 1024 * 1024;
+
+/// Files walked and quick-hashed at once when the config sets none. Both wait
+/// on the network drive far more than on the CPU, so this is not the CPU count.
+pub const DEFAULT_THREADS: usize = 16;
+
+/// Files read in full at once when the config sets none. Full reads are limited
+/// by the drive's bandwidth, and more of them at once make a disk seek.
+pub const DEFAULT_FULL_THREADS: usize = 2;
+
+/// Folders a NAS or an OS keeps for itself: recycle bins, snapshots, thumbnail
+/// caches and fsck's leftovers. Walking them costs time, and a recycle-bin copy
+/// could otherwise become a link target.
+pub const DEFAULT_EXCLUDE: &[&str] = &[
+    "@eaDir",
+    "#recycle",
+    "#snapshot",
+    "@Recycle",
+    ".@__thumb",
+    ".recycle",
+    ".snapshots",
+    ".Trash-*",
+    "$RECYCLE.BIN",
+    "lost+found",
+];
 
 impl Config {
     /// The smallest file a run considers. Never below 1 byte, so an empty file
@@ -29,6 +63,38 @@ impl Config {
     pub fn effective_min_size(&self) -> u64 {
         self.min_size.unwrap_or(DEFAULT_MIN_SIZE).max(1)
     }
+
+    pub fn effective_threads(&self) -> usize {
+        self.threads.unwrap_or(DEFAULT_THREADS).max(1)
+    }
+
+    pub fn effective_full_threads(&self) -> usize {
+        self.full_threads.unwrap_or(DEFAULT_FULL_THREADS).max(1)
+    }
+
+    /// The name patterns walks leave out.
+    pub fn effective_exclude(&self) -> Vec<String> {
+        match &self.exclude {
+            Some(patterns) => patterns.clone(),
+            None => DEFAULT_EXCLUDE.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+}
+
+/// Check exclude patterns before they are saved. Each is matched against one
+/// file or folder name, so a pattern with `/` could never match.
+pub fn check_exclude_patterns(patterns: &[String]) -> Result<()> {
+    for pattern in patterns {
+        if pattern.is_empty() {
+            return Err(anyhow!("an exclude pattern cannot be empty"));
+        }
+        if pattern.contains('/') {
+            return Err(anyhow!(
+                "exclude pattern {pattern:?} contains /, but each pattern is matched against one file or folder name; give the folder's name alone, such as \"#recycle\""
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The config file: `DEJAVIEW_CONFIG` when set, else `dejaview/config.json`
@@ -178,6 +244,17 @@ pub fn ensure_roots_disjoint(downloads: &Path, media: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exclude_defaults_until_set_and_refuses_a_path() {
+        let mut config = Config::default();
+        assert!(config.effective_exclude().iter().any(|p| p == "#recycle"));
+        config.exclude = Some(Vec::new());
+        assert!(config.effective_exclude().is_empty());
+        assert!(check_exclude_patterns(&["#recycle".into(), ".Trash-*".into()]).is_ok());
+        assert!(check_exclude_patterns(&["media/#recycle".into()]).is_err());
+        assert!(check_exclude_patterns(&[String::new()]).is_err());
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -202,6 +279,8 @@ mod tests {
             min_age: Some(60),
             min_size: Some(4096),
             threads: Some(4),
+            full_threads: None,
+            exclude: None,
             link_mode: Some(LinkMode::SymlinkOnly),
         };
 
@@ -269,6 +348,8 @@ mod tests {
             min_age: None,
             min_size: None,
             threads: None,
+            full_threads: None,
+            exclude: None,
             link_mode: None,
         };
 
@@ -288,6 +369,8 @@ mod tests {
             min_age: None,
             min_size: None,
             threads: None,
+            full_threads: None,
+            exclude: None,
             link_mode: None,
         };
 
@@ -303,6 +386,8 @@ mod tests {
             min_age: None,
             min_size: None,
             threads: None,
+            full_threads: None,
+            exclude: None,
             link_mode: None,
         }
     }
@@ -375,6 +460,8 @@ mod tests {
             min_age: None,
             min_size: None,
             threads: None,
+            full_threads: None,
+            exclude: None,
             link_mode: None,
         };
 

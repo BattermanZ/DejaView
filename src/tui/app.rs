@@ -85,7 +85,8 @@ pub struct App {
     media: Option<PathBuf>,
     min_age: Option<u64>,
     min_size: u64,
-    threads: Option<usize>,
+    threads: usize,
+    full_threads: usize,
     link_mode: LinkMode,
     expand_paths: bool,
     current_phase: Option<String>,
@@ -120,7 +121,8 @@ impl App {
             media: config.media.clone(),
             min_age: config.min_age,
             min_size: config.effective_min_size(),
-            threads: config.threads,
+            threads: config.effective_threads(),
+            full_threads: config.effective_full_threads(),
             link_mode: config.link_mode.unwrap_or(LinkMode::Best),
             expand_paths: false,
             current_phase: None,
@@ -310,10 +312,14 @@ impl App {
         self.min_size
     }
 
+    /// Files walked and quick-hashed at once.
     pub fn threads_label(&self) -> String {
-        self.threads
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "auto".to_string())
+        self.threads.to_string()
+    }
+
+    /// Files read in full at once.
+    pub fn full_threads_label(&self) -> String {
+        self.full_threads.to_string()
     }
 
     pub fn link_mode_label(&self) -> &'static str {
@@ -1082,8 +1088,8 @@ impl App {
                 self.active_workers.clear();
                 self.hash_progress_done = None;
                 self.hash_progress_total = None;
-                self.report_before_link = None;
                 self.merge_report(kind.clone(), report);
+                self.report_before_link = None;
                 self.live_entries.clear();
                 self.running_job = None;
                 self.finish_live_run();
@@ -1218,6 +1224,18 @@ impl App {
                 }
             }
             JobKind::Scan | JobKind::LinkAll => {
+                let mut report = report;
+                // A link of reviewed rows the cache vouches for walks
+                // nothing and considers only the rows' files; keep the count
+                // the scan showed, as a single-row link does.
+                // A link run sets the scan's report aside while it runs.
+                if matches!(kind, JobKind::LinkAll)
+                    && let Some(previous) =
+                        self.report.as_ref().or(self.report_before_link.as_ref())
+                {
+                    report.files_considered =
+                        report.files_considered.max(previous.files_considered);
+                }
                 self.live_files_seen = Some(report.files_considered);
                 self.live_planned_actions = Some(report.planned_actions);
                 self.live_applied_actions = Some(report.applied_actions);
@@ -1307,6 +1325,7 @@ mod tests {
             total_saved_bytes: 1024,
             skipped_by_min_age: 0,
             skipped_by_min_size: 0,
+            skipped_by_exclude: 0,
             skipped_as_library_file: 0,
             dangling_symlinks: Vec::new(),
             warnings: WarningSummary {
@@ -1337,6 +1356,7 @@ mod tests {
             total_saved_bytes: 30,
             skipped_by_min_age: 0,
             skipped_by_min_size: 0,
+            skipped_by_exclude: 0,
             skipped_as_library_file: 0,
             dangling_symlinks: Vec::new(),
             warnings: WarningSummary {
@@ -1868,6 +1888,23 @@ mod tests {
     }
 
     #[test]
+    fn link_all_keeps_the_file_count_the_scan_showed() {
+        let mut app = App::new(&Config::default(), false);
+        let mut scanned = sample_report();
+        scanned.files_considered = 7;
+        // As starting a link run leaves it: the scan's report set aside.
+        app.report_before_link = Some(scanned);
+        let mut linked = sample_report();
+        linked.files_considered = 3;
+
+        assert!(app.apply_tui_event(JobKind::LinkAll, TuiEvent::Done { report: linked }));
+
+        assert_eq!(app.live_files_seen, Some(7));
+        assert_eq!(app.report.as_ref().map(|r| r.files_considered), Some(7));
+        assert!(app.report_before_link.is_none());
+    }
+
+    #[test]
     fn link_all_takes_the_planned_rows_the_scan_showed() {
         let config = Config::default();
         let mut app = App::new(&config, false);
@@ -1968,6 +2005,7 @@ mod tests {
             total_saved_bytes: 30,
             skipped_by_min_age: 0,
             skipped_by_min_size: 0,
+            skipped_by_exclude: 0,
             skipped_as_library_file: 0,
             dangling_symlinks: Vec::new(),
             warnings: WarningSummary {
@@ -2020,6 +2058,7 @@ mod tests {
                 total_saved_bytes: 10,
                 skipped_by_min_age: 0,
                 skipped_by_min_size: 0,
+                skipped_by_exclude: 0,
                 skipped_as_library_file: 0,
                 dangling_symlinks: Vec::new(),
                 warnings: WarningSummary {
@@ -2141,6 +2180,8 @@ mod tests {
                     min_age: Some(900),
                     min_size: None,
                     threads: Some(8),
+                    full_threads: None,
+                    exclude: None,
                     link_mode: Some(LinkMode::Best),
                 })
             },
@@ -2151,6 +2192,8 @@ mod tests {
                     min_age: config.min_age,
                     min_size: config.min_size,
                     threads: config.threads,
+                    full_threads: config.full_threads,
+                    exclude: config.exclude.clone(),
                     link_mode: config.link_mode,
                 });
                 Ok(())

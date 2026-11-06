@@ -142,8 +142,21 @@ enum ConfigCommands {
         #[arg(value_parser = clap::value_parser!(u64).range(1..))]
         bytes: u64,
     },
-    /// Set worker thread count for hashing
+    /// Set how many files are walked and quick-hashed at once (default 16)
     SetThreads { count: usize },
+    /// Set how many files are read in full at once (default 2)
+    SetFullThreads { count: usize },
+    /// Set the file and folder names every walk leaves out, as globs (* for any run of characters, ? for one). With no PATTERN, nothing is left out
+    #[command(
+        after_help = "The default list leaves out the folders a NAS or an OS keeps for itself: @eaDir, #recycle, #snapshot, @Recycle, .@__thumb, .recycle, .snapshots, .Trash-*, $RECYCLE.BIN and lost+found."
+    )]
+    SetExclude {
+        /// Names to leave out, such as '#recycle' or '*.part'
+        patterns: Vec<String>,
+        /// Go back to the default list
+        #[arg(long, conflicts_with = "patterns")]
+        default: bool,
+    },
     /// Set link mode
     SetLinkMode { mode: LinkModeArg },
     /// Validate configured paths and permissions
@@ -186,6 +199,13 @@ impl From<LinkModeArg> for LinkMode {
 fn main() -> ExitCode {
     match run_cli() {
         Ok(()) => ExitCode::SUCCESS,
+        Err(err) if err.is::<engine::Cancelled>() => {
+            eprintln!(
+                "{} Stopped before changing anything. The hashes finished so far are saved in the cache, so the next run starts from there.",
+                "⚠".yellow()
+            );
+            ExitCode::FAILURE
+        }
         Err(err) => {
             eprintln!("Error: {err:?}");
             // ADR 0003: 3 tells a script that another run had the lock and
@@ -208,12 +228,6 @@ fn run_cli() -> Result<()> {
         Err(warning) => eprintln!("{} {warning}", "⚠".yellow()),
     }
     let mut config = load_config()?;
-
-    if let Some(threads) = config.threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build_global()?;
-    }
 
     match cli.command {
         Commands::Scan {
@@ -318,11 +332,42 @@ fn run_cli() -> Result<()> {
             }
             ConfigCommands::SetThreads { count } => {
                 if count == 0 {
-                    return Err(anyhow::anyhow!("threads must be greater than 0"));
+                    return Err(anyhow::anyhow!(
+                        "threads must be at least 1: it is how many files are walked and quick-hashed at once; 16 suits a network drive"
+                    ));
                 }
                 config.threads = Some(count);
                 save_config(&config)?;
                 println!("{} threads set to {}.", "✔".green(), count);
+            }
+            ConfigCommands::SetFullThreads { count } => {
+                if count == 0 {
+                    return Err(anyhow::anyhow!(
+                        "full threads must be at least 1: it is how many files are read in full at once; use 2, or 1 for a single spinning disk"
+                    ));
+                }
+                config.full_threads = Some(count);
+                save_config(&config)?;
+                println!("{} full_threads set to {}.", "✔".green(), count);
+            }
+            ConfigCommands::SetExclude { patterns, default } => {
+                if default {
+                    config.exclude = None;
+                } else {
+                    config::check_exclude_patterns(&patterns)?;
+                    config.exclude = Some(patterns);
+                }
+                save_config(&config)?;
+                let effective = config.effective_exclude();
+                if effective.is_empty() {
+                    println!("{} Walks now leave nothing out.", "✔".green());
+                } else {
+                    println!(
+                        "{} Walks now leave out: {}",
+                        "✔".green(),
+                        effective.join("  ")
+                    );
+                }
             }
             ConfigCommands::SetLinkMode { mode } => {
                 config.link_mode = Some(mode.into());
@@ -377,10 +422,47 @@ fn command_name(command: &Commands) -> &'static str {
     }
 }
 
-/// A run driven by the TUI can be cancelled by a `cancel` line on stdin; any
-/// other run ignores stdin.
+/// The cancel token of a scan or link. Ctrl+C, SIGTERM (a cron timeout,
+/// `docker stop`) and SIGHUP cancel it: the run stops before its next file,
+/// or between chunks of a large one, saves the hashes it has finished and
+/// changes nothing more. A second signal ends the process at once, for a run
+/// stuck on a read from a mount that stopped answering.
+///
+/// A process told to ignore one of those signals, as `nohup` ignores SIGHUP,
+/// keeps every signal as it was given: catching SIGHUP there would stop a run
+/// its user meant to outlive the terminal. A run driven by the TUI is also
+/// cancelled by a `cancel` line on stdin; any other run ignores stdin.
 fn run_cancel_token(tui_events: bool) -> engine::CancelToken {
     let token = engine::CancelToken::default();
+    let on_signal = token.clone();
+    // try_set_handler refuses, and restores all three, when any of them is
+    // not at its default.
+    let handled = ctrlc::try_set_handler(move || {
+        if on_signal.is_cancelled() {
+            // The conventional status of a process ended by SIGINT.
+            std::process::exit(130);
+        }
+        on_signal.cancel();
+        logger::warn("run", "stop requested by a signal");
+        // stderr, so a TUI-driven run's stdout stays pure NDJSON.
+        eprintln!(
+            "{} Stopping before the next file, keeping the hashes finished so far. Press Ctrl+C again to stop at once.",
+            "⚠".yellow()
+        );
+    });
+    match handled {
+        Ok(()) => {}
+        Err(ctrlc::Error::MultipleHandlers) => logger::info(
+            "run",
+            "SIGINT, SIGTERM or SIGHUP is already ignored or handled, as under nohup; leaving signals as they were given, so a run stopped by one loses the hashes it has not saved",
+        ),
+        Err(err) => logger::warn(
+            "run",
+            format!(
+                "cannot catch Ctrl+C or SIGTERM ({err}); stopping a run that way loses the hashes it has not saved"
+            ),
+        ),
+    }
     if tui_events {
         token.watch(std::io::stdin());
     }
@@ -400,9 +482,12 @@ fn read_plan(path: &std::path::Path) -> Result<Vec<(PathBuf, PathBuf)>> {
             path.display()
         ));
     }
+    // A row given twice is linked once: the second would fail as changed.
+    let mut seen = std::collections::HashSet::new();
     Ok(pairs
         .into_iter()
         .map(|pair| (PathBuf::from(pair.source), PathBuf::from(pair.target)))
+        .filter(|pair| seen.insert(pair.clone()))
         .collect())
 }
 
@@ -471,7 +556,9 @@ fn validate_config(config: &config::Config) -> Result<()> {
     {
         if let Err(err) = config::ensure_roots_disjoint(&downloads, &media) {
             failures.push(err.to_string());
-        } else if let Err(err) = engine::ensure_roots_not_mounted_inside(&downloads, &media) {
+        } else if let Err(err) =
+            engine::ensure_roots_not_mounted_inside(&downloads, &media, config.effective_exclude())
+        {
             failures.push(format!("{err:#}"));
         }
     }
@@ -668,6 +755,60 @@ mod tests {
             Commands::Link { confirm, .. } => assert!(confirm),
             _ => panic!("expected link command"),
         }
+    }
+
+    #[test]
+    fn parses_config_set_exclude_command() {
+        let cli = Cli::try_parse_from(["dejaview", "config", "set-exclude", "#recycle", "*.part"])
+            .expect("parse config set-exclude");
+        match cli.command {
+            Commands::Config(ConfigArgs {
+                command: ConfigCommands::SetExclude { patterns, default },
+            }) => {
+                assert_eq!(patterns, vec!["#recycle", "*.part"]);
+                assert!(!default);
+            }
+            _ => panic!("expected config set-exclude command"),
+        }
+        assert!(
+            Cli::try_parse_from(["dejaview", "config", "set-exclude", "--default", "x"]).is_err()
+        );
+    }
+
+    #[test]
+    fn set_exclude_help_names_every_default_pattern() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("config")
+            .and_then(|config| config.find_subcommand_mut("set-exclude"))
+            .and_then(|command| command.get_after_help())
+            .map(ToString::to_string)
+            .expect("set-exclude has an after_help");
+        for pattern in config::DEFAULT_EXCLUDE {
+            assert!(help.contains(pattern), "{pattern} missing from {help}");
+        }
+    }
+
+    #[test]
+    fn a_plan_row_given_twice_is_read_once() {
+        let root = unique_temp_dir("plan_twice");
+        fs::create_dir_all(&root).expect("create root");
+        let plan = root.join("plan.json");
+        fs::write(
+            &plan,
+            br#"[{"source":"/dl/a","target":"/m/a"},{"source":"/dl/a","target":"/m/a"},{"source":"/dl/b","target":"/m/a"}]"#,
+        )
+        .expect("write plan");
+        let pairs = read_plan(&plan).expect("read plan");
+        assert_eq!(
+            pairs,
+            vec![
+                (PathBuf::from("/dl/a"), PathBuf::from("/m/a")),
+                (PathBuf::from("/dl/b"), PathBuf::from("/m/a")),
+            ]
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

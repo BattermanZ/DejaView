@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::fs;
-use std::io::ErrorKind;
-use std::path::Path;
+use std::io::{BufReader, ErrorKind};
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::config::{Config, cache_path};
@@ -11,17 +11,39 @@ use crate::logger;
 
 use super::types::Cache;
 
+/// Read the cache. A missing file is an empty cache. A file that cannot be
+/// read or parsed is too, with a warning in the log, since it means hashing
+/// the whole library again.
 pub(super) fn load_cache(path: &Path) -> Cache {
-    match fs::read_to_string(path) {
-        Ok(s) => {
-            logger::info("cache", format!("loading cache from {}", path.display()));
-            serde_json::from_str(&s).unwrap_or_default()
-        }
-        Err(_) => {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
             logger::info("cache", format!("cache missing at {}", path.display()));
-            Cache::new()
+            return Cache::new();
         }
-    }
+        Err(err) => {
+            logger::warn(
+                "cache",
+                format!(
+                    "cannot read the cache {} ({err}); starting with an empty one, so every candidate is hashed again",
+                    path.display()
+                ),
+            );
+            return Cache::new();
+        }
+    };
+    logger::info("cache", format!("loading cache from {}", path.display()));
+    // Parsed as it is read, so a large cache is not held twice in memory.
+    serde_json::from_reader(BufReader::new(file)).unwrap_or_else(|err| {
+        logger::warn(
+            "cache",
+            format!(
+                "the cache {} cannot be parsed ({err}); starting with an empty one, so every candidate is hashed again",
+                path.display()
+            ),
+        );
+        Cache::new()
+    })
 }
 
 pub(super) fn save_cache(path: &Path, cache: &Cache) -> Result<()> {
@@ -33,9 +55,76 @@ pub(super) fn save_cache(path: &Path, cache: &Cache) -> Result<()> {
     safe_write_bytes(path, &json)
 }
 
-/// The cache key for a path. Every cache read, write and prune goes through it.
-pub(super) fn cache_key(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+/// The first part of the key of every file under the media root.
+const MEDIA_KEY_ROOT: &str = "media";
+
+/// Whether a key names a file under the media root.
+pub(super) fn is_media_key(key: &str) -> bool {
+    key.strip_prefix(MEDIA_KEY_ROOT)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// How cache keys name paths: by root and the path below it, such as
+/// `media/Movies/Arrival (2016).mkv`. The same share mounted at two paths, say
+/// in a Docker cron job and on the host the dashboard runs on, then keys its
+/// files alike, and neither run prunes the other's entries. An entry is used
+/// only while the file's size, times, device and inode match, so a key alone
+/// never vouches for a file.
+pub(super) struct CacheKeys {
+    downloads: PathBuf,
+    media: PathBuf,
+}
+
+impl CacheKeys {
+    pub(super) fn new(downloads: &Path, media: &Path) -> Self {
+        CacheKeys {
+            downloads: downloads.to_path_buf(),
+            media: media.to_path_buf(),
+        }
+    }
+
+    /// The key for a path found under one of the roots. A path under neither,
+    /// which a walk never yields, is keyed by itself.
+    pub(super) fn key(&self, path: &Path, in_downloads: bool) -> String {
+        let (name, root) = if in_downloads {
+            ("downloads", &self.downloads)
+        } else {
+            (MEDIA_KEY_ROOT, &self.media)
+        };
+        match path.strip_prefix(root) {
+            Ok(rel) => format!("{name}/{}", rel.to_string_lossy()),
+            Err(_) => path.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Rename the keys an earlier version wrote, the absolute path of each
+    /// file, to this form, so upgrading costs no rehash. A key under neither
+    /// root is left as it is and pruned by the next complete run. Returns how
+    /// many keys changed.
+    pub(super) fn migrate(&self, cache: &mut Cache) -> usize {
+        let old: Vec<String> = cache
+            .keys()
+            .filter(|key| key.starts_with('/'))
+            .cloned()
+            .collect();
+        let mut migrated = 0;
+        for old_key in old {
+            let path = Path::new(&old_key);
+            let in_downloads = if path.starts_with(&self.downloads) {
+                true
+            } else if path.starts_with(&self.media) {
+                false
+            } else {
+                continue;
+            };
+            let new_key = self.key(path, in_downloads);
+            if let Some(entry) = cache.remove(&old_key) {
+                cache.entry(new_key).or_insert(entry);
+                migrated += 1;
+            }
+        }
+        migrated
+    }
 }
 
 /// Drop entries for paths this run did not see, so the cache follows the trees

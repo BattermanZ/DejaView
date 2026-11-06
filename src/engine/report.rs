@@ -38,6 +38,13 @@ pub(super) fn print_run_summary(
         "ℹ".cyan(),
         metrics.skipped_by_min_age
     );
+    if metrics.skipped_by_exclude > 0 {
+        println!(
+            "{} Left out by the exclude list: {} file(s) and folder(s); the log names each",
+            "ℹ".cyan(),
+            metrics.skipped_by_exclude
+        );
+    }
     println!("{} Planned actions: {}", "ℹ".cyan(), planned_actions);
     if applied_actions > 0 {
         println!("{} Applied actions: {}", "ℹ".cyan(), applied_actions);
@@ -223,6 +230,7 @@ pub(super) fn build_run_report(options: &ScanRunOptions<'_>, input: RunReportInp
         total_saved_bytes: input.total_saved_space,
         skipped_by_min_age: input.metrics.skipped_by_min_age,
         skipped_by_min_size: input.metrics.skipped_by_min_size,
+        skipped_by_exclude: input.metrics.skipped_by_exclude,
         skipped_as_library_file: input.metrics.skipped_as_library_file,
         dangling_symlinks: input
             .metrics

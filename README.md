@@ -29,7 +29,7 @@ There is also a terminal dashboard, `dejaview tui`, for scanning, reviewing and 
 
 - **Matching by content.** Files are grouped by size, then compared with BLAKE3 hashes: a quick hash of the first and last MiB, and a full hash only when quick hashes collide. Names and folders play no part.
 - **Hardlink first.** On the same filesystem the download becomes a hardlink and the space comes back. Across filesystems, or if the hardlink fails, DejaView falls back to a relative symlink and records why in the report.
-- **Cheap repeat runs.** A cache in the downloads folder remembers hashes. Hardlinked paths are hashed once, and an already-linked pair with no other file of the same size is not read at all, so rescanning a library that the *arr apps already hardlink costs very little.
+- **Cheap repeat runs.** A cache in the downloads folder remembers what each file hashed to, quick hashes included, so a repeat run reads only what it has not hashed before: files that are new or changed since the last run, and library files the first time a download of their size turns up. Hardlinked paths are read once, and files of a size no download shares with a library file are not read at all.
 - **Dry run by default.** `scan` only shows the plan. `link` changes files, and `link --confirm` asks first.
 - **Reports.** `--json` prints a run summary for scripts, and every `link` run writes a JSON report of what it changed.
 - **Terminal dashboard.** Live progress per hashing thread, link one row or all of them, and cancel a running scan or link with `c`.
@@ -101,7 +101,9 @@ dejaview link --confirm
 | `dejaview config set-media PATH` | Set the media folder. |
 | `dejaview config set-min-age SECONDS` | Skip files modified more recently than this. |
 | `dejaview config set-min-size BYTES` | Skip files smaller than this. At least 1: empty files are always skipped. |
-| `dejaview config set-threads N` | Set the number of hashing threads. |
+| `dejaview config set-threads N` | Set how many files are walked and quick-hashed at once. |
+| `dejaview config set-full-threads N` | Set how many files are read in full at once. |
+| `dejaview config set-exclude [PATTERN]...` | Set the file and folder names every walk leaves out, as globs (`*` for any run of characters, `?` for one). With no pattern nothing is left out; `--default` goes back to the default list. |
 | `dejaview config set-link-mode best\|symlink-only` | Choose hardlink with symlink fallback, or symlinks only. |
 | `dejaview cache info` | Show where the cache is and how many entries it holds. |
 | `dejaview cache clear` | Delete the cache. The next scan hashes everything again. |
@@ -130,7 +132,9 @@ For a cron job, give the binary's absolute path (cron's `PATH` is short), drop s
 
 The line keeps what DejaView writes to stderr, which is warnings and errors, and prints it unless the run exited with 3; cron mails whatever is printed.
 
-Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder. A run that finds another one going does nothing and exits with code 3, so a cron run that overlaps a long first run, or a run from the dashboard, skips its turn. Exit code 0 means the run finished, and 1 that it could not start or stopped on an error (with `--strict`, on the first failure).
+Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder. A run that finds another one going does nothing and exits with code 3, so a cron run that overlaps a long first run, or a run from the dashboard, skips its turn. Exit code 0 means the run finished, and 1 that it could not start or stopped on an error (with `--strict`, on the first failure), or was stopped on request before it linked anything.
+
+Ctrl+C, SIGTERM (a cron timeout, `docker stop`) or SIGHUP stops a scan or link before its next file, or partway through a large one, keeps every hash already finished in the cache and changes nothing more; a second Ctrl+C stops at once. While hashing, the cache is also saved every five minutes, so even a run killed outright loses at most that much work. A link run stopped this way while linking keeps the files it already linked, writes its report and exits 0; the report shows which pairs stayed planned. A run started under `nohup`, or with any of those signals ignored, keeps every signal as it was given.
 
 ### Terminal dashboard
 
@@ -157,7 +161,7 @@ Add `--strict` to run the dashboard's scans and links in strict mode.
 
 Cancelling a scan stops it almost at once, even partway through a large file, and keeps every hash already finished in the cache, so the next scan picks up where it stopped. Cancelling a link stops before the next file: files already linked stay linked and the rest stay planned. Quitting is blocked while a run is active, so cancel first.
 
-`l` and `L` link only rows you have seen: each row's download, to the library file the row shows. A duplicate that appeared since the scan is left for the next one, and so is a row whose files changed in between. `L` stays off until a scan has finished with planned rows. Linking lists both folders again to re-check the rows, but only hashes files of the same size as them.
+`l` and `L` link only rows you have seen: each row's download, to the library file the row shows. A duplicate that appeared since the scan is left for the next one, and so is a row whose files changed in between. `L` stays off until a scan has finished with planned rows. When neither file of any row has changed since the scan hashed it, and no download in them has other hardlinks or is a library file seen through a second mount, linking checks the rows against the cache and a `stat` of each file and of its folders, and walks neither folder. Otherwise it walks both folders again to re-check the rows, and only hashes files of the same size as them.
 
 ## Configuration
 
@@ -178,14 +182,16 @@ If the log cannot be written, DejaView warns once, naming the path, and runs wit
 | `media` | unset | The library. Read, never written. |
 | `min_age` | `0` | Seconds. Files modified more recently are skipped, which keeps DejaView away from files a client is still writing. |
 | `min_size` | `1048576` (1 MiB) | Bytes. Smaller files are skipped: `.nfo` files, text subtitles and artwork save almost nothing and cost a read on every run. Empty files are always skipped, because a torrent client creates a file empty before writing into it. |
-| `threads` | number of CPUs | Hashing threads. Lower it if parallel reads thrash spinning disks. |
+| `threads` | `16` | Files walked and quick-hashed at once. Both wait on the drive, mostly on its answer to each `stat` or short read, so a network drive keeps many busy whatever the CPU count. |
+| `full_threads` | `2` | Files read in full at once. Full reads are limited by the drive's bandwidth, and more of them at once make a spinning disk seek; set it to `1` for a single spinning disk. |
+| `exclude` | the folders a NAS or an OS keeps for itself | Names of files and folders every walk leaves out, with everything under them, each matched against one name. The default list is `@eaDir`, `#recycle`, `#snapshot`, `@Recycle`, `.@__thumb`, `.recycle`, `.snapshots`, `.Trash-*`, `$RECYCLE.BIN` and `lost+found`: walking them costs time, and a recycle-bin copy could otherwise become a link target. |
 | `link_mode` | `best` | `best` hardlinks and falls back to relative symlinks. `symlink-only` always uses relative symlinks. |
 
 ### Files DejaView writes
 
 | File | When |
 |---|---|
-| `<downloads>/.dejaview_cache.json` | Every scan and link. Entries for files that no longer exist are dropped after each complete run. |
+| `<downloads>/.dejaview_cache.json` | Every scan and link that learns a hash or drops an entry. Each entry is keyed by its folder (`downloads` or `media`) and its path below it, so the same share mounted at another path, as in a Docker container, uses the same entries. Entries for files that no longer exist are dropped after each complete run. |
 | `<downloads>/.dejaview_link_report.json` | Every link run without `--report`. |
 | `<downloads>/.dejaview_tui_report.json` | When you press `R` in the dashboard. |
 | `<downloads>/.dejaview_lock` | Every scan, link and `cache cleanup-temp`, which lock it while they run. It stays, empty; deleting it between runs is harmless. |
@@ -220,10 +226,10 @@ Files whose name starts with `.dejaview_` are never treated as duplicates.
 
 ## How it works
 
-1. Walk both folders without following symlinks. Skip files smaller than `min_size` (and every empty file), files younger than `min_age`, and DejaView's own files.
-2. Group files by size. Paths that are already the same file count once, and a group that is all one file is skipped.
-3. Quick hash (BLAKE3 of the first and last MiB) of each remaining file, unless every file in the group is already cached.
-4. Full BLAKE3 hash of the files whose quick hashes collide.
+1. Walk both folders without following symlinks, leaving out the names on the `exclude` list. Skip files smaller than `min_size` (and every empty file), files younger than `min_age`, and DejaView's own files.
+2. Group files by size. Paths that are already the same file count once. A group is skipped when it is all one file, holds no download or no library file, or every download in it already is a library file.
+3. Quick hash (BLAKE3 of the first and last MiB) of each remaining file the cache does not already know. A file of 1 MiB or less is read whole, so its quick hash is its full hash.
+4. Full BLAKE3 hash of the files whose quick hashes collide, unless cached.
 5. In each set of identical files, the first media file by path is the target. Every download copy that is not already a link to it gets an action.
 6. `link` only: check both files again, link to a temporary name, rename it over the download.
 
