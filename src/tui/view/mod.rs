@@ -9,15 +9,53 @@ use crate::tui::model::LinkReportEntry;
 use crate::tui::theme::Theme;
 use crate::tui::wordmark;
 
+/// A size in binary units, as the CLI prints it: `4.9 KiB`.
 fn format_bytes(bytes: u64) -> String {
-    let units = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
+    let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
     let mut value = bytes as f64;
     let mut idx = 0usize;
     while value >= 1024.0 && idx < units.len() - 1 {
         value /= 1024.0;
         idx += 1;
     }
-    format!("{value:.2} {}", units[idx])
+    if idx == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", units[idx])
+    }
+}
+
+/// A row's path as the table shows it: below its folder, or whole when the
+/// person asked for full paths with `p`.
+fn row_path<'a>(path: &'a str, root: Option<&std::path::Path>, expand: bool) -> &'a str {
+    if expand {
+        return path;
+    }
+    root.and_then(|root| std::path::Path::new(path).strip_prefix(root).ok())
+        .and_then(|rel| rel.to_str())
+        .filter(|rel| !rel.is_empty())
+        .unwrap_or(path)
+}
+
+/// Cut `path` to `width` characters, keeping its file name, which is what
+/// tells one episode from the next: the folders give way first, from the
+/// left. A file name too long on its own keeps its start, where a release
+/// names its title and episode; its end is a release group the rows share.
+fn trim_keep_name(path: &str, width: usize) -> String {
+    let count = path.chars().count();
+    if count <= width {
+        return path.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if name.chars().count() < width {
+        let tail: String = path.chars().skip(count - (width - 1)).collect();
+        return format!("…{tail}");
+    }
+    let start: String = name.chars().take(width - 1).collect();
+    format!("{start}…")
 }
 
 fn trim_middle(input: &str, max_len: usize) -> String {
@@ -646,6 +684,7 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let state_width = 12u16;
+    let size_width = 10u16;
     let max_outcome_len = app
         .rows()
         .iter()
@@ -653,13 +692,23 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         .max()
         .unwrap_or_else(|| "OUTCOME".chars().count());
     let outcome_width = (max_outcome_len as u16 + 2).clamp(12, 18);
-    let source_width = content[1]
+    let spacing = 2u16;
+    // A wide table shows the library file too; a narrow one keeps the room
+    // for the download, which is what tells rows apart.
+    let show_target = content[1].width >= 110;
+    let columns = if show_target { 5 } else { 4 };
+    let flexible = content[1]
         .width
-        .saturating_sub(state_width)
-        .saturating_sub(outcome_width)
-        .saturating_sub(4);
+        .saturating_sub(state_width + size_width + outcome_width + spacing * (columns - 1));
+    let (source_width, target_width) = if show_target {
+        let source = flexible * 11 / 20;
+        (source, flexible - source)
+    } else {
+        (flexible, 0)
+    };
     let visible_capacity = usize::from(content[1].height.saturating_sub(1));
     let (start, end) = visible_row_window(app.rows().len(), app.selected_row(), visible_capacity);
+    let expand = app.expand_paths();
 
     let rows: Vec<Row> = app
         .rows()
@@ -669,21 +718,32 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         .take(end.saturating_sub(start))
         .map(|(idx, row)| {
             let is_selected = idx == app.selected_row();
-            Row::new(vec![
+            let style = row_style(row, is_selected);
+            let mut cells = vec![
                 Cell::from(Span::styled(
                     format!(" {} ", row.status.to_uppercase()),
                     status_chip_style(row, is_selected),
                 )),
                 Cell::from(Span::styled(
-                    trim_to_width(&row.source, source_width),
-                    row_style(row, is_selected),
+                    trim_keep_name(
+                        row_path(&row.source, app.downloads_root(), expand),
+                        usize::from(source_width),
+                    ),
+                    style,
                 )),
-                Cell::from(Span::styled(
-                    outcome_label(row),
-                    row_style(row, is_selected),
-                )),
-            ])
-            .style(if is_selected {
+                Cell::from(Span::styled(format_bytes(row.size), style)),
+                Cell::from(Span::styled(outcome_label(row), style)),
+            ];
+            if show_target {
+                cells.push(Cell::from(Span::styled(
+                    trim_keep_name(
+                        row_path(&row.target, app.media_root(), expand),
+                        usize::from(target_width),
+                    ),
+                    style,
+                )));
+            }
+            Row::new(cells).style(if is_selected {
                 Theme::result_row_selected()
             } else {
                 Theme::result_row()
@@ -691,21 +751,26 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(state_width),
-            Constraint::Min(source_width.max(12)),
-            Constraint::Length(outcome_width),
-        ],
-    )
-    .header(Row::new(vec![
+    let mut widths = vec![
+        Constraint::Length(state_width),
+        Constraint::Length(source_width),
+        Constraint::Length(size_width),
+        Constraint::Length(outcome_width),
+    ];
+    let mut header = vec![
         Cell::from(Span::styled("STATE", Theme::title(false))),
         Cell::from(Span::styled("SOURCE", Theme::title(false))),
+        Cell::from(Span::styled("SIZE", Theme::title(false))),
         Cell::from(Span::styled("OUTCOME", Theme::title(false))),
-    ]))
-    .style(Theme::panel())
-    .column_spacing(2);
+    ];
+    if show_target {
+        widths.push(Constraint::Length(target_width));
+        header.push(Cell::from(Span::styled("TARGET", Theme::title(false))));
+    }
+    let table = Table::new(rows, widths)
+        .header(Row::new(header))
+        .style(Theme::panel())
+        .column_spacing(spacing);
     frame.render_widget(table, content[1]);
 }
 
@@ -1137,8 +1202,8 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(format_bytes(app.saved_bytes()), "10.00 B");
-        assert_eq!(format_bytes(app.potential_saved_bytes()), "20.00 B");
+        assert_eq!(format_bytes(app.saved_bytes()), "10 B");
+        assert_eq!(format_bytes(app.potential_saved_bytes()), "20 B");
     }
 
     #[test]
@@ -1310,5 +1375,142 @@ mod tests {
         assert_eq!(visible_row_window(10, 9, 4), (6, 10));
         assert_eq!(visible_row_window(3, 9, 4), (0, 3));
         assert_eq!(visible_row_window(3, 0, 0), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod row_tests {
+    use super::*;
+    use crate::protocol::{RunReport, WarningSummary};
+
+    #[test]
+    fn a_trimmed_path_keeps_its_file_name() {
+        assert_eq!(trim_keep_name("a/b.mkv", 20), "a/b.mkv");
+        assert_eq!(
+            trim_keep_name("Show.S01/Show.S01E05.mkv", 18),
+            "…1/Show.S01E05.mkv"
+        );
+        // A name longer than the column keeps its start: title and episode.
+        assert_eq!(
+            trim_keep_name("Show/Show.Name.S01E05.1080p.WEB-DL-GROUP.mkv", 17),
+            "Show.Name.S01E05…"
+        );
+        assert_eq!(trim_keep_name("abc", 0), "");
+    }
+
+    #[test]
+    fn a_row_path_is_shown_below_its_folder_unless_expanded() {
+        let root = std::path::Path::new("/srv/torrents");
+        assert_eq!(
+            row_path("/srv/torrents/a/b.mkv", Some(root), false),
+            "a/b.mkv"
+        );
+        assert_eq!(
+            row_path("/srv/torrents/a/b.mkv", Some(root), true),
+            "/srv/torrents/a/b.mkv"
+        );
+        assert_eq!(
+            row_path("/elsewhere/b.mkv", Some(root), false),
+            "/elsewhere/b.mkv"
+        );
+        assert_eq!(
+            row_path("/srv/torrents/a/b.mkv", None, false),
+            "/srv/torrents/a/b.mkv"
+        );
+    }
+
+    /// A scan of `episodes` downloads under a long downloads folder.
+    pub(super) fn app_with_episodes(episodes: u32) -> App {
+        let downloads = "/tmp/claude-0/-home-user/a-very-long-session-folder/downloads";
+        let config = crate::config::Config {
+            downloads: Some(std::path::PathBuf::from(downloads)),
+            media: Some(std::path::PathBuf::from("/srv/media")),
+            ..crate::config::Config::default()
+        };
+        let mut app = App::new(&config, false);
+        let entries = (1..=episodes)
+            .map(|n| LinkReportEntry {
+                source: format!(
+                    "{downloads}/Show.Name.S01.1080p.WEB-DL.H.264-GROUP/Show.Name.S01E{n:02}.1080p.WEB-DL.H.264-GROUP.mkv"
+                ),
+                target: format!("/srv/media/TV/Show Name/Season 1/Show Name S01E{n:02}.mkv"),
+                size: 1_500_000_000,
+                status: "planned".to_string(),
+                method: Some("try-hardlink".to_string()),
+                fallback_reason: None,
+                error: None,
+            })
+            .collect();
+        app.set_report_for_test(RunReport {
+            mode: "scan".to_string(),
+            planned_actions: episodes as usize,
+            warnings: WarningSummary::default(),
+            entries,
+            ..RunReport::default()
+        });
+        app
+    }
+
+    pub(super) fn screen(app: &App, cols: u16, rows: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(cols, rows);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| render(frame, app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..rows)
+            .map(|y| {
+                (0..cols)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn rows_of_a_season_can_be_told_apart() {
+        let app = app_with_episodes(3);
+        let text = screen(&app, 120, 40);
+        for n in 1..=3 {
+            assert!(text.contains(&format!("S01E0{n}")), "episode {n}:\n{text}");
+        }
+        assert!(text.contains("SIZE") && text.contains("1.4 GiB"), "{text}");
+        assert!(
+            row_lines(&text)
+                .iter()
+                .all(|row| !row.contains("a-very-long-session-folder")),
+            "the downloads folder is not repeated in the rows:\n{text}"
+        );
+    }
+
+    /// The table's row lines: those with a row's state chip, which the
+    /// column pads with spaces (the PLANNED card's title is followed by its
+    /// border).
+    fn row_lines(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter(|line| line.contains(" PLANNED  "))
+            .collect()
+    }
+
+    #[test]
+    fn a_wide_table_shows_the_library_file_and_p_shows_full_paths() {
+        let mut app = app_with_episodes(2);
+        let text = screen(&app, 400, 40);
+        let rows = row_lines(&text);
+        assert_eq!(rows.len(), 2, "{text}");
+        assert!(text.contains("TARGET"), "{text}");
+        assert!(
+            rows[1].contains("TV/Show Name/Season 1/Show Name S01E02.mkv"),
+            "{text}"
+        );
+        assert!(!rows[1].contains("/srv/media"), "below its folder: {text}");
+
+        app.toggle_path_mode_for_test();
+        let text = screen(&app, 400, 40);
+        let rows = row_lines(&text);
+        assert!(
+            rows[1].contains("/srv/media/TV/Show Name/Season 1"),
+            "{text}"
+        );
+        assert!(rows[1].contains("/downloads/Show.Name.S01.1080p"), "{text}");
     }
 }

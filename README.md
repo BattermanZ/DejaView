@@ -181,7 +181,7 @@ Add `--strict` to run the dashboard's scans and links in strict mode.
 | `c` | Cancel the running scan or link |
 | `j` / `k` or arrows | Move the selection |
 | `e` | Edit the downloads and media paths |
-| `p` | Show full or shortened paths |
+| `p` | Show the rows' paths in full, or below their folders |
 | `R` | Save the current report to `.dejaview_tui_report.json` in downloads |
 | `J` | Show the current report as JSON |
 | `?` | Help |

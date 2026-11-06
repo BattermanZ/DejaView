@@ -283,6 +283,16 @@ impl App {
             .unwrap_or_else(|| "<not set>".to_string())
     }
 
+    /// The downloads folder, which the table shows each download below.
+    pub fn downloads_root(&self) -> Option<&std::path::Path> {
+        self.downloads.as_deref()
+    }
+
+    /// The media folder, which the table shows each library file below.
+    pub fn media_root(&self) -> Option<&std::path::Path> {
+        self.media.as_deref()
+    }
+
     pub fn min_age_secs(&self) -> u64 {
         self.min_age.unwrap_or(0)
     }
@@ -1310,6 +1320,10 @@ impl App {
 
     pub(crate) fn set_report_for_test(&mut self, report: RunReport) {
         self.report = Some(report);
+    }
+
+    pub(crate) fn toggle_path_mode_for_test(&mut self) {
+        self.toggle_path_mode();
     }
 }
 
