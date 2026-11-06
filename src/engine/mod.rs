@@ -23,7 +23,7 @@ pub use types::ScanRunOptions;
 
 use crate::protocol::Outcome;
 use crate::protocol::WarningSummary;
-use crate::protocol::{Phase, TuiEvent};
+use crate::protocol::{Counts, Phase, TuiEvent};
 use cache::{CacheKeys, load_cache, prune_cache, save_cache};
 use collect::{CollectOptions, collect_run_files, group_files_by_size};
 use hashing::{CHECKPOINT_EVERY, Checkpoint, HashOptions, Hashed, hash_groups_and_update_cache};
@@ -325,14 +325,13 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         let _ = types::emit_tui_event(&TuiEvent::Phase {
             phase: Phase::Planning,
         });
-        let _ = types::emit_tui_event(&TuiEvent::Count {
+        let _ = types::emit_tui_event(&TuiEvent::Count(Counts {
             files_seen: Some(files_seen),
             groups_found: Some(groups_found),
             planned_actions: Some(planned_actions),
             applied_actions: Some(0),
-            hash_progress_done: None,
-            hash_progress_total: None,
-        });
+            ..Counts::default()
+        }));
         let _ = types::emit_tui_event(&TuiEvent::Log {
             message: format!("Planning complete. {planned_actions} action(s) queued."),
         });
@@ -696,14 +695,10 @@ fn plan_by_walking(
         });
     }
     if options.tui_events {
-        let _ = types::emit_tui_event(&TuiEvent::Count {
+        let _ = types::emit_tui_event(&TuiEvent::Count(Counts {
             files_seen: Some(files_seen),
-            groups_found: None,
-            planned_actions: None,
-            applied_actions: None,
-            hash_progress_done: None,
-            hash_progress_total: None,
-        });
+            ..Counts::default()
+        }));
         let _ = types::emit_tui_event(&TuiEvent::Phase {
             phase: Phase::HashingSample,
         });

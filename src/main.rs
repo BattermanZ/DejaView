@@ -15,6 +15,11 @@ mod logger;
 mod protocol;
 mod tui;
 
+/// The helpers the integration tests share, so the unit tests use the same.
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_common;
+
 use config::{load_config, save_config};
 use engine::LinkMode;
 use fsutil::normalize_runtime_dir;
@@ -693,23 +698,11 @@ fn probe_directory_writable(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_common::TempDir;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
-
-    fn unique_temp_dir(prefix: &str) -> PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time before epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "dejaview_main_{prefix}_{}_{}",
-            std::process::id(),
-            ts
-        ))
-    }
 
     #[test]
     fn parses_scan_command() {
@@ -860,8 +853,7 @@ mod tests {
 
     #[test]
     fn a_plan_row_given_twice_is_read_once() {
-        let root = unique_temp_dir("plan_twice");
-        fs::create_dir_all(&root).expect("create root");
+        let root = TempDir::new("plan_twice");
         let plan = root.join("plan.json");
         fs::write(
             &plan,
@@ -876,7 +868,6 @@ mod tests {
                 (PathBuf::from("/dl/b"), PathBuf::from("/m/a")),
             ]
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -942,8 +933,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            let root = unique_temp_dir("probe_symlink");
-            fs::create_dir_all(&root).expect("create root");
+            let root = TempDir::new("probe_symlink");
             let victim = root.join("victim");
             fs::write(&victim, b"keep").expect("write victim");
             let link = root.join(format!(".dejaview_validate_{}.{}", std::process::id(), 1u8));
@@ -954,7 +944,6 @@ mod tests {
             }
 
             assert_eq!(fs::read(&victim).expect("read victim"), b"keep");
-            let _ = fs::remove_dir_all(&root);
         }
     }
 }

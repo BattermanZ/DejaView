@@ -246,6 +246,7 @@ pub fn ensure_roots_disjoint(downloads: &Path, media: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_common::TempDir;
 
     #[test]
     fn exclude_defaults_until_set_and_refuses_a_path() {
@@ -257,23 +258,10 @@ mod tests {
         assert!(check_exclude_patterns(&["media/#recycle".into()]).is_err());
         assert!(check_exclude_patterns(&[String::new()]).is_err());
     }
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn unique_temp_dir(prefix: &str) -> PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time before epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "dejaview_config_{prefix}_{}_{}",
-            std::process::id(),
-            ts
-        ))
-    }
 
     #[test]
     fn load_save_roundtrip() {
-        let root = unique_temp_dir("roundtrip");
+        let root = TempDir::new("roundtrip");
         let path = root.join("config").join("config.json");
         let config = Config {
             downloads: Some(root.join("downloads")),
@@ -294,13 +282,11 @@ mod tests {
         assert_eq!(loaded.min_size, config.min_size);
         assert_eq!(loaded.threads, config.threads);
         assert_eq!(loaded.link_mode, config.link_mode);
-
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     #[test]
     fn load_invalid_json_fails() {
-        let root = unique_temp_dir("invalid_json");
+        let root = TempDir::new("invalid_json");
         let path = root.join("config").join("config.json");
         fs::create_dir_all(path.parent().expect("parent")).expect("create config dir");
         fs::write(&path, b"{not-valid-json").expect("write invalid config");
@@ -315,8 +301,6 @@ mod tests {
             message.contains("delete it"),
             "says how to recover: {message}"
         );
-
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     #[test]
@@ -338,7 +322,7 @@ mod tests {
 
     #[test]
     fn validate_runtime_paths_accepts_existing_directories() {
-        let root = unique_temp_dir("validate_ok");
+        let root = TempDir::new("validate_ok");
         let downloads = root.join("downloads");
         let media = root.join("media");
         fs::create_dir_all(&downloads).expect("create downloads");
@@ -356,12 +340,11 @@ mod tests {
         };
 
         validate_runtime_paths(&config).expect("paths should validate");
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     #[test]
     fn validate_runtime_paths_rejects_missing_directory() {
-        let root = unique_temp_dir("validate_missing");
+        let root = TempDir::new("validate_missing");
         let downloads = root.join("downloads");
         fs::create_dir_all(&downloads).expect("create downloads");
 
@@ -378,7 +361,6 @@ mod tests {
 
         let result = validate_runtime_paths(&config);
         assert!(result.is_err());
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     fn config_for(downloads: &Path, media: &Path) -> Config {
@@ -404,40 +386,37 @@ mod tests {
 
     #[test]
     fn validate_runtime_paths_rejects_media_inside_downloads() {
-        let root = unique_temp_dir("validate_media_nested");
+        let root = TempDir::new("validate_media_nested");
         let downloads = root.join("downloads");
         let media = downloads.join("library");
         fs::create_dir_all(&media).expect("create nested media");
 
         assert_overlap_rejected(&config_for(&downloads, &media), "media path is inside");
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     #[test]
     fn validate_runtime_paths_rejects_downloads_inside_media() {
-        let root = unique_temp_dir("validate_downloads_nested");
+        let root = TempDir::new("validate_downloads_nested");
         let media = root.join("data");
         let downloads = media.join("torrents");
         fs::create_dir_all(&downloads).expect("create nested downloads");
 
         assert_overlap_rejected(&config_for(&downloads, &media), "downloads path is inside");
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     #[test]
     fn validate_runtime_paths_rejects_same_directory() {
-        let root = unique_temp_dir("validate_same_dir");
+        let root = TempDir::new("validate_same_dir");
         let shared = root.join("shared");
         fs::create_dir_all(&shared).expect("create shared dir");
 
         assert_overlap_rejected(&config_for(&shared, &shared), "the same directory");
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     #[cfg(unix)]
     #[test]
     fn validate_runtime_paths_rejects_nesting_hidden_behind_symlink() {
-        let root = unique_temp_dir("validate_symlink_nested");
+        let root = TempDir::new("validate_symlink_nested");
         let downloads = root.join("downloads");
         let real_media = downloads.join("library");
         let media_link = root.join("media");
@@ -445,12 +424,11 @@ mod tests {
         std::os::unix::fs::symlink(&real_media, &media_link).expect("create media symlink");
 
         assert_overlap_rejected(&config_for(&downloads, &media_link), "media path is inside");
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 
     #[test]
     fn validate_runtime_paths_rejects_relative_directories() {
-        let root = unique_temp_dir("validate_relative");
+        let root = TempDir::new("validate_relative");
         let downloads = root.join("downloads");
         let media = root.join("media");
         fs::create_dir_all(&downloads).expect("create downloads");
@@ -469,6 +447,5 @@ mod tests {
 
         let result = validate_runtime_paths(&config);
         assert!(result.is_err());
-        fs::remove_dir_all(&root).expect("cleanup temp dir");
     }
 }

@@ -10,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use crate::config::{Config, load_config, save_config, validate_runtime_paths};
 use crate::engine::LinkMode;
 use crate::fsutil::{expand_home, normalize_runtime_dir};
-use crate::protocol::{Mode, Outcome, Phase, PlannedPair};
+use crate::protocol::{Counts, Mode, Outcome, Phase, PlannedPair};
 
 use super::actions;
 use super::events::{self, Event};
@@ -1168,14 +1168,14 @@ impl App {
                 self.current_path = Some(path);
                 false
             }
-            TuiEvent::Count {
+            TuiEvent::Count(Counts {
                 files_seen,
                 groups_found,
                 planned_actions,
                 applied_actions,
                 hash_progress_done,
                 hash_progress_total,
-            } => {
+            }) => {
                 // Progress goes to the activity line and the counters, never
                 // the Run Log: a line per step would push out what a person
                 // needs to read there, such as why a run failed.
@@ -1579,6 +1579,7 @@ fn display_phase(phase: Phase) -> &'static str {
 #[cfg(test)]
 mod tests {
     use crate::protocol::{EntryStatus, LinkMethod, WarningSummary};
+    use crate::test_common::TempDir;
     use anyhow::anyhow;
 
     use super::super::model::{RunReport, TuiEvent};
@@ -1586,19 +1587,6 @@ mod tests {
     use crossterm::event::KeyCode;
     use std::fs;
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn unique_temp_path(prefix: &str) -> PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time before epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "dejaview_tui_{prefix}_{}_{}",
-            std::process::id(),
-            ts
-        ))
-    }
 
     fn sample_report() -> RunReport {
         RunReport {
@@ -1614,13 +1602,7 @@ mod tests {
             skipped_by_exclude: 0,
             skipped_as_library_file: 0,
             dangling_symlinks: Vec::new(),
-            warnings: WarningSummary {
-                walk_errors: 0,
-                metadata_errors: 0,
-                sample_hash_errors: 0,
-                full_hash_errors: 0,
-                link_errors: 0,
-            },
+            warnings: WarningSummary::default(),
             entries: vec![],
             ..Default::default()
         }
@@ -1647,13 +1629,7 @@ mod tests {
             skipped_by_exclude: 0,
             skipped_as_library_file: 0,
             dangling_symlinks: Vec::new(),
-            warnings: WarningSummary {
-                walk_errors: 0,
-                metadata_errors: 0,
-                sample_hash_errors: 0,
-                full_hash_errors: 0,
-                link_errors: 0,
-            },
+            warnings: WarningSummary::default(),
             entries: vec![
                 LinkReportEntry {
                     source: "a".to_string(),
@@ -1685,7 +1661,8 @@ mod tests {
 
     #[test]
     fn save_report_error_does_not_abort_ui() {
-        let temp_file = unique_temp_path("report_parent_file");
+        let dir = TempDir::new("report_parent_file");
+        let temp_file = dir.join("not-a-folder");
         fs::write(&temp_file, b"not a directory").expect("create temp file");
 
         let config = Config {
@@ -1789,14 +1766,14 @@ mod tests {
             path: Some("/downloads/movie.mkv".to_string()),
         }))
         .expect("send worker");
-        tx.send(Ok(TuiEvent::Count {
+        tx.send(Ok(TuiEvent::Count(Counts {
             files_seen: Some(42),
             groups_found: Some(3),
             planned_actions: Some(2),
             applied_actions: Some(0),
             hash_progress_done: Some(23),
             hash_progress_total: Some(42),
-        }))
+        })))
         .expect("send count");
 
         app.poll_running_job();
@@ -2217,13 +2194,14 @@ mod tests {
         let mut app = App::new(&Config::default(), false);
         let (tx, rx) = mpsc::channel();
         app.running_job = Some(RunningJob::new(JobKind::Scan, rx, mpsc::channel().0));
-        let count = |files_seen, done, applied| TuiEvent::Count {
-            files_seen,
-            groups_found: None,
-            planned_actions: None,
-            applied_actions: applied,
-            hash_progress_done: done,
-            hash_progress_total: done.map(|_| 10),
+        let count = |files_seen, done, applied| {
+            TuiEvent::Count(Counts {
+                files_seen,
+                applied_actions: applied,
+                hash_progress_done: done,
+                hash_progress_total: done.map(|_| 10),
+                ..Counts::default()
+            })
         };
         tx.send(Ok(TuiEvent::Phase {
             phase: Phase::Collecting,
@@ -2612,13 +2590,7 @@ mod tests {
             skipped_by_exclude: 0,
             skipped_as_library_file: 0,
             dangling_symlinks: Vec::new(),
-            warnings: WarningSummary {
-                walk_errors: 0,
-                metadata_errors: 0,
-                sample_hash_errors: 0,
-                full_hash_errors: 0,
-                link_errors: 0,
-            },
+            warnings: WarningSummary::default(),
             entries: vec![
                 LinkReportEntry {
                     source: "/downloads/a.mkv".to_string(),
@@ -2668,13 +2640,7 @@ mod tests {
                 skipped_by_exclude: 0,
                 skipped_as_library_file: 0,
                 dangling_symlinks: Vec::new(),
-                warnings: WarningSummary {
-                    walk_errors: 0,
-                    metadata_errors: 0,
-                    sample_hash_errors: 0,
-                    full_hash_errors: 0,
-                    link_errors: 0,
-                },
+                warnings: WarningSummary::default(),
                 entries: vec![LinkReportEntry {
                     source: "/downloads/a.mkv".to_string(),
                     target: "/media/a.mkv".to_string(),
@@ -2796,7 +2762,7 @@ mod tests {
 
     #[test]
     fn config_editor_persists_valid_paths() {
-        let root = unique_temp_path("config_editor_save");
+        let root = TempDir::new("config_editor_save");
         let downloads = root.join("downloads");
         let media = root.join("media");
         fs::create_dir_all(&downloads).expect("create downloads");
@@ -2869,7 +2835,7 @@ mod tests {
 
     #[test]
     fn config_editor_save_failure_stays_in_overlay() {
-        let root = unique_temp_path("config_editor_save_failure");
+        let root = TempDir::new("config_editor_save_failure");
         let downloads = root.join("downloads");
         let media = root.join("media");
         fs::create_dir_all(&downloads).expect("create downloads");

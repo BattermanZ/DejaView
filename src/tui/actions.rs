@@ -302,24 +302,12 @@ pub fn save_report(report: &RunReport, path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::protocol::{Mode, Phase};
+    use crate::test_common::TempDir;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
-
-    fn unique_temp_dir(prefix: &str) -> PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time before epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "dejaview_tui_actions_{prefix}_{}_{}",
-            std::process::id(),
-            ts
-        ))
-    }
 
     fn sample_report() -> RunReport {
         serde_json::from_str(
@@ -438,8 +426,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            let root = unique_temp_dir("save_report_symlink");
-            fs::create_dir_all(&root).expect("create root");
+            let root = TempDir::new("save_report_symlink");
             let victim = root.join("victim.json");
             let report_path = root.join("report.json");
             fs::write(&victim, b"keep").expect("write victim");
@@ -452,8 +439,6 @@ mod tests {
                     .contains("refusing to overwrite symlink target")
             );
             assert_eq!(fs::read(&victim).expect("read victim"), b"keep");
-
-            fs::remove_dir_all(&root).expect("cleanup temp dir");
         }
     }
 
@@ -476,7 +461,7 @@ mod tests {
 
     #[test]
     fn a_test_hardlink_between_two_folders_works_and_leaves_nothing() {
-        let root = unique_temp_dir("link_check");
+        let root = TempDir::new("link_check");
         let downloads = root.join("downloads");
         let media = root.join("media");
         fs::create_dir_all(&downloads).expect("downloads");
@@ -494,12 +479,11 @@ mod tests {
             files_under(&downloads).is_empty(),
             "the test link is removed"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn no_test_hardlink_is_made_when_the_library_is_reached_through_a_mount() {
-        let root = unique_temp_dir("link_check_mount");
+        let root = TempDir::new("link_check_mount");
         // On the host the library sits inside the data folder; downloads is
         // the data folder seen through a bind mount.
         let data = root.join("data");
@@ -520,7 +504,6 @@ mod tests {
         };
         if !mount(&data, &downloads) {
             eprintln!("skipped: bind mounts need root");
-            let _ = fs::remove_dir_all(&root);
             return;
         }
         let mounted_media = mount(&data.join("media"), &media);
@@ -531,7 +514,6 @@ mod tests {
         for target in [&media, &downloads] {
             let _ = std::process::Command::new("umount").arg(target).status();
         }
-        let _ = fs::remove_dir_all(&root);
         let Some((check, lines)) = result else {
             eprintln!("skipped: the second bind mount failed");
             return;

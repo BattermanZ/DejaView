@@ -1,20 +1,9 @@
+mod common;
+use common::TempDir;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time before epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "dejaview_it_{prefix}_{}_{}",
-        std::process::id(),
-        ts
-    ))
-}
 
 fn run_cmd(root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_dejaview"))
@@ -55,7 +44,7 @@ fn set_link_mode(root: &Path, mode: &str) {
 
 #[test]
 fn config_and_cache_commands_work_end_to_end() {
-    let root = unique_temp_dir("config_cache");
+    let root = TempDir::new("config_cache");
     let downloads = root.join("downloads");
     let media = root.join("media");
     fs::create_dir_all(&downloads).expect("create downloads");
@@ -111,13 +100,11 @@ fn config_and_cache_commands_work_end_to_end() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn scan_fails_with_actionable_message_when_paths_missing() {
-    let root = unique_temp_dir("missing_paths");
+    let root = TempDir::new("missing_paths");
     let missing_downloads = root.join("downloads_missing");
     let media = root.join("media");
     fs::create_dir_all(&media).expect("create media");
@@ -143,13 +130,11 @@ fn scan_fails_with_actionable_message_when_paths_missing() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("downloads path does not exist"));
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn link_command_prefers_hardlink_and_writes_report() {
-    let root = unique_temp_dir("link_symlink");
+    let root = TempDir::new("link_symlink");
     let downloads = root.join("downloads");
     let media = root.join("media");
     fs::create_dir_all(&downloads).expect("create downloads");
@@ -188,13 +173,11 @@ fn link_command_prefers_hardlink_and_writes_report() {
     assert_eq!(src_meta.ino(), tgt_meta.ino());
     assert_eq!(src_meta.dev(), tgt_meta.dev());
     assert!(report.exists());
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn link_command_honors_symlink_only_mode() {
-    let root = unique_temp_dir("link_symlink_only");
+    let root = TempDir::new("link_symlink_only");
     let downloads = root.join("downloads");
     let media = root.join("media");
     fs::create_dir_all(&downloads).expect("create downloads");
@@ -231,13 +214,11 @@ fn link_command_honors_symlink_only_mode() {
     let stdout_json: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("parse link stdout json");
     assert_eq!(stdout_json["entries"][0]["method"], "symlink");
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn cache_audit_and_cleanup_temp_commands_work() {
-    let root = unique_temp_dir("cache_temp_cleanup");
+    let root = TempDir::new("cache_temp_cleanup");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let nested = downloads.join("nested");
@@ -285,13 +266,11 @@ fn cache_audit_and_cleanup_temp_commands_work() {
     assert!(stdout.contains("Removed temp artifacts: 3"));
     assert!(!downloads.join(".dejaview_hardlink.tmp.1").exists());
     assert!(!nested.join(".dejaview_link.tmp.2").exists());
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn scan_json_writes_machine_readable_stdout_and_report() {
-    let root = unique_temp_dir("scan_json_report");
+    let root = TempDir::new("scan_json_report");
     let downloads = root.join("downloads");
     let media = root.join("media");
     fs::create_dir_all(&downloads).expect("create downloads");
@@ -348,13 +327,11 @@ fn scan_json_writes_machine_readable_stdout_and_report() {
             .expect("parse report json");
     assert_eq!(report_json["mode"], "scan");
     assert_eq!(report_json["planned_actions"], 1);
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn link_json_reports_applied_actions() {
-    let root = unique_temp_dir("link_json");
+    let root = TempDir::new("link_json");
     let downloads = root.join("downloads");
     let media = root.join("media");
     fs::create_dir_all(&downloads).expect("create downloads");
@@ -397,13 +374,11 @@ fn link_json_reports_applied_actions() {
         stdout_json["entries"][0]["method"] == "hardlink"
             || stdout_json["entries"][0]["method"] == "symlink"
     );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn link_tui_events_stdout_stays_machine_parseable() {
-    let root = unique_temp_dir("link_tui_events");
+    let root = TempDir::new("link_tui_events");
     let downloads = root.join("downloads");
     let media = root.join("media");
     fs::create_dir_all(&downloads).expect("create downloads");
@@ -446,13 +421,11 @@ fn link_tui_events_stdout_stays_machine_parseable() {
         }
     }
     assert!(saw_done, "expected final done event in stdout:\n{stdout}");
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn config_validate_reports_success_for_valid_paths() {
-    let root = unique_temp_dir("config_validate");
+    let root = TempDir::new("config_validate");
     let downloads = root.join("downloads");
     let media = root.join("media");
     fs::create_dir_all(&downloads).expect("create downloads");
@@ -481,13 +454,11 @@ fn config_validate_reports_success_for_valid_paths() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("Configuration is valid"));
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn link_confirm_conflicts_with_json_mode() {
-    let root = unique_temp_dir("confirm_json_conflict");
+    let root = TempDir::new("confirm_json_conflict");
     let downloads = root.join("downloads");
     let media = root.join("media");
     fs::create_dir_all(&downloads).expect("create downloads");
@@ -514,13 +485,11 @@ fn link_confirm_conflicts_with_json_mode() {
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("--confirm cannot be combined with --json")
     );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn nested_media_root_is_rejected_and_library_is_untouched() {
-    let root = unique_temp_dir("nested_roots");
+    let root = TempDir::new("nested_roots");
     let downloads = root.join("downloads");
     let media = downloads.join("media");
     fs::create_dir_all(&media).expect("create nested media");
@@ -555,8 +524,6 @@ fn nested_media_root_is_rejected_and_library_is_untouched() {
         library_inode,
         "library file must not be relinked"
     );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 fn write_seeded(path: &Path, size: usize, seed: u8) {
@@ -601,7 +568,7 @@ fn paths_read_by(root: &Path, args: &[&str]) -> Vec<String> {
 
 #[test]
 fn scans_skip_hardlinked_files_and_reuse_cache_for_every_path() {
-    let root = unique_temp_dir("hash_reads");
+    let root = TempDir::new("hash_reads");
     let downloads = root.join("downloads");
     let media = root.join("media");
     // A real duplicate: separate copies in downloads and media.
@@ -658,13 +625,11 @@ fn scans_skip_hardlinked_files_and_reuse_cache_for_every_path() {
         after_link.is_empty(),
         "linked pairs are one physical file and must not be reread: {after_link:?}"
     );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn linking_one_source_hashes_only_its_size_group() {
-    let root = unique_temp_dir("link_one_reads");
+    let root = TempDir::new("link_one_reads");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_seeded(&media.join("a.mkv"), 300_000, 1);
@@ -710,13 +675,11 @@ fn linking_one_source_hashes_only_its_size_group() {
         fs::metadata(media.join("b.mkv")).expect("meta").ino(),
         "an unselected source is left alone"
     );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn broken_config_file_error_names_the_file_and_the_fix() {
-    let root = unique_temp_dir("broken_config");
+    let root = TempDir::new("broken_config");
     let config_path = root.join("xdg").join("dejaview").join("config.json");
     fs::create_dir_all(config_path.parent().expect("config dir")).expect("create config dir");
     fs::write(&config_path, b"{\"downloads\": \"/srv\",, }").expect("write broken config");
@@ -738,8 +701,6 @@ fn broken_config_file_error_names_the_file_and_the_fix() {
         b"{\"downloads\": \"/srv\",, }",
         "a broken config is left for the user to fix"
     );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 /// Config with downloads and media set and min_age 0, leaving min_size at its
@@ -762,7 +723,7 @@ fn configure_default_floor(root: &Path, downloads: &Path, media: &Path) {
 
 #[test]
 fn files_under_one_mib_are_left_alone_by_default() {
-    let root = unique_temp_dir("min_size_default");
+    let root = TempDir::new("min_size_default");
     let downloads = root.join("downloads");
     let media = root.join("media");
     // A subtitle-sized pair below the floor, and a video-sized pair above it.
@@ -800,8 +761,6 @@ fn files_under_one_mib_are_left_alone_by_default() {
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse link json");
     assert_eq!(report["applied_actions"], 1, "the subtitle is linked now");
     assert_eq!(report["skipped_by_min_size"], 0);
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 /// A bind mount that the test removes again, even when an assertion fails.
@@ -830,7 +789,7 @@ impl Drop for BindMount {
 
 #[test]
 fn library_bind_mounted_inside_downloads_is_refused() {
-    let root = unique_temp_dir("bind_mount");
+    let root = TempDir::new("bind_mount");
     // On the host, the library sits inside the data folder. A container sees
     // the data folder as downloads and the library as media.
     let data = root.join("data");
@@ -844,7 +803,6 @@ fn library_bind_mounted_inside_downloads_is_refused() {
     fs::create_dir_all(&media).expect("create media mount point");
     let Some(_downloads_mount) = BindMount::new(&data, &downloads) else {
         eprintln!("skipped: bind mounts need root");
-        let _ = fs::remove_dir_all(&root);
         return;
     };
     let Some(_media_mount) = BindMount::new(&data.join("media"), &media) else {
@@ -890,7 +848,6 @@ fn library_bind_mounted_inside_downloads_is_refused() {
 
     drop(_media_mount);
     drop(_downloads_mount);
-    let _ = fs::remove_dir_all(&root);
 }
 
 fn configure_small_files(root: &Path, downloads: &Path, media: &Path) {
@@ -911,7 +868,7 @@ fn configure_small_files(root: &Path, downloads: &Path, media: &Path) {
 
 #[test]
 fn link_summary_says_how_many_downloads_became_symlinks() {
-    let root = unique_temp_dir("symlink_summary");
+    let root = TempDir::new("symlink_summary");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_seeded(&downloads.join("a.mkv"), 5000, 1);
@@ -931,12 +888,11 @@ fn link_summary_says_how_many_downloads_became_symlinks() {
         stdout.contains("2 download(s) became symlinks"),
         "stdout={stdout}"
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn scans_list_symlinks_into_the_library_that_no_longer_resolve() {
-    let root = unique_temp_dir("dangling_symlinks");
+    let root = TempDir::new("dangling_symlinks");
     let downloads = root.join("downloads");
     let media = root.join("media");
     fs::create_dir_all(downloads.join("Show.S01")).expect("create downloads");
@@ -973,12 +929,11 @@ fn scans_list_symlinks_into_the_library_that_no_longer_resolve() {
     let out = run_cmd(&root, &["scan", "--no-progress"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("no longer resolve"), "stderr={stderr}");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn config_validate_tries_a_real_hardlink() {
-    let root = unique_temp_dir("validate_hardlink");
+    let root = TempDir::new("validate_hardlink");
     let downloads = root.join("downloads");
     let media = root.join("media");
     fs::create_dir_all(&downloads).expect("create downloads");
@@ -1020,12 +975,11 @@ fn config_validate_tries_a_real_hardlink() {
             "stdout={stdout}\nstderr={stderr}"
         );
     }
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_second_run_exits_3_while_another_holds_the_lock() {
-    let root = unique_temp_dir("run_lock");
+    let root = TempDir::new("run_lock");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_seeded(&downloads.join("a.mkv"), 5000, 1);
@@ -1073,7 +1027,6 @@ fn a_second_run_exits_3_while_another_holds_the_lock() {
         "stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 fn run_cmd_env(root: &Path, args: &[&str], env: &[(&str, &Path)]) -> std::process::Output {
@@ -1092,8 +1045,7 @@ fn run_cmd_env(root: &Path, args: &[&str], env: &[(&str, &Path)]) -> std::proces
 
 #[test]
 fn an_unwritable_log_location_warns_and_the_command_still_runs() {
-    let root = unique_temp_dir("unwritable_log");
-    fs::create_dir_all(&root).expect("create root");
+    let root = TempDir::new("unwritable_log");
     // A state folder under a regular file cannot be created, even by root.
     let blocker = root.join("not-a-dir");
     fs::write(&blocker, b"file").expect("write blocker");
@@ -1107,12 +1059,11 @@ fn an_unwritable_log_location_warns_and_the_command_still_runs() {
         "the warning names the log path: {stderr}"
     );
     assert!(stderr.contains("DEJAVIEW_LOG"), "and the way out: {stderr}");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn dejaview_config_and_dejaview_log_choose_the_files() {
-    let root = unique_temp_dir("env_paths");
+    let root = TempDir::new("env_paths");
     let downloads = root.join("downloads");
     fs::create_dir_all(&downloads).expect("create downloads");
     let config = root.join("elsewhere").join("dejaview.json");
@@ -1158,12 +1109,11 @@ fn dejaview_config_and_dejaview_log_choose_the_files() {
         String::from_utf8_lossy(&out.stderr).contains("run started"),
         "DEJAVIEW_LOG=- logs to stderr"
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn link_with_a_plan_links_only_the_reviewed_pairs() {
-    let root = unique_temp_dir("plan_file");
+    let root = TempDir::new("plan_file");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_seeded(&downloads.join("reviewed.mkv"), 5000, 1);
@@ -1218,7 +1168,6 @@ fn link_with_a_plan_links_only_the_reviewed_pairs() {
         "an empty plan links nothing, not everything"
     );
     assert_ne!(ino(downloads.join("new.mkv")), ino(media.join("new.mkv")));
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -1226,7 +1175,7 @@ fn a_signal_stops_a_scan_and_keeps_the_hashes_it_finished() {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
 
-    let root = unique_temp_dir("signal");
+    let root = TempDir::new("signal");
     let downloads = root.join("downloads");
     let media = root.join("media");
     // A small pair is hashed whole by its quick hash, before the full pass.
@@ -1279,8 +1228,6 @@ fn a_signal_stops_a_scan_and_keeps_the_hashes_it_finished() {
         cache.get("downloads/small.mkv").is_some() && cache.get("media/small.mkv").is_some(),
         "the hashes finished before the signal are kept: {cache}"
     );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 /// The events of a `--tui-events` run, which must succeed.
@@ -1313,7 +1260,7 @@ fn logged(events: &[serde_json::Value], text: &str) -> bool {
 
 #[test]
 fn reviewed_rows_the_cache_vouches_for_are_linked_without_a_walk() {
-    let root = unique_temp_dir("plan_from_cache");
+    let root = TempDir::new("plan_from_cache");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_seeded(&downloads.join("Movie/movie.mkv"), 5000, 1);
@@ -1356,13 +1303,11 @@ fn reviewed_rows_the_cache_vouches_for_are_linked_without_a_walk() {
         "the log says why the cache could not vouch: {link:?}"
     );
     assert_eq!(ino(episode), ino(media.join("TV/ep.mkv")));
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_walk_paces_its_progress_events() {
-    let root = unique_temp_dir("paced_events");
+    let root = TempDir::new("paced_events");
     let downloads = root.join("downloads");
     let media = root.join("media");
     for folder in 0..20 {
@@ -1395,13 +1340,11 @@ fn a_walk_paces_its_progress_events() {
         .find_map(|e| e["files_seen"].as_u64())
         .expect("a count event from the walk");
     assert_eq!(last_count, 2000, "the final count is never paced away");
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_reviewed_download_hardlinked_into_the_library_since_the_scan_is_left_alone() {
-    let root = unique_temp_dir("plan_hardlinked_since");
+    let root = TempDir::new("plan_hardlinked_since");
     let downloads = root.join("downloads");
     let media = root.join("media");
     let download = downloads.join("movie.mkv");
@@ -1438,8 +1381,6 @@ fn a_reviewed_download_hardlinked_into_the_library_since_the_scan_is_left_alone(
         ino(media.join("B/movie.mkv")),
         "the hardlink Sonarr made is kept"
     );
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -1447,7 +1388,7 @@ fn a_run_under_nohup_keeps_running_when_the_terminal_hangs_up() {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
 
-    let root = unique_temp_dir("nohup");
+    let root = TempDir::new("nohup");
     let downloads = root.join("downloads");
     let media = root.join("media");
     fs::create_dir_all(&downloads).expect("create downloads");
@@ -1490,8 +1431,6 @@ fn a_run_under_nohup_keeps_running_when_the_terminal_hangs_up() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(events.last().expect("events")["type"], "done");
-
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 /// `dir` bind-mounted read-only onto itself, so nothing in it can be
@@ -1522,10 +1461,9 @@ fn tree_with_one_pair_that_cannot_link(root: &Path) -> Option<(PathBuf, BindMoun
 
 #[test]
 fn a_link_run_with_a_failed_pair_exits_2_and_says_why() {
-    let root = unique_temp_dir("exit_2");
+    let root = TempDir::new("exit_2");
     let Some((_downloads, mount)) = tree_with_one_pair_that_cannot_link(&root) else {
         eprintln!("skipped: this process may not mount");
-        let _ = fs::remove_dir_all(&root);
         return;
     };
 
@@ -1548,15 +1486,13 @@ fn a_link_run_with_a_failed_pair_exits_2_and_says_why() {
     );
     assert_eq!(failed["method"], serde_json::Value::Null);
     assert_eq!(failed["fallback_reason"], serde_json::Value::Null);
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_strict_json_run_prints_its_report_before_the_error() {
-    let root = unique_temp_dir("strict_json");
+    let root = TempDir::new("strict_json");
     let Some((_downloads, mount)) = tree_with_one_pair_that_cannot_link(&root) else {
         eprintln!("skipped: this process may not mount");
-        let _ = fs::remove_dir_all(&root);
         return;
     };
 
@@ -1569,7 +1505,6 @@ fn a_strict_json_run_prints_its_report_before_the_error() {
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse report");
     assert_eq!(report["outcome"], "failed");
     assert_eq!(report["applied_actions"], 1);
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 /// The events of a `--tui-events` run, whatever its exit code.
@@ -1603,8 +1538,7 @@ fn final_event_of(events: &[serde_json::Value]) -> &serde_json::Value {
 
 #[test]
 fn a_config_error_ends_the_event_stream_with_one_error() {
-    let root = unique_temp_dir("stream_config_error");
-    fs::create_dir_all(&root).expect("create root");
+    let root = TempDir::new("stream_config_error");
 
     let out = run_cmd(&root, &["scan", "--tui-events", "--no-progress"]);
 
@@ -1618,7 +1552,6 @@ fn a_config_error_ends_the_event_stream_with_one_error() {
             .is_some_and(|message| message.contains("set-downloads")),
         "{last}"
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 /// Run as a user that cannot read a file of mode 000: this one, or `nobody`
@@ -1662,7 +1595,7 @@ fn walkdir_all(root: &Path) -> Vec<PathBuf> {
 #[test]
 fn a_strict_hash_failure_ends_the_event_stream_with_one_error() {
     use std::os::unix::fs::PermissionsExt;
-    let root = unique_temp_dir("stream_hash_error");
+    let root = TempDir::new("stream_hash_error");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_seeded(&downloads.join("unreadable.mkv"), 4000, 1);
@@ -1697,15 +1630,13 @@ fn a_strict_hash_failure_ends_the_event_stream_with_one_error() {
         fs::Permissions::from_mode(0o644),
     )
     .expect("make readable");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_strict_link_failure_ends_the_event_stream_with_its_report() {
-    let root = unique_temp_dir("stream_link_error");
+    let root = TempDir::new("stream_link_error");
     let Some((_downloads, mount)) = tree_with_one_pair_that_cannot_link(&root) else {
         eprintln!("skipped: this process may not mount");
-        let _ = fs::remove_dir_all(&root);
         return;
     };
 
@@ -1726,7 +1657,6 @@ fn a_strict_link_failure_ends_the_event_stream_with_its_report() {
         .map(|entry| entry["status"].as_str().unwrap_or("").to_string())
         .collect();
     assert_eq!(statuses, ["applied", "failed"]);
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
@@ -1734,7 +1664,7 @@ fn a_cancel_ends_the_event_stream_with_one_cancelled() {
     use std::io::{BufRead, BufReader, Write};
     use std::process::Stdio;
 
-    let root = unique_temp_dir("stream_cancel");
+    let root = TempDir::new("stream_cancel");
     let downloads = root.join("downloads");
     let media = root.join("media");
     fs::create_dir_all(&downloads).expect("create downloads");
@@ -1771,12 +1701,11 @@ fn a_cancel_ends_the_event_stream_with_one_cancelled() {
 
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(final_event_of(&events)["type"], "cancelled");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_scan_names_each_folder_once_and_each_path_below_it() {
-    let root = unique_temp_dir("human_scan");
+    let root = TempDir::new("human_scan");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_seeded(&downloads.join("Show.S01").join("e01.mkv"), 5000, 1);
@@ -1795,12 +1724,11 @@ fn a_scan_names_each_folder_once_and_each_path_below_it() {
     assert!(stdout.contains("Show.S01/e01.mkv"), "{stdout}");
     assert!(stdout.contains("TV/Show/e01.mkv"), "{stdout}");
     assert!(stdout.contains("Found 1 duplicate(s)"), "{stdout}");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_scan_that_finds_nothing_says_so_without_a_table() {
-    let root = unique_temp_dir("human_nothing");
+    let root = TempDir::new("human_nothing");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_seeded(&downloads.join("a.mkv"), 5000, 1);
@@ -1812,12 +1740,11 @@ fn a_scan_that_finds_nothing_says_so_without_a_table() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("No duplicates found."), "{stdout}");
     assert!(!stdout.contains("Library file"), "no empty table: {stdout}");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_link_run_ends_with_what_it_linked_and_freed() {
-    let root = unique_temp_dir("human_verdict");
+    let root = TempDir::new("human_verdict");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_seeded(&downloads.join("a.mkv"), 2048, 1);
@@ -1833,12 +1760,11 @@ fn a_link_run_ends_with_what_it_linked_and_freed() {
         Some("✔ Linked 1 of 1, 2.0 KiB freed"),
         "{stdout}"
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_quiet_run_prints_only_what_it_linked() {
-    let root = unique_temp_dir("quiet");
+    let root = TempDir::new("quiet");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_seeded(&downloads.join("a.mkv"), 2048, 1);
@@ -1858,15 +1784,13 @@ fn a_quiet_run_prints_only_what_it_linked() {
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout), "");
     assert_eq!(String::from_utf8_lossy(&out.stderr), "");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_quiet_run_with_a_failed_pair_says_so() {
-    let root = unique_temp_dir("quiet_failed");
+    let root = TempDir::new("quiet_failed");
     let Some((downloads, mount)) = tree_with_one_pair_that_cannot_link(&root) else {
         eprintln!("skipped: this process may not mount");
-        let _ = fs::remove_dir_all(&root);
         return;
     };
 
@@ -1884,26 +1808,22 @@ fn a_quiet_run_with_a_failed_pair_says_so() {
         )
     );
     assert!(String::from_utf8_lossy(&out.stderr).contains("Read-only file system"));
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn quiet_and_json_cannot_be_combined() {
-    let root = unique_temp_dir("quiet_json");
-    fs::create_dir_all(&root).expect("create root");
+    let root = TempDir::new("quiet_json");
     let out = run_cmd(&root, &["link", "--quiet", "--json"]);
     assert_eq!(
         out.status.code(),
         Some(1),
         "a command line that cannot run exits 1; 2 means a run finished with failures"
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn setting_a_folder_that_does_not_exist_names_it() {
-    let root = unique_temp_dir("set_missing");
-    fs::create_dir_all(&root).expect("create root");
+    let root = TempDir::new("set_missing");
     let missing = root.join("not-mounted");
 
     let out = run_cmd(
@@ -1917,12 +1837,11 @@ fn setting_a_folder_that_does_not_exist_names_it() {
         stderr.contains(&missing.display().to_string()),
         "the error names the path: {stderr}"
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn the_full_pass_reports_its_progress_in_bytes() {
-    let root = unique_temp_dir("hash_bytes");
+    let root = TempDir::new("hash_bytes");
     let downloads = root.join("downloads");
     let media = root.join("media");
     // Bigger than the quick hash's sample, so the pair is read in full.
@@ -1943,12 +1862,11 @@ fn the_full_pass_reports_its_progress_in_bytes() {
     let last = bytes.last().expect("hash_bytes events");
     assert_eq!(last["total"], 2 * (3 << 20), "{events:?}");
     assert_eq!(last["done"], last["total"], "the pass ends complete");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_leftover_temp_symlink_is_listed_and_removed_without_touching_its_target() {
-    let root = unique_temp_dir("temp_symlink");
+    let root = TempDir::new("temp_symlink");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_seeded(&media.join("movie.mkv"), 4096, 3);
@@ -1978,7 +1896,6 @@ fn a_leftover_temp_symlink_is_listed_and_removed_without_touching_its_target() {
         4096,
         "the library file it pointed at is untouched"
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 /// Downloads `a\xff.mkv` and `a\xfe.mkv`, whose names differ only in a byte
@@ -2000,7 +1917,7 @@ fn tree_with_names_that_are_not_utf8(root: &Path) -> (PathBuf, PathBuf, PathBuf)
 
 #[test]
 fn names_that_differ_only_in_bytes_that_are_not_utf8_stay_apart() {
-    let root = unique_temp_dir("not_utf8");
+    let root = TempDir::new("not_utf8");
     let (_media, _ff, _fe) = tree_with_names_that_are_not_utf8(&root);
 
     let out = run_cmd(&root, &["scan", "--json", "--no-progress"]);
@@ -2024,12 +1941,11 @@ fn names_that_differ_only_in_bytes_that_are_not_utf8_stay_apart() {
         4,
         "{cache}"
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_plan_row_whose_path_is_not_utf8_links_that_file() {
-    let root = unique_temp_dir("not_utf8_plan");
+    let root = TempDir::new("not_utf8_plan");
     let (media, ff, fe) = tree_with_names_that_are_not_utf8(&root);
     let out = run_cmd(&root, &["scan", "--json", "--no-progress"]);
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse report");
@@ -2075,25 +1991,22 @@ fn a_plan_row_whose_path_is_not_utf8_links_that_file() {
         "the reviewed row is linked"
     );
     assert_ne!(inode(&ff), inode(&media.join("x.mkv")), "and nothing else");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_usage_error_exits_1_and_help_exits_0() {
-    let root = unique_temp_dir("usage");
-    fs::create_dir_all(&root).expect("create root");
+    let root = TempDir::new("usage");
     let out = run_cmd(&root, &["link", "--bogus"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("--bogus"));
     let out = run_cmd(&root, &["--help"]);
     assert_eq!(out.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&out.stdout).contains("Usage"));
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_broken_config_file_ends_the_event_stream_with_one_error() {
-    let root = unique_temp_dir("stream_broken_config");
+    let root = TempDir::new("stream_broken_config");
     let config = root.join("xdg").join("dejaview").join("config.json");
     fs::create_dir_all(config.parent().expect("config folder")).expect("create config folder");
     fs::write(&config, "{").expect("write broken config");
@@ -2110,13 +2023,12 @@ fn a_broken_config_file_ends_the_event_stream_with_one_error() {
             .is_some_and(|m| m.contains("not valid JSON")),
         "{last}"
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_strict_hash_failure_still_writes_and_prints_its_report() {
     use std::os::unix::fs::PermissionsExt;
-    let root = unique_temp_dir("strict_hash_report");
+    let root = TempDir::new("strict_hash_report");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_seeded(&downloads.join("unreadable.mkv"), 4000, 1);
@@ -2148,12 +2060,11 @@ fn a_strict_hash_failure_still_writes_and_prints_its_report() {
     let written: serde_json::Value =
         serde_json::from_slice(&fs::read(&report).expect("--report is written")).expect("parse");
     assert_eq!(written["outcome"], "failed");
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
 #[test]
 fn a_quiet_run_says_how_many_downloads_became_symlinks() {
-    let root = unique_temp_dir("quiet_symlinks");
+    let root = TempDir::new("quiet_symlinks");
     let downloads = root.join("downloads");
     let media = root.join("media");
     write_seeded(&downloads.join("a.mkv"), 2048, 1);
@@ -2170,5 +2081,4 @@ fn a_quiet_run_says_how_many_downloads_became_symlinks() {
             downloads.join(".dejaview_link_report.json").display()
         )
     );
-    fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

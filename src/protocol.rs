@@ -340,6 +340,18 @@ pub struct RunReport {
     pub entries: Vec<LinkReportEntry>,
 }
 
+/// The counters a `count` event carries. A run sends the ones that moved;
+/// each `None` leaves the dashboard's value as it was.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Counts {
+    pub files_seen: Option<usize>,
+    pub groups_found: Option<usize>,
+    pub planned_actions: Option<usize>,
+    pub applied_actions: Option<usize>,
+    pub hash_progress_done: Option<usize>,
+    pub hash_progress_total: Option<usize>,
+}
+
 /// The version of the `--tui-events` stream. The dashboard refuses a child
 /// that speaks another, such as a binary an upgrade replaced on disk while
 /// the dashboard was open. Raise it whenever an event changes shape, a new
@@ -369,14 +381,7 @@ pub enum TuiEvent {
         phase: Option<Phase>,
         path: String,
     },
-    Count {
-        files_seen: Option<usize>,
-        groups_found: Option<usize>,
-        planned_actions: Option<usize>,
-        applied_actions: Option<usize>,
-        hash_progress_done: Option<usize>,
-        hash_progress_total: Option<usize>,
-    },
+    Count(Counts),
     PlannedEntries {
         entries: Vec<LinkReportEntry>,
     },
@@ -506,10 +511,8 @@ mod tests {
             dangling_symlinks: vec!["/srv/downloads/Gone.mkv".to_string()],
             warnings: WarningSummary {
                 walk_errors: 1,
-                metadata_errors: 0,
-                sample_hash_errors: 0,
-                full_hash_errors: 0,
                 link_errors: 1,
+                ..Default::default()
             },
             entries: vec![planned, applied, symlinked, already, skipped, failed],
         }
@@ -559,14 +562,10 @@ mod tests {
                 phase: Some(Phase::Collecting),
                 path: "/srv/downloads/Planned.mkv".to_string(),
             },
-            TuiEvent::Count {
+            TuiEvent::Count(Counts {
                 files_seen: Some(120),
-                groups_found: None,
-                planned_actions: None,
-                applied_actions: None,
-                hash_progress_done: None,
-                hash_progress_total: None,
-            },
+                ..Counts::default()
+            }),
             TuiEvent::Phase {
                 phase: Phase::HashingSample,
             },

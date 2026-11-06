@@ -15,7 +15,7 @@ use super::cancel::{CancelToken, FirstError};
 use super::types::{FileInfo, FileSnapshot, RunMetrics};
 use super::types::{emit_tui_event, progress_due};
 use crate::logger;
-use crate::protocol::{Phase, TuiEvent, WarningSummary};
+use crate::protocol::{Counts, Phase, TuiEvent, WarningSummary};
 
 /// Names every walk leaves out, with everything under them: a folder a NAS
 /// keeps for itself is never read, so a recycle-bin copy never becomes a link
@@ -473,14 +473,10 @@ impl<'a> Walk<'a> {
                     phase: Some(Phase::Collecting),
                     path: path.display().to_string(),
                 });
-                let _ = emit_tui_event(&TuiEvent::Count {
+                let _ = emit_tui_event(&TuiEvent::Count(Counts {
                     files_seen: Some(seen),
-                    groups_found: None,
-                    planned_actions: None,
-                    applied_actions: None,
-                    hash_progress_done: None,
-                    hash_progress_total: None,
-                });
+                    ..Counts::default()
+                }));
             }
         }
         found.files.push(FileInfo {

@@ -20,7 +20,7 @@ use super::report::build_report_entries;
 use super::types::{Cache, CacheEntry, FileInfo, FileSnapshot, LinkMode};
 use super::types::{emit_tui_event, progress_due};
 use crate::logger;
-use crate::protocol::{Phase, TuiEvent, WarningSummary};
+use crate::protocol::{Counts, Phase, TuiEvent, WarningSummary};
 
 /// Every path a hash opened, so a test can count reads under its own folder.
 #[cfg(test)]
@@ -121,14 +121,11 @@ fn emit_worker_activity(phase: Phase, worker: usize, path: Option<String>, tui_e
 /// Hashing progress for the TUI, paced except at a phase's start and end.
 fn emit_hash_progress(done: usize, total: usize, tui_events: bool) {
     if tui_events && (done == 0 || done == total || progress_due()) {
-        let _ = emit_tui_event(&TuiEvent::Count {
-            files_seen: None,
-            groups_found: None,
-            planned_actions: None,
-            applied_actions: None,
+        let _ = emit_tui_event(&TuiEvent::Count(Counts {
             hash_progress_done: Some(done),
             hash_progress_total: Some(total),
-        });
+            ..Counts::default()
+        }));
     }
 }
 
@@ -669,14 +666,11 @@ pub(super) fn hash_groups_and_update_cache(
                 done,
                 total: total_full_bytes,
             });
-            let _ = emit_tui_event(&TuiEvent::Count {
-                files_seen: None,
-                groups_found: None,
-                planned_actions: None,
-                applied_actions: None,
+            let _ = emit_tui_event(&TuiEvent::Count(Counts {
                 hash_progress_done: Some(full_done.load(Ordering::Relaxed) as usize),
                 hash_progress_total: Some(total_full_files),
-            });
+                ..Counts::default()
+            }));
         }
     };
 

@@ -217,6 +217,29 @@ pub struct ScanRunOptions<'a> {
     pub cancel: CancelToken,
 }
 
+#[cfg(test)]
+impl ScanRunOptions<'_> {
+    /// A run with every option at its default, for a person at a terminal: a
+    /// scan when `dry_run`, else a link. A test sets what it needs with
+    /// `..ScanRunOptions::for_test(dry_run)`.
+    pub(super) fn for_test(dry_run: bool) -> Self {
+        ScanRunOptions {
+            dry_run,
+            strict: false,
+            report_path: None,
+            json_output: false,
+            quiet: false,
+            show_progress: false,
+            require_confirm: false,
+            tui_events: false,
+            link_mode: LinkMode::Best,
+            only_sources: &[],
+            only_pairs: &[],
+            cancel: CancelToken::default(),
+        }
+    }
+}
+
 /// Who reads what a run prints, which decides what it prints. Worked out
 /// once from the options, so no print site combines the flags itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

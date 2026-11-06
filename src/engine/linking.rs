@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::logger;
 use crate::protocol::TuiEvent;
 
-use crate::protocol::{EntryStatus, LinkMethod, LinkReportEntry, Phase, WarningSummary};
+use crate::protocol::{Counts, EntryStatus, LinkMethod, LinkReportEntry, Phase, WarningSummary};
 
 use super::cancel::CancelToken;
 use super::types::emit_tui_event;
@@ -1031,14 +1031,11 @@ pub(super) fn apply_actions(
             ),
         );
         if tui_events {
-            let _ = emit_tui_event(&TuiEvent::Count {
-                files_seen: None,
-                groups_found: None,
+            let _ = emit_tui_event(&TuiEvent::Count(Counts {
                 planned_actions: Some(actions.len()),
                 applied_actions: Some(applied_actions),
-                hash_progress_done: None,
-                hash_progress_total: None,
-            });
+                ..Counts::default()
+            }));
         }
     }
 
