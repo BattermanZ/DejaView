@@ -147,7 +147,7 @@ Add `--strict` to run the dashboard's scans and links in strict mode.
 
 Cancelling a scan stops it almost at once, even partway through a large file, and keeps every hash already finished in the cache, so the next scan picks up where it stopped. Cancelling a link stops before the next file: files already linked stay linked and the rest stay planned. Quitting is blocked while a run is active, so cancel first.
 
-Linking a single row runs a full scan first. With a warm cache that is quick; on a cold cache it takes as long as any scan.
+Linking a single row lists both folders again to re-check that row, but only hashes files of the same size as it.
 
 ## Configuration
 

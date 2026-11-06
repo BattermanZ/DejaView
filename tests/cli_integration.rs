@@ -559,9 +559,15 @@ fn write_seeded(path: &Path, size: usize, seed: u8) {
     fs::write(path, bytes).expect("write seeded file");
 }
 
-/// Paths a scan actually opened for hashing, read from the TUI event stream.
 fn paths_read_by_scan(root: &Path) -> Vec<String> {
-    let out = run_cmd(root, &["scan", "--tui-events", "--no-progress"]);
+    paths_read_by(root, &["scan"])
+}
+
+/// Paths a scan or link run opened for hashing, read from the TUI event stream.
+fn paths_read_by(root: &Path, args: &[&str]) -> Vec<String> {
+    let mut args = args.to_vec();
+    args.extend(["--tui-events", "--no-progress"]);
+    let out = run_cmd(root, &args);
     assert!(
         out.status.success(),
         "stderr={}",
@@ -640,6 +646,58 @@ fn scans_skip_hardlinked_files_and_reuse_cache_for_every_path() {
     assert!(
         after_link.is_empty(),
         "linked pairs are one physical file and must not be reread: {after_link:?}"
+    );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn linking_one_source_hashes_only_its_size_group() {
+    let root = unique_temp_dir("link_one_reads");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&media.join("a.mkv"), 300_000, 1);
+    write_seeded(&downloads.join("a.mkv"), 300_000, 1);
+    write_seeded(&media.join("b.mkv"), 200_000, 2);
+    write_seeded(&downloads.join("b.mkv"), 200_000, 2);
+
+    run_ok(
+        &root,
+        &[
+            "config",
+            "set-downloads",
+            downloads.to_str().expect("downloads str"),
+        ],
+    );
+    run_ok(
+        &root,
+        &["config", "set-media", media.to_str().expect("media str")],
+    );
+    set_min_age_zero(&root);
+
+    let source = downloads.join("a.mkv");
+    let reads = paths_read_by(
+        &root,
+        &[
+            "link",
+            "--only-source",
+            source.to_str().expect("source str"),
+        ],
+    );
+
+    assert!(
+        !reads.iter().any(|p| p.contains("b.mkv")),
+        "an unselected size group must not be read: {reads:?}"
+    );
+    assert_eq!(
+        fs::metadata(&source).expect("meta").ino(),
+        fs::metadata(media.join("a.mkv")).expect("meta").ino(),
+        "the selected source is linked"
+    );
+    assert_ne!(
+        fs::metadata(downloads.join("b.mkv")).expect("meta").ino(),
+        fs::metadata(media.join("b.mkv")).expect("meta").ino(),
+        "an unselected source is left alone"
     );
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");

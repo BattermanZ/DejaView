@@ -134,6 +134,15 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<()> {
 
     let seen_paths: HashSet<String> = files.iter().map(|file| cache_key(&file.path)).collect();
     let mut groups = group_files_by_size(files);
+    if !options.only_sources.is_empty() {
+        // Linking selected rows: only the size groups holding those sources can
+        // produce their actions, so leave every other group unread.
+        groups.retain(|group| {
+            group
+                .iter()
+                .any(|file| file.in_downloads && options.only_sources.contains(&file.path))
+        });
+    }
     let hash_result = hash_groups_and_update_cache(
         &mut groups,
         &mut cache,
