@@ -22,6 +22,15 @@ fn is_regular(entry: &DirEntry) -> bool {
     entry.file_type().is_file() && !entry.path_is_symlink()
 }
 
+/// DejaView writes its cache, reports and temp files under the `.dejaview_`
+/// prefix in the downloads root; they are never candidates.
+fn is_own_file(entry: &DirEntry) -> bool {
+    entry
+        .file_name()
+        .to_str()
+        .is_some_and(|name| name.starts_with(".dejaview_"))
+}
+
 pub(super) fn collect_files(
     root: &Path,
     in_downloads: bool,
@@ -44,7 +53,7 @@ pub(super) fn collect_files(
                 continue;
             }
         };
-        if !is_regular(&entry) {
+        if !is_regular(&entry) || is_own_file(&entry) {
             continue;
         }
         let meta = match entry.metadata() {

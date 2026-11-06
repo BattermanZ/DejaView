@@ -1092,3 +1092,35 @@ fn apply_actions_refuses_to_replace_a_file_inside_the_media_root() {
 
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+#[test]
+fn collect_files_skips_dejaview_own_files() {
+    let root = unique_temp_dir("own_files");
+    write_file(&root.join("movie.mkv"), b"content");
+    write_file(&root.join(".dejaview_cache.json"), b"{}");
+    write_file(&root.join(".dejaview_link_report.json"), b"{}");
+    write_file(&root.join(".dejaview_tui_report.json"), b"{}");
+    write_file(&root.join("sub").join(".dejaview_hardlink.tmp.1.2"), b"content");
+    write_file(&root.join(".dejaview-notes.txt"), b"not ours");
+
+    let mut warnings = RunWarnings::default();
+    let mut metrics = RunMetrics::default();
+    let files = collect_files(
+        &root,
+        true,
+        Duration::from_secs(0),
+        false,
+        false,
+        &mut warnings,
+        &mut metrics,
+    )
+    .expect("collect files");
+    let mut names: Vec<String> = files
+        .iter()
+        .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+
+    assert_eq!(names, vec![".dejaview-notes.txt", "movie.mkv"]);
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
