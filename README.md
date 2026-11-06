@@ -182,7 +182,7 @@ Add `--strict` to run the dashboard's scans and links in strict mode.
 | `j` / `k` or arrows | Move the selection; in Help or the JSON preview, scroll |
 | `PgUp` / `PgDn` | Move the selection a screen at a time, or scroll a screen |
 | `g` / `G` or `Home` / `End` | Go to the first or last row, or the start or end of Help or the JSON preview |
-| `e` | Edit the downloads and media paths |
+| `e` | Edit the downloads and media paths; `~` stands for the home folder |
 | `p` | Show the rows' paths in full, or below their folders |
 | `R` | Save the current report to `.dejaview_tui_report.json` in downloads |
 | `J` | Show the current report as JSON; `J` or `Esc` closes it |

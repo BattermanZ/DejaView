@@ -1895,3 +1895,23 @@ fn quiet_and_json_cannot_be_combined() {
     assert_eq!(out.status.code(), Some(2), "clap's usage error");
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+#[test]
+fn setting_a_folder_that_does_not_exist_names_it() {
+    let root = unique_temp_dir("set_missing");
+    fs::create_dir_all(&root).expect("create root");
+    let missing = root.join("not-mounted");
+
+    let out = run_cmd(
+        &root,
+        &["config", "set-downloads", missing.to_str().expect("path")],
+    );
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&missing.display().to_string()),
+        "the error names the path: {stderr}"
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}

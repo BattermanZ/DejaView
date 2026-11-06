@@ -935,8 +935,6 @@ fn render_scrolling_overlay(
     frame.render_widget(body, area);
 }
 
-const CONFIG_EDITOR_TIP: &str = "Use absolute paths to existing directories. The editor validates before saving to the repo config file.";
-
 fn render_config_overlay(frame: &mut Frame, editor: &ConfigEditor) {
     let screen = frame.area();
     let width = 90u16
@@ -950,7 +948,13 @@ fn render_config_overlay(frame: &mut Frame, editor: &ConfigEditor) {
         .unwrap_or_else(|| "Enter saves on the second field. Esc cancels.".to_string());
     // The status box grows with its text, so a long error is read whole.
     let status_lines = wrap_text(&status, inner_width.saturating_sub(2));
-    let tips = wrap_text(CONFIG_EDITOR_TIP, inner_width);
+    let tip = format!(
+        "Absolute paths to existing folders; ~ is your home folder. Both are checked before they are saved to {}.",
+        crate::config::config_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "the config file".to_string())
+    );
+    let tips = wrap_text(&tip, inner_width);
     let status_height = u16::try_from(status_lines.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2);
@@ -1901,6 +1905,41 @@ mod rescan_tests {
         assert!(
             text.contains("y clear and scan") && text.contains("n cancel"),
             "{text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::row_tests::screen;
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn the_path_editor_names_the_config_file_and_shows_a_long_error_whole() {
+        let mut app = App::new(&crate::config::Config::default(), false);
+        app.handle_key_for_test(KeyCode::Char('e'), KeyModifiers::NONE);
+        let long =
+            "/tmp/claude-0/-home-user/fd53d022-d0e1-4c5b-9a7e-1f2e3d4c5b6a/downloads/library";
+        for c in long.chars() {
+            app.handle_key_for_test(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        app.handle_key_for_test(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_key_for_test(KeyCode::Enter, KeyModifiers::NONE);
+
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("config.json"), "{text}");
+        assert!(!text.contains("repo config file"), "{text}");
+        let error_lines = text
+            .lines()
+            .skip_while(|line| !line.contains("Status"))
+            .take_while(|line| !line.contains('└'))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(error_lines.contains("Downloads: cannot use"), "{text}");
+        assert!(
+            error_lines.contains("library"),
+            "the end of the path: {text}"
         );
     }
 }

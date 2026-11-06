@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::config::{Config, load_config, save_config, validate_runtime_paths};
 use crate::engine::LinkMode;
-use crate::fsutil::normalize_runtime_dir;
+use crate::fsutil::{expand_home, normalize_runtime_dir};
 use crate::protocol::PlannedPair;
 
 use super::actions;
@@ -873,13 +873,13 @@ impl App {
         let config = match self.normalized_config_from_editor(load_fn, &editor) {
             Ok(config) => config,
             Err(err) => {
-                self.set_config_editor_error(err.to_string());
+                self.set_config_editor_error(format!("{err:#}"));
                 return Ok(());
             }
         };
 
         if let Err(err) = save_fn(&config) {
-            self.set_config_editor_error(format!("Failed to save config: {err}"));
+            self.set_config_editor_error(format!("Failed to save config: {err:#}"));
             return Ok(());
         }
 
@@ -897,12 +897,18 @@ impl App {
         L: FnOnce() -> Result<Config>,
     {
         let mut config = load_fn()?;
-        config.downloads = Some(normalize_runtime_dir(std::path::Path::new(
-            editor.downloads.trim(),
-        ))?);
-        config.media = Some(normalize_runtime_dir(std::path::Path::new(
-            editor.media.trim(),
-        ))?);
+        let home = dirs::home_dir();
+        // Each error says which field it is about.
+        let folder = |field: &str, typed: &str| -> Result<PathBuf> {
+            let typed = typed.trim();
+            if typed.is_empty() {
+                return Err(anyhow::anyhow!("{field}: type the folder's path"));
+            }
+            normalize_runtime_dir(&expand_home(typed, home.as_deref()))
+                .map_err(|err| anyhow::anyhow!("{field}: {err:#}"))
+        };
+        config.downloads = Some(folder("Downloads", &editor.downloads)?);
+        config.media = Some(folder("Media", &editor.media)?);
         validate_runtime_paths(&config)?;
         Ok(config)
     }
@@ -2539,7 +2545,39 @@ mod tests {
             .expect("save flow should not hard fail");
 
         let editor = app.config_editor().expect("editor should stay open");
-        assert!(editor.error.is_some());
+        let error = editor.error.as_deref().expect("an error");
+        assert!(
+            error.starts_with("Downloads: cannot use /does/not/exist"),
+            "names the field and the path: {error}"
+        );
+    }
+
+    #[test]
+    fn the_path_editor_reads_a_leading_tilde_as_home() {
+        let Some(home) = dirs::home_dir().filter(|home| home.is_dir()) else {
+            return;
+        };
+        let mut app = App::new(&Config::default(), false);
+        app.overlay = Overlay::ConfigEditor(ConfigEditor {
+            downloads: "~".to_string(),
+            media: "/nonexistent/media".to_string(),
+            active_field: ConfigField::Media,
+            error: None,
+        });
+
+        app.save_config_from_editor_with(|| Ok(Config::default()), |_| Ok(()))
+            .expect("save flow should not hard fail");
+
+        // The home folder resolved; the media path is what fails.
+        let error = app
+            .config_editor()
+            .and_then(|editor| editor.error.clone())
+            .expect("an error");
+        assert!(
+            error.starts_with("Media:"),
+            "{error} (home {})",
+            home.display()
+        );
     }
 
     #[test]

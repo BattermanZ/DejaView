@@ -44,6 +44,7 @@
 
 ### Fixed
 
+- `config set-downloads` and `config set-media` name the path they could not use, where they said only "No such file or directory". The dashboard's path editor reads `~` as the home folder, says which field an error is about, shows a long error whole, and names the config file it saves to. [#5]
 - In the dashboard, `x` and `X` ask before clearing the cache, which means reading every file again. Before, `x`, next to `c` and in no list of keys, cleared it at once. [#5]
 - In the dashboard, the selected row carries a marker and reverse video, `PgUp`, `PgDn`, `g`, `G`, `Home` and `End` move through the rows, and Help and the JSON preview scroll with the same keys, so a report of hundreds of entries can be read to its end; `j` no longer closes the preview. After `l` links a row, the selection moves to the next planned row instead of back to the first. [#5]
 - The dashboard fits an 80x24 terminal, and works down to 60x20: below 30 rows the header gives up the wordmark for one line of counts, below 100 columns the Workspace sidebar gives way and below 70 the Inspector, the dialogs are as tall as their text, the metric titles are never cut, and the footer always keeps `? help`. Before, at 80x24 the dialogs cut off their own prompt, Help stopped halfway and the Run Log had one line; at 60x20 the footer and the log disappeared. [#5]
