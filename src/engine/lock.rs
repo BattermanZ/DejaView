@@ -38,6 +38,23 @@ impl fmt::Display for LockHeld {
 
 impl std::error::Error for LockHeld {}
 
+/// Take the lock, retrying for a moment before calling it held. A process that
+/// forks shares its open files with the child until the child's exec closes
+/// them, so a lock this process just released can stay held for that instant
+/// when another thread is starting a process.
+fn try_lock_briefly(file: &File) -> std::result::Result<(), TryLockError> {
+    const ATTEMPTS: u32 = 10;
+    for _ in 1..ATTEMPTS {
+        match file.try_lock() {
+            Err(TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            other => return other,
+        }
+    }
+    file.try_lock()
+}
+
 pub fn acquire(downloads: &Path) -> Result<RunLock> {
     let path = downloads.join(LOCK_FILE);
     if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
@@ -53,7 +70,7 @@ pub fn acquire(downloads: &Path) -> Result<RunLock> {
         .truncate(false)
         .open(&path)
         .map_err(|err| anyhow!("cannot open the lock file {}: {err}", path.display()))?;
-    match file.try_lock() {
+    match try_lock_briefly(&file) {
         Ok(()) => Ok(RunLock { _file: Some(file) }),
         Err(TryLockError::WouldBlock) => Err(LockHeld { path }.into()),
         // Some network filesystems cannot lock at all. Refusing every run there
