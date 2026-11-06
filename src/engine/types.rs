@@ -157,6 +157,9 @@ pub struct ScanRunOptions<'a> {
     pub strict: bool,
     pub report_path: Option<&'a Path>,
     pub json_output: bool,
+    /// Print nothing unless a link was made or something failed: a cron
+    /// job's mail then means something happened.
+    pub quiet: bool,
     pub show_progress: bool,
     pub require_confirm: bool,
     pub tui_events: bool,

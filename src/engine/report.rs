@@ -8,77 +8,162 @@ use crate::protocol::{LinkReportEntry, RunReport, WarningSummary};
 
 use super::types::{LinkAction, LinkMode, RunMetrics, RunWarnings, ScanRunOptions};
 
-fn format_size(bytes: u64) -> String {
-    let units = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
+/// A size for a person, in binary units: `8.0 MiB`.
+pub(super) fn format_size(bytes: u64) -> String {
+    let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
     let mut size = bytes as f64;
     let mut unit_index = 0;
     while size >= 1024.0 && unit_index < units.len() - 1 {
         size /= 1024.0;
         unit_index += 1;
     }
-    format!("{:.2} {}", size, units[unit_index])
+    if unit_index == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", units[unit_index])
+    }
 }
 
+/// The plan for a person: the two folders once, then one row per pair with
+/// paths below them, or that there is nothing to do.
+pub(super) fn print_plan(actions: &[LinkAction], downloads: &Path, media: &Path, bytes: u64) {
+    println!("Downloads: {}", downloads.display());
+    println!("Media:     {}", media.display());
+    if actions.is_empty() {
+        println!("{} No duplicates found.", "✔".green());
+        return;
+    }
+    println!(
+        "{}",
+        super::linking::action_table(actions, downloads, media)
+    );
+    println!(
+        "Found {} duplicate(s): {} could be freed.",
+        actions.len(),
+        format_size(bytes)
+    );
+}
+
+/// What the run looked at and what went wrong, for a person. A quiet run
+/// prints only what went wrong.
 pub(super) fn print_run_summary(
     files_seen: usize,
     metrics: &RunMetrics,
-    planned_actions: usize,
-    applied_actions: usize,
     symlinked: usize,
     warnings: &RunWarnings,
+    quiet: bool,
 ) {
-    println!("{} Files considered: {}", "ℹ".cyan(), files_seen);
-    println!(
-        "{} Skipped by min-size: {}",
-        "ℹ".cyan(),
-        metrics.skipped_by_min_size
-    );
-    println!(
-        "{} Skipped by min-age: {}",
-        "ℹ".cyan(),
-        metrics.skipped_by_min_age
-    );
-    if metrics.skipped_by_exclude > 0 {
-        println!(
-            "{} Left out by the exclude list: {} file(s) and folder(s); the log names each",
-            "ℹ".cyan(),
-            metrics.skipped_by_exclude
-        );
-    }
-    println!("{} Planned actions: {}", "ℹ".cyan(), planned_actions);
-    if applied_actions > 0 {
-        println!("{} Applied actions: {}", "ℹ".cyan(), applied_actions);
-    }
-    if symlinked > 0 {
-        println!(
-            "{} {symlinked} of them as symlinks: each points at its library file and breaks if Sonarr or Radarr upgrades, renames or deletes that file. `fallback_reason` in the report says why each is not a hardlink.",
-            "⚠".yellow()
-        );
+    if !quiet {
+        let mut left_out = Vec::new();
+        if metrics.skipped_by_min_size > 0 {
+            left_out.push(format!(
+                "{} under the size floor",
+                metrics.skipped_by_min_size
+            ));
+        }
+        if metrics.skipped_by_min_age > 0 {
+            left_out.push(format!(
+                "{} younger than the minimum age",
+                metrics.skipped_by_min_age
+            ));
+        }
+        if metrics.skipped_by_exclude > 0 {
+            left_out.push(format!(
+                "{} by the exclude list (the log names each)",
+                metrics.skipped_by_exclude
+            ));
+        }
+        if left_out.is_empty() {
+            println!("{} Considered {files_seen} file(s).", "ℹ".cyan());
+        } else {
+            println!(
+                "{} Considered {files_seen} file(s); left out {}.",
+                "ℹ".cyan(),
+                left_out.join(", ")
+            );
+        }
+        if symlinked > 0 {
+            println!(
+                "{} {symlinked} download(s) became symlinks: each points at its library file and breaks if Sonarr or Radarr upgrades, renames or deletes that file. `fallback_reason` in the report says why each is not a hardlink.",
+                "⚠".yellow()
+            );
+        }
     }
 
     let total = warning_total(warnings);
     if total > 0 {
-        println!(
-            "{} Warnings: walk={} metadata={} sample-hash={} full-hash={} link={}",
-            "⚠".yellow(),
-            warnings.walk_errors,
-            warnings.metadata_errors,
-            warnings.sample_hash_errors,
-            warnings.full_hash_errors,
-            warnings.link_errors
+        let counts = [
+            ("walk", warnings.walk_errors),
+            ("metadata", warnings.metadata_errors),
+            ("quick hash", warnings.sample_hash_errors),
+            ("full hash", warnings.full_hash_errors),
+            ("link", warnings.link_errors),
+        ]
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(what, count)| format!("{what} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+        eprintln!(
+            "{} {total} file(s) could not be read, hashed or linked ({counts}); the log names each.",
+            "⚠".yellow()
         );
     }
 }
 
-pub(super) fn print_space_summary(actions_empty: bool, total_saved_space: u64) {
-    if actions_empty {
-        println!("{} No actions needed.", "✔".green());
-    } else {
-        println!(
-            "{} Potential space saved: {}",
-            "💾".cyan(),
-            format_size(total_saved_space)
-        );
+/// How a link run ended, in the one line a person or a cron mail reads.
+pub(super) struct Verdict<'a> {
+    pub(super) planned: usize,
+    pub(super) applied: usize,
+    pub(super) already_linked: usize,
+    pub(super) skipped: usize,
+    pub(super) failed: u64,
+    pub(super) freed_bytes: u64,
+    pub(super) cancelled: bool,
+    pub(super) report: Option<&'a Path>,
+}
+
+impl Verdict<'_> {
+    /// `Linked 7 of 8, 8.0 MiB freed, 1 failed: see <report>`.
+    pub(super) fn line(&self) -> String {
+        let mut parts = vec![format!(
+            "Linked {} of {}, {} freed",
+            self.applied,
+            self.planned,
+            format_size(self.freed_bytes)
+        )];
+        if self.already_linked > 0 {
+            parts.push(format!("{} already linked", self.already_linked));
+        }
+        if self.skipped > 0 {
+            parts.push(format!("{} left alone", self.skipped));
+        }
+        if self.failed > 0 {
+            parts.push(format!("{} failed", self.failed));
+        }
+        let mut line = parts.join(", ");
+        if self.cancelled {
+            line.push_str("; stopped on request, the rest stay planned");
+        }
+        if (self.failed > 0 || self.skipped > 0)
+            && let Some(report) = self.report
+        {
+            line.push_str(&format!(": see {}", report.display()));
+        }
+        line
+    }
+
+    /// Print the line, unless a quiet run linked nothing and nothing failed.
+    pub(super) fn print(&self, quiet: bool) {
+        if self.planned == 0 || (quiet && self.applied == 0 && self.failed == 0) {
+            return;
+        }
+        let mark = if self.failed > 0 || self.cancelled {
+            "⚠".yellow()
+        } else {
+            "✔".green()
+        };
+        println!("{mark} {}", self.line());
     }
 }
 

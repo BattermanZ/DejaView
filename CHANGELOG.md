@@ -18,6 +18,7 @@
 
 ### Added
 
+- `--quiet` (`-q`) on `scan` and `link` prints nothing unless the run linked something or something failed, so a cron job mails only when something happened. The README's cron example uses it. [#5]
 - The report says how its run ended (`outcome`: `complete`, `cancelled` or `failed`), when (`started_at`, `finished_at`), with what (`version`, `downloads`, `media`, `link_mode`), how many downloads became symlinks (`symlinked`) and how many pairs already were one file (`already_linked`, `already_linked_bytes`). [#5]
 - `dejaview config set-full-threads N` sets how many files are read in full at once. [#4]
 - `dejaview config set-exclude [PATTERN]...` sets the file and folder names every walk leaves out, as globs, with everything under them. The report counts what the list left out in `skipped_by_exclude`, the summary says how many, and the log names each. [#4]
@@ -29,6 +30,7 @@
 
 ### Changed
 
+- `scan` and `link` print the downloads and media folders once and each path below its folder, with a size column, where every row repeated both absolute paths. A link run ends with one line saying what it did, such as `Linked 7 of 8, 8.0 MiB freed, 1 failed: see <report>`, and a run that finds nothing says `No duplicates found.` over no table. Before, a run with failed links still ended with "Potential space saved" and "Done", and none said how much space it freed. Sizes are in KiB, MiB and GiB. [#5]
 - A scan or link run from the dashboard reports which file it is on and how many it has found or hashed up to ten times a second, instead of once for every file, which on a large library sent the dashboard hundreds of thousands of updates. [#4]
 - Hashing makes fewer round trips to a network drive: quick and full hashes read exactly the bytes they hash, where each spent one or two more reads finding the end of the file, and a full hash reads 8 MiB at a time instead of 1 MiB. [#4]
 - Linking makes fewer round trips to a network drive: each link looks up the library file once, where it looked it up four times, and the download once instead of twice. [#4]

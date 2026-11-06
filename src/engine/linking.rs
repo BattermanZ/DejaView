@@ -808,17 +808,26 @@ pub(super) fn plan_actions(groups: &[Vec<FileInfo>]) -> Plan {
     }
 }
 
-/// The table a person reads: one row per planned action.
-pub(super) fn action_table(actions: &[LinkAction]) -> Table {
+/// The table a person reads: one row per planned action, each path below
+/// its folder, which the caller prints once above it. The header is plain:
+/// colour codes would count as width and push the columns out of line.
+pub(super) fn action_table(actions: &[LinkAction], downloads: &Path, media: &Path) -> Table {
+    let below = |path: &Path, root: &Path| {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    };
     let mut table = Table::new();
     table
         .load_style(UTF8_FULL.with_rounded_corners())
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["Download".yellow(), "Media".yellow()]);
+        .set_header(vec!["Download", "Library file", "Size"]);
     for action in actions {
         table.add_row(vec![
-            action.src.to_string_lossy().to_string(),
-            action.tgt.to_string_lossy().to_string(),
+            below(&action.src, downloads),
+            below(&action.tgt, media),
+            super::report::format_size(action.size),
         ]);
     }
     table
@@ -828,7 +837,6 @@ pub(super) struct ApplyOptions<'a> {
     /// The downloads root: a download's folder must resolve inside it.
     pub(super) downloads: &'a Path,
     pub(super) strict: bool,
-    pub(super) json_output: bool,
     pub(super) tui_events: bool,
     pub(super) link_mode: LinkMode,
     pub(super) cancel: &'a CancelToken,
@@ -859,7 +867,6 @@ pub(super) fn apply_actions(
     let ApplyOptions {
         downloads,
         strict,
-        json_output,
         tui_events,
         link_mode,
         cancel,
@@ -878,9 +885,6 @@ pub(super) fn apply_actions(
         return ApplyOutcome::default();
     }
 
-    if !json_output && !tui_events {
-        println!("{} Applying…", "▶".cyan());
-    }
     let roots = CanonicalRoots::new(downloads, media);
     // Resolved once per run, not once per pair.
     let canonical_media = fs::canonicalize(media);
@@ -1017,8 +1021,6 @@ pub(super) fn apply_actions(
                 let _ = emit_tui_event(&TuiEvent::Log {
                     message: reason.clone(),
                 });
-            } else if !json_output {
-                eprintln!("{} {reason}", "⚠".yellow());
             }
             continue;
         }

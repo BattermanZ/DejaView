@@ -69,6 +69,7 @@ fn run_scan(config: &Config, dry_run: bool, strict: bool, report_path: Option<&P
             strict,
             report_path,
             json_output: false,
+            quiet: false,
             show_progress: false,
             require_confirm: false,
             tui_events: false,
@@ -711,7 +712,6 @@ fn apply_actions_rejects_source_metadata_change_after_planning() {
         &ApplyOptions {
             downloads: &downloads,
             strict: false,
-            json_output: true,
             tui_events: false,
             link_mode: LinkMode::Best,
             cancel: &CancelToken::default(),
@@ -792,7 +792,6 @@ fn apply_actions_rejects_target_metadata_change_after_planning() {
         &ApplyOptions {
             downloads: &downloads,
             strict: false,
-            json_output: true,
             tui_events: false,
             link_mode: LinkMode::Best,
             cancel: &CancelToken::default(),
@@ -898,7 +897,6 @@ fn apply_actions_allow_multiple_sources_for_same_target_in_one_run() {
         &ApplyOptions {
             downloads: &downloads,
             strict: false,
-            json_output: true,
             tui_events: false,
             link_mode: LinkMode::Best,
             cancel: &CancelToken::default(),
@@ -1036,6 +1034,7 @@ fn run_scan_strict_fails_on_sample_hash_error() {
             strict: true,
             report_path: None,
             json_output: false,
+            quiet: false,
             show_progress: false,
             require_confirm: false,
             tui_events: false,
@@ -1053,6 +1052,7 @@ fn run_scan_strict_fails_on_sample_hash_error() {
             strict: false,
             report_path: None,
             json_output: false,
+            quiet: false,
             show_progress: false,
             require_confirm: false,
             tui_events: false,
@@ -1097,6 +1097,7 @@ fn run_scan_non_strict_link_failure_continues() {
             strict: false,
             report_path: None,
             json_output: false,
+            quiet: false,
             show_progress: false,
             require_confirm: false,
             tui_events: false,
@@ -1146,6 +1147,7 @@ fn run_scan_strict_link_failure_returns_error() {
             strict: true,
             report_path: None,
             json_output: false,
+            quiet: false,
             show_progress: false,
             require_confirm: false,
             tui_events: false,
@@ -1281,7 +1283,6 @@ fn apply_actions_refuses_to_replace_a_file_inside_the_media_root() {
         &ApplyOptions {
             downloads: &root.join("downloads"),
             strict: false,
-            json_output: true,
             tui_events: false,
             link_mode: LinkMode::Best,
             cancel: &CancelToken::default(),
@@ -1487,6 +1488,7 @@ fn cancelled_link_run_returns_cancelled_and_changes_nothing() {
             strict: false,
             report_path: None,
             json_output: false,
+            quiet: false,
             show_progress: false,
             require_confirm: false,
             tui_events: false,
@@ -1535,7 +1537,6 @@ fn apply_actions_stops_before_the_next_file_when_cancelled() {
         &ApplyOptions {
             downloads: &root.join("downloads"),
             strict: false,
-            json_output: true,
             tui_events: false,
             link_mode: LinkMode::Best,
             cancel: &cancel,
@@ -1617,6 +1618,7 @@ fn cross_seeded_downloads_sharing_an_inode_are_all_linked() {
             strict: true,
             report_path: Some(&report),
             json_output: false,
+            quiet: false,
             show_progress: false,
             require_confirm: false,
             tui_events: false,
@@ -1737,7 +1739,6 @@ fn a_download_found_to_be_the_library_file_at_link_time_is_already_linked() {
         &ApplyOptions {
             downloads: &downloads,
             strict: true,
-            json_output: true,
             tui_events: false,
             link_mode: LinkMode::Best,
             cancel: &CancelToken::default(),
@@ -2037,6 +2038,7 @@ fn a_pair_left_alone_for_access_does_not_stop_a_strict_run() {
             strict: true,
             report_path: Some(&report),
             json_output: false,
+            quiet: false,
             show_progress: false,
             require_confirm: false,
             tui_events: false,
@@ -2362,6 +2364,7 @@ fn hashing_saves_the_cache_as_it_goes() {
         strict: true,
         report_path: None,
         json_output: false,
+        quiet: false,
         show_progress: false,
         require_confirm: false,
         tui_events: false,
@@ -2555,7 +2558,6 @@ fn a_failed_pair_names_the_os_error_and_drops_the_planned_method() {
         &ApplyOptions {
             downloads: &downloads,
             strict: false,
-            json_output: true,
             tui_events: false,
             link_mode: LinkMode::Best,
             cancel: &CancelToken::default(),
@@ -2717,4 +2719,31 @@ fn a_plan_comes_out_in_download_path_order() {
     let mut sorted = sources.clone();
     sorted.sort();
     assert_eq!(sources, sorted);
+}
+
+#[test]
+fn the_plan_table_lines_up_with_colours_on() {
+    colored::control::set_override(true);
+    let action = super::types::LinkAction {
+        src: PathBuf::from("/dl/Show.S01/e01.mkv"),
+        tgt: PathBuf::from("/media/TV/Show/e01.mkv"),
+        size: 3 << 20,
+        src_snapshot: snapshot_of(Path::new("/")),
+        tgt_snapshot: snapshot_of(Path::new("/")),
+    };
+    let table =
+        super::linking::action_table(&[action], Path::new("/dl"), Path::new("/media")).to_string();
+    colored::control::unset_override();
+
+    let widths: Vec<usize> = table.lines().map(|line| line.chars().count()).collect();
+    assert!(
+        widths.windows(2).all(|pair| pair[0] == pair[1]),
+        "every line as wide as the others:\n{table}"
+    );
+    assert!(table.contains("Show.S01/e01.mkv") && table.contains("TV/Show/e01.mkv"));
+    assert!(
+        !table.contains("/dl/"),
+        "paths are below their folder:\n{table}"
+    );
+    assert!(table.contains("3.0 MiB"), "{table}");
 }

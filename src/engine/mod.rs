@@ -24,8 +24,7 @@ use hashing::{CHECKPOINT_EVERY, Checkpoint, HashOptions, Hashed, hash_groups_and
 use linking::{ApplyOptions, ApplyOutcome, apply_actions, plan_actions};
 use report::{
     Outcome, RunReportInput, build_report_entries, build_run_report, maybe_confirm_apply,
-    planned_bytes, print_run_summary, print_space_summary, resolve_report_path, strict_failure,
-    try_write_run_report,
+    planned_bytes, print_run_summary, resolve_report_path, strict_failure, try_write_run_report,
 };
 use types::{Cache, LinkAction, RunMetrics, RunWarnings};
 
@@ -212,6 +211,9 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         .ok_or_else(|| anyhow!("Media path not set"))?;
     let min_age = std::time::Duration::from_secs(config.min_age.unwrap_or(0));
     let machine_output = options.json_output || options.tui_events;
+    // What a person reads on a terminal; a quiet run prints only links made
+    // and failures.
+    let human = !machine_output && !options.quiet;
     logger::info(
         "run",
         format!(
@@ -278,7 +280,7 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         logger::warn("run", &message);
         if options.tui_events {
             let _ = types::emit_tui_event(&TuiEvent::Log { message });
-        } else if !options.json_output {
+        } else if human {
             eprintln!("{} {message}", "⚠".yellow());
         }
     }
@@ -308,10 +310,8 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         });
     }
 
-    if !machine_output {
-        println!("\n{} Found duplicates:", "▶".cyan());
-        println!("{}", linking::action_table(&actions));
-        print_space_summary(actions.is_empty(), total_saved_space);
+    if human {
+        report::print_plan(&actions, downloads, media, total_saved_space);
     }
     let out_path = resolve_report_path(downloads, &options, planned_actions);
     let mut report_entries = build_report_entries(&actions, options.link_mode);
@@ -342,13 +342,15 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         }
         maybe_confirm_apply(options.require_confirm, planned_actions)?;
         logger::info("run", "starting apply phase");
+        if human && planned_actions > 0 {
+            println!("{} Linking…", "▶".cyan());
+        }
         apply_actions(
             &actions,
             media,
             &ApplyOptions {
                 downloads,
                 strict: options.strict,
-                json_output: options.json_output,
                 tui_events: options.tui_events,
                 link_mode: options.link_mode,
                 cancel: &options.cancel,
@@ -371,27 +373,31 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         }
     }
 
-    if skipped > 0 && !machine_output {
-        println!(
-            "{} Left alone {skipped} pair(s) on purpose; each entry's `error` in the report says why.",
-            "ℹ".cyan()
-        );
-    }
-    if already_linked > 0 && !machine_output {
-        println!(
-            "{} {already_linked} pair(s) already were one file; nothing changed. The filesystem gives one file different inode numbers: on mergerfs, mount with inodecalc=hybrid-hash, or use_ino on older versions.",
-            "ℹ".cyan()
-        );
+    if human {
+        // Each pair left alone on purpose, with why: the run decided it, so a
+        // person should see it, though nothing failed.
+        for reason in report_entries
+            .iter()
+            .filter(|entry| entry.status == "skipped")
+            .filter_map(|entry| entry.error.as_deref())
+        {
+            eprintln!("{} {reason}", "⚠".yellow());
+        }
+        if already_linked > 0 {
+            println!(
+                "{} {already_linked} pair(s) already were one file; nothing changed. The filesystem gives one file different inode numbers: on mergerfs, mount with inodecalc=hybrid-hash, or use_ino on older versions.",
+                "ℹ".cyan()
+            );
+        }
+        report::print_dangling_symlinks(&metrics.dangling_symlinks);
     }
     if !machine_output {
-        report::print_dangling_symlinks(&metrics.dangling_symlinks);
         print_run_summary(
             files_seen,
             &metrics,
-            planned_actions,
-            applied_actions,
             report::symlinked_count(&report_entries),
             &warnings,
+            options.quiet,
         );
     }
 
@@ -429,6 +435,23 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
     // A script reading --json gets the report of a run --strict stopped too.
     if options.json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if !machine_output && !options.dry_run {
+        report::Verdict {
+            planned: planned_actions,
+            applied: applied_actions,
+            already_linked,
+            skipped,
+            failed: warnings.link_errors,
+            freed_bytes,
+            cancelled: apply_cancelled,
+            report: out_path.as_deref(),
+        }
+        .print(options.quiet);
+    } else if human && planned_actions > 0 {
+        println!(
+            "{} Scan only: nothing was changed. `dejaview link` links them.",
+            "ℹ".cyan()
+        );
     }
     logger::info(
         "run",
@@ -454,11 +477,6 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         let _ = types::emit_tui_event(&TuiEvent::Done {
             report: Box::new(report),
         });
-    } else if options.dry_run && !machine_output {
-        println!("{} Dry-run; no changes.", "ℹ".yellow());
-    }
-    if !machine_output {
-        println!("{} Done.", "✔".green());
     }
     Ok(if apply_cancelled {
         RunEnd::Cancelled
@@ -755,7 +773,7 @@ fn report_second_mount_skips(
     );
     if options.tui_events {
         let _ = types::emit_tui_event(&TuiEvent::Log { message });
-    } else if !options.json_output {
+    } else if !options.json_output && !options.quiet {
         eprintln!("{} {message}", "⚠".yellow());
     }
 }

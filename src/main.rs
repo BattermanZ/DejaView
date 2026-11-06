@@ -92,6 +92,9 @@ struct RunOutputArgs {
     /// Write run report JSON to this path
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Print nothing unless a link was made or something failed, as a cron job wants
+    #[arg(long, short = 'q', conflicts_with = "json")]
+    quiet: bool,
     /// Progress display mode
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
@@ -110,11 +113,11 @@ enum ProgressMode {
     Off,
 }
 
-fn progress_enabled(mode: ProgressMode, no_progress: bool, json: bool, tui_events: bool) -> bool {
-    if no_progress || json || tui_events {
+fn progress_enabled(output: &RunOutputArgs) -> bool {
+    if output.no_progress || output.json || output.quiet || output.tui_events {
         return false;
     }
-    match mode {
+    match output.progress {
         ProgressMode::Auto => std::io::stdout().is_terminal(),
         ProgressMode::On => true,
         ProgressMode::Off => false,
@@ -259,12 +262,8 @@ fn run_cli() -> Result<ExitCode> {
                         strict,
                         report_path: output.report.as_deref(),
                         json_output: output.json,
-                        show_progress: progress_enabled(
-                            output.progress,
-                            output.no_progress,
-                            output.json,
-                            output.tui_events,
-                        ),
+                        quiet: output.quiet,
+                        show_progress: progress_enabled(&output),
                         require_confirm: false,
                         tui_events: output.tui_events,
                         link_mode: effective_link_mode(&config, symlink_only),
@@ -306,12 +305,8 @@ fn run_cli() -> Result<ExitCode> {
                         strict,
                         report_path: output.report.as_deref(),
                         json_output: output.json,
-                        show_progress: progress_enabled(
-                            output.progress,
-                            output.no_progress,
-                            output.json,
-                            output.tui_events,
-                        ),
+                        quiet: output.quiet,
+                        show_progress: progress_enabled(&output),
                         require_confirm: confirm,
                         tui_events: output.tui_events,
                         link_mode: effective_link_mode(&config, symlink_only),

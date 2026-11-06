@@ -927,7 +927,10 @@ fn link_summary_says_how_many_downloads_became_symlinks() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("2 of them as symlinks"), "stdout={stdout}");
+    assert!(
+        stdout.contains("2 download(s) became symlinks"),
+        "stdout={stdout}"
+    );
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
 
@@ -1768,5 +1771,127 @@ fn a_cancel_ends_the_event_stream_with_one_cancelled() {
 
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(final_event_of(&events)["type"], "cancelled");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_scan_names_each_folder_once_and_each_path_below_it() {
+    let root = unique_temp_dir("human_scan");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("Show.S01").join("e01.mkv"), 5000, 1);
+    write_seeded(&media.join("TV").join("Show").join("e01.mkv"), 5000, 1);
+    configure_small_files(&root, &downloads, &media);
+
+    let out = run_cmd(&root, &["scan", "--no-progress"]);
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.matches(&*downloads.to_string_lossy()).count(),
+        1,
+        "the downloads folder is printed once: {stdout}"
+    );
+    assert!(stdout.contains("Show.S01/e01.mkv"), "{stdout}");
+    assert!(stdout.contains("TV/Show/e01.mkv"), "{stdout}");
+    assert!(stdout.contains("Found 1 duplicate(s)"), "{stdout}");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_scan_that_finds_nothing_says_so_without_a_table() {
+    let root = unique_temp_dir("human_nothing");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("a.mkv"), 5000, 1);
+    write_seeded(&media.join("b.mkv"), 5000, 2);
+    configure_small_files(&root, &downloads, &media);
+
+    let out = run_cmd(&root, &["scan", "--no-progress"]);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("No duplicates found."), "{stdout}");
+    assert!(!stdout.contains("Library file"), "no empty table: {stdout}");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_link_run_ends_with_what_it_linked_and_freed() {
+    let root = unique_temp_dir("human_verdict");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("a.mkv"), 2048, 1);
+    write_seeded(&media.join("a.mkv"), 2048, 1);
+    configure_small_files(&root, &downloads, &media);
+
+    let out = run_cmd(&root, &["link", "--no-progress"]);
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.lines().last(),
+        Some("✔ Linked 1 of 1, 2.0 KiB freed"),
+        "{stdout}"
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_quiet_run_prints_only_what_it_linked() {
+    let root = unique_temp_dir("quiet");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_seeded(&downloads.join("a.mkv"), 2048, 1);
+    write_seeded(&media.join("a.mkv"), 2048, 1);
+    configure_small_files(&root, &downloads, &media);
+
+    let out = run_cmd(&root, &["link", "--quiet"]);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "✔ Linked 1 of 1, 2.0 KiB freed\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+
+    // Nothing left to link: nothing to say.
+    let out = run_cmd(&root, &["link", "--quiet"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn a_quiet_run_with_a_failed_pair_says_so() {
+    let root = unique_temp_dir("quiet_failed");
+    let Some((downloads, mount)) = tree_with_one_pair_that_cannot_link(&root) else {
+        eprintln!("skipped: this process may not mount");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    };
+
+    let out = run_cmd(&root, &["link", "--quiet"]);
+    drop(mount);
+
+    assert_eq!(out.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report = downloads.join(".dejaview_link_report.json");
+    assert_eq!(
+        stdout.trim_end(),
+        format!(
+            "⚠ Linked 1 of 2, 2.9 KiB freed, 1 failed: see {}",
+            report.display()
+        )
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Read-only file system"));
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn quiet_and_json_cannot_be_combined() {
+    let root = unique_temp_dir("quiet_json");
+    fs::create_dir_all(&root).expect("create root");
+    let out = run_cmd(&root, &["link", "--quiet", "--json"]);
+    assert_eq!(out.status.code(), Some(2), "clap's usage error");
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }

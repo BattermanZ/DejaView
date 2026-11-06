@@ -6,21 +6,18 @@ This is for the usual torrent plus Sonarr/Radarr setup, where a finished downloa
 
 ```text
 $ dejaview scan
-▶ Found duplicates:
-╭──────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────╮
-│ Download                                                         ┆ Media                                       │
-╞══════════════════════════════════════════════════════════════════╪═════════════════════════════════════════════╡
-│ /srv/torrents/complete/Arrival.2016.1080p/Arrival.2016.1080p.mkv ┆ /srv/media/Movies/Arrival (2016).mkv        │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ /srv/torrents/complete/Show.S01/Show.S01E01.mkv                  ┆ /srv/media/TV/Show/Season 1/Show S01E01.mkv │
-╰──────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────╯
-💾 Potential space saved: 6.10 MB
-ℹ Files considered: 6
-ℹ Skipped by min-size: 0
-ℹ Skipped by min-age: 0
-ℹ Planned actions: 2
-ℹ Dry-run; no changes.
-✔ Done.
+Downloads: /srv/torrents/complete
+Media:     /srv/media
+╭───────────────────────────────────────────┬──────────────────────────────────┬─────────╮
+│ Download                                  ┆ Library file                     ┆ Size    │
+╞═══════════════════════════════════════════╪══════════════════════════════════╪═════════╡
+│ Arrival.2016.1080p/Arrival.2016.1080p.mkv ┆ Movies/Arrival (2016).mkv        ┆ 4.1 GiB │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
+│ Show.S01/Show.S01E01.mkv                  ┆ TV/Show/Season 1/Show S01E01.mkv ┆ 1.9 GiB │
+╰───────────────────────────────────────────┴──────────────────────────────────┴─────────╯
+Found 2 duplicate(s): 6.0 GiB could be freed.
+ℹ Considered 6 file(s).
+ℹ Scan only: nothing was changed. `dejaview link` links them.
 ```
 
 There is also a terminal dashboard, `dejaview tui`, for scanning, reviewing and linking row by row.
@@ -115,6 +112,7 @@ dejaview link --confirm
 | Option | Effect |
 |---|---|
 | `--json` | Print the run summary as JSON on stdout. Turns progress output off. |
+| `--quiet`, `-q` | Print nothing unless the run linked something or something failed, then only the line that says so and the failures. Turns progress output off. Cannot be combined with `--json`. |
 | `--report PATH` | Also write the summary to PATH. Without it, a `link` run that planned something writes `.dejaview_link_report.json` in downloads, one that planned nothing leaves that report as it was, and `scan` writes nothing. |
 | `--progress auto\|on\|off` | Progress bars. `auto` (the default) shows them on a terminal. |
 | `--no-progress` | Same as `--progress off`. |
@@ -123,14 +121,16 @@ dejaview link --confirm
 | `--min-size BYTES` | Skip files smaller than this for this run, in place of the configured floor. |
 | `--confirm` | `link` only. Ask before changing anything. Needs a terminal and cannot be combined with `--json`. |
 
-For a cron job, give the binary's absolute path (cron's `PATH` is short), drop stdout so cron mails only warnings and errors, and treat exit code 3 as nothing to report:
+A run for a person prints the two folders once, a table of the planned pairs with each path below its folder, and ends with one line: `Linked 7 of 8, 8.0 MiB freed, 1 failed: see <report>`, or `No duplicates found.`
+
+For a cron job, give the binary's absolute path (cron's `PATH` is short), run with `--quiet`, and treat exit code 3 as nothing to report:
 
 ```bash
 # Every night at 03:17. The report stays at <downloads>/.dejaview_link_report.json.
-17 3 * * * out=$(/home/me/.cargo/bin/dejaview link --no-progress 2>&1 >/dev/null); [ "$?" -ne 3 ] && [ -n "$out" ] && echo "$out"
+17 3 * * * out=$(/home/me/.cargo/bin/dejaview link --quiet 2>&1); [ "$?" -ne 3 ] && [ -n "$out" ] && echo "$out"
 ```
 
-The line keeps what DejaView writes to stderr, which is warnings and errors, and prints it unless the run exited with 3; cron mails whatever is printed.
+A quiet run prints a line only when it linked something or something failed, and the line prints it unless the run exited with 3, so cron mails only on a night something happened. The report and the log keep the rest, such as symlinks into the library that no longer resolve.
 
 Only one scan, link or `cache cleanup-temp` runs at a time per downloads folder. A run that finds another one going does nothing and exits with code 3, so a cron run that overlaps a long first run, or a run from the dashboard, skips its turn.
 
