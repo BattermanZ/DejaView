@@ -63,13 +63,22 @@ pub fn acquire(downloads: &Path) -> Result<RunLock> {
             path.display()
         ));
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|err| anyhow!("cannot open the lock file {}: {err}", path.display()))?;
+    // flock needs only a handle, not write access: open an existing lock file
+    // read-only, so one made by root on an earlier run works for every user.
+    let file = match File::open(&path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path),
+        opened => opened,
+    }
+    .map_err(|err| {
+        anyhow!(
+            "cannot open the lock file {}: {err}; check that this user can read the downloads folder",
+            path.display()
+        )
+    })?;
     match try_lock_briefly(&file) {
         Ok(()) => Ok(RunLock { _file: Some(file) }),
         Err(TryLockError::WouldBlock) => Err(LockHeld { path }.into()),
@@ -84,5 +93,72 @@ pub fn acquire(downloads: &Path) -> Result<RunLock> {
             eprintln!("warning: {message}");
             Ok(RunLock { _file: None })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn temp_downloads(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dejaview_lock_{prefix}_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create dir");
+        dir
+    }
+
+    fn hold(dir: &Path) -> File {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(LOCK_FILE))
+            .expect("open lock");
+        file.try_lock().expect("take lock");
+        file
+    }
+
+    #[test]
+    fn a_lock_released_a_moment_later_is_taken() {
+        let dir = temp_downloads("brief");
+        let held = hold(&dir);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(held);
+        });
+        assert!(acquire(&dir).is_ok(), "waits out a release in progress");
+        releaser.join().expect("releaser");
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_lock_still_held_is_reported_as_held() {
+        let dir = temp_downloads("held");
+        let _held = hold(&dir);
+        let err = acquire(&dir).err().expect("held lock refuses");
+        assert!(err.is::<LockHeld>(), "{err}");
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_lock_file_this_user_cannot_write_still_locks() {
+        // Root made it 0644 on an earlier run; a run as another user can still
+        // read it, which is all a lock needs.
+        let dir = temp_downloads("read_only");
+        let path = dir.join(LOCK_FILE);
+        fs::write(&path, b"").expect("create lock file");
+        let mut perms = fs::metadata(&path).expect("meta").permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&path, perms).expect("chmod 0444");
+        assert!(acquire(&dir).is_ok());
+        fs::remove_dir_all(&dir).expect("cleanup");
     }
 }
