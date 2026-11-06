@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use colored::*;
+use std::collections::HashSet;
 
 mod cache;
 mod collect;
@@ -12,7 +13,7 @@ pub use types::LinkMode;
 pub use types::ScanRunOptions;
 
 use crate::protocol::TuiEvent;
-use cache::{load_cache, save_cache};
+use cache::{cache_key, load_cache, prune_cache, save_cache};
 use collect::{CollectOptions, collect_run_files, group_files_by_size};
 use hashing::{HashOptions, hash_groups_and_update_cache};
 use linking::{apply_actions, plan_actions_and_table};
@@ -114,6 +115,7 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
     logger::info("run", format!("using cache path {}", cache_path.display()));
     let mut cache = load_cache(&cache_path);
 
+    let seen_paths: HashSet<String> = files.iter().map(|file| cache_key(&file.path)).collect();
     let mut groups = group_files_by_size(files);
     hash_groups_and_update_cache(
         &mut groups,
@@ -127,6 +129,20 @@ pub fn run_scan_with_options(config: &Config, options: ScanRunOptions<'_>) -> Re
         },
         &mut warnings,
     )?;
+    if warnings.walk_errors == 0 && warnings.metadata_errors == 0 {
+        let pruned = prune_cache(&mut cache, &seen_paths);
+        if pruned > 0 {
+            logger::info(
+                "cache",
+                format!("pruned {pruned} entries for paths no longer present"),
+            );
+        }
+    } else {
+        logger::info(
+            "cache",
+            "walk was incomplete; keeping entries for paths not seen this run",
+        );
+    }
     save_cache(&cache_path, &cache)?;
 
     let (table, actions, _total_saved_space) = plan_actions_and_table(&groups);

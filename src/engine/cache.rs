@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -30,6 +31,20 @@ pub(super) fn save_cache(path: &Path, cache: &Cache) -> Result<()> {
         format!("saving {} cache entries to {}", cache.len(), path.display()),
     );
     safe_write_bytes(path, &json)
+}
+
+/// The cache key for a path. Every cache read, write and prune goes through it.
+pub(super) fn cache_key(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Drop entries for paths this run did not see, so the cache follows the trees
+/// instead of growing with every file that ever passed through them. Returns how
+/// many entries were dropped.
+pub(super) fn prune_cache(cache: &mut Cache, seen: &HashSet<String>) -> usize {
+    let before = cache.len();
+    cache.retain(|path, _| seen.contains(path));
+    before - cache.len()
 }
 
 pub(super) fn clear_cache_file(path: &Path) -> Result<()> {

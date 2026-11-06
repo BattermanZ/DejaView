@@ -1100,7 +1100,10 @@ fn collect_files_skips_dejaview_own_files() {
     write_file(&root.join(".dejaview_cache.json"), b"{}");
     write_file(&root.join(".dejaview_link_report.json"), b"{}");
     write_file(&root.join(".dejaview_tui_report.json"), b"{}");
-    write_file(&root.join("sub").join(".dejaview_hardlink.tmp.1.2"), b"content");
+    write_file(
+        &root.join("sub").join(".dejaview_hardlink.tmp.1.2"),
+        b"content",
+    );
     write_file(&root.join(".dejaview-notes.txt"), b"not ours");
 
     let mut warnings = RunWarnings::default();
@@ -1123,4 +1126,65 @@ fn collect_files_skips_dejaview_own_files() {
 
     assert_eq!(names, vec![".dejaview-notes.txt", "movie.mkv"]);
     fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn run_scan_prunes_cache_entries_for_removed_files() {
+    let root = unique_temp_dir("cache_prune");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    write_file(&downloads.join("keep.mkv"), b"keep-content");
+    write_file(&media.join("keep.mkv"), b"keep-content");
+    write_file(&downloads.join("gone.mkv"), b"gone-content");
+    write_file(&media.join("gone.mkv"), b"gone-content");
+    let config = make_config(&downloads, &media, 0);
+
+    run_scan(&config, true, false, None);
+    let cache_file = downloads.join(".dejaview_cache.json");
+    let gone_key = downloads.join("gone.mkv").to_string_lossy().into_owned();
+    assert!(load_cache(&cache_file).contains_key(&gone_key));
+
+    fs::remove_file(downloads.join("gone.mkv")).expect("remove download");
+    run_scan(&config, true, false, None);
+
+    let cache = load_cache(&cache_file);
+    assert!(
+        !cache.contains_key(&gone_key),
+        "removed path must be pruned"
+    );
+    let keep_key = downloads.join("keep.mkv").to_string_lossy().into_owned();
+    assert!(
+        cache.contains_key(&keep_key),
+        "present path must stay cached"
+    );
+
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn prune_cache_keeps_only_seen_paths() {
+    let mut cache: Cache = Cache::new();
+    for path in ["/dl/a", "/dl/b", "/media/c"] {
+        cache.insert(
+            path.to_string(),
+            CacheEntry {
+                size: 1,
+                mtime_ns: 0,
+                ctime_ns: 0,
+                dev: 1,
+                inode: 1,
+                hash: "h".into(),
+            },
+        );
+    }
+    let seen: std::collections::HashSet<String> = ["/dl/a", "/media/c"]
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+
+    let pruned = super::cache::prune_cache(&mut cache, &seen);
+
+    assert_eq!(pruned, 1);
+    assert!(!cache.contains_key("/dl/b"));
+    assert_eq!(cache.len(), 2);
 }

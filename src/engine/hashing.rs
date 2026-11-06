@@ -115,7 +115,7 @@ fn split_by_inode(group: &[FileInfo]) -> Vec<Vec<usize>> {
 }
 
 fn cache_key(file: &FileInfo) -> String {
-    file.path.to_string_lossy().into_owned()
+    super::cache::cache_key(&file.path)
 }
 
 fn cache_entry_matches(entry: &CacheEntry, file: &FileInfo) -> bool {
