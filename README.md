@@ -51,6 +51,7 @@ What it is not:
 - **A library file is never mistaken for a download.** A download that shares an inode with any library file is already linked and left alone. One on another device with the same size and timestamps as a library file is that file seen through a second mount, such as a mergerfs branch, and is left alone too; the run warns and counts it in the report's `skipped_as_library_file`.
 - **Each replacement is atomic.** DejaView creates the link under a temporary name next to the download, then renames it over the download. An interrupted run leaves either the old file or the link, plus at worst a `.dejaview_*.tmp.*` file that `dejaview cache cleanup-temp` removes.
 - **Nothing changes behind its back.** Right before replacing a file, it checks the size, timestamps and inode of both files again and skips the pair if either changed since the scan. It also refuses a target that is a symlink or sits outside the media folder.
+- **A link never locks out the torrent client.** A hardlinked download is the library file, so it takes on that file's owner and permissions (and its ACLs, extended attributes and SELinux label); a symlinked one is read with them. Before linking, DejaView checks that the download's owner and group could still read it, and leaves the pair alone with the reason in the report when they could not.
 - **`scan` leaves your files alone.** It does write its cache, `.dejaview_cache.json`, in the downloads folder, so downloads must be writable.
 
 ## Quick start
@@ -191,6 +192,8 @@ Files whose name starts with `.dejaview_` are never treated as duplicates.
 **`config validate` says the media path is inside the downloads path.** The two folders overlap, so a link run would rewrite files in your library. Point media at the library folder itself. The two can share a parent, such as `/srv/media` and `/srv/torrents`, but neither can contain the other.
 
 **`link` made symlinks instead of hardlinks.** The download and the library file are on different filesystems, or on different mergerfs branches. The `fallback_reason` field in the link report says which.
+
+**A pair failed with "could no longer read".** The library file belongs to another user and is closed to the download's owner or group, so after linking the torrent client could not read its own file. Give the torrent client and Sonarr or Radarr a shared group and group-readable files (umask 002), or make the library world-readable, then run again. ACLs and SELinux labels are not compared: in Docker with SELinux, a `:Z` label on the library mount relabels files the downloads container may then not read, so use `:z` on both.
 
 **A pair failed with "source changed since planning".** The download changed between the scan and the link, usually because a client was still writing it. Run again later, or raise `min_age`.
 

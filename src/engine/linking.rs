@@ -144,6 +144,82 @@ fn ensure_target_snapshot_matches(path: &Path, expected: &FileSnapshot) -> Resul
     Ok(())
 }
 
+/// Owner, group and permission bits of a file.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Access {
+    pub(super) uid: u32,
+    pub(super) gid: u32,
+    pub(super) mode: u32,
+}
+
+impl Access {
+    fn of(meta: &fs::Metadata) -> Self {
+        Access {
+            uid: meta.uid(),
+            gid: meta.gid(),
+            mode: meta.mode() & 0o7777,
+        }
+    }
+
+    fn describe(self) -> String {
+        format!("uid {}, gid {}, mode {:04o}", self.uid, self.gid, self.mode)
+    }
+}
+
+/// Whether the user or group a download is read by would lose read access once
+/// the download becomes a link to the library file. A hardlink is one inode, so
+/// the download takes on the library file's owner and mode; reading through a
+/// symlink is governed by them too. Returns who loses access.
+///
+/// The download's owner is assumed to belong to the download's group, which is
+/// how torrent clients and the *arr apps are usually set up; root reads
+/// anything and is never locked out.
+pub(super) fn read_access_lost(download: Access, library: Access) -> Option<String> {
+    let reads = |mode: u32, class_shift: u32| mode & (0o4 << class_shift) != 0;
+    let (owner, group, other) = (6, 3, 0);
+
+    if download.uid != 0 && reads(download.mode, owner) {
+        let keeps = if library.uid == download.uid {
+            reads(library.mode, owner)
+        } else if library.gid == download.gid {
+            reads(library.mode, group)
+        } else {
+            reads(library.mode, other)
+        };
+        if !keeps {
+            return Some(format!("its owner (uid {})", download.uid));
+        }
+    }
+    if reads(download.mode, group) {
+        let keeps = if library.gid == download.gid {
+            reads(library.mode, group)
+        } else {
+            reads(library.mode, other)
+        };
+        if !keeps {
+            return Some(format!("its group (gid {})", download.gid));
+        }
+    }
+    None
+}
+
+fn ensure_link_keeps_read_access(src: &Path, tgt: &Path) -> Result<()> {
+    let download =
+        Access::of(&fs::metadata(src).with_context(|| format!("metadata {}", src.display()))?);
+    let library =
+        Access::of(&fs::metadata(tgt).with_context(|| format!("metadata {}", tgt.display()))?);
+    if let Some(who) = read_access_lost(download, library) {
+        return Err(anyhow!(
+            "left alone: once linked, {who} could no longer read {}, so the torrent client would stop seeding it. The download is {}; the library file {} is {}. Let that user or group read the library file (a shared group for the torrent client and Sonarr or Radarr, files 0664 or 0644), then run again.",
+            src.display(),
+            download.describe(),
+            tgt.display(),
+            library.describe()
+        ));
+    }
+    Ok(())
+}
+
 fn finalize_tmp_swap_with<G>(tmp_link: &Path, src: &Path, rename_fn: G) -> Result<()>
 where
     G: Fn(&Path, &Path) -> std::io::Result<()>,
@@ -548,6 +624,7 @@ pub(super) fn apply_actions(
             ensure_source_snapshot_matches(&action.src, &action.src_snapshot, &replaced_inodes)?;
             ensure_target_within_media_root(media, &action.tgt)?;
             ensure_target_snapshot_matches(&action.tgt, &action.tgt_snapshot)?;
+            ensure_link_keeps_read_access(&action.src, &action.tgt)?;
             let (method, fallback_reason) =
                 replace_file_with_best_link(&action.src, &action.tgt, link_mode)?;
             report_entries[index].method = Some(method);

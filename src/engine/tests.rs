@@ -1534,3 +1534,72 @@ fn cross_seeded_downloads_sharing_an_inode_are_all_linked() {
     assert_eq!(report["warnings"]["link_errors"], 0);
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+#[test]
+fn link_that_would_lock_out_the_download_owner_is_refused() {
+    if !running_as_root() {
+        eprintln!("skipped: changing file owners needs root");
+        return;
+    }
+    // The torrent client owns its download; the library copy belongs to the
+    // *arr user and is closed to everyone else. A hardlink would hand the
+    // download the library's owner and mode, and seeding would stop.
+    let root = unique_temp_dir("owner_lockout");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let download = downloads.join("movie.mkv");
+    let library = media.join("movie.mkv");
+    write_file(&download, b"owned-bytes");
+    write_file(&library, b"owned-bytes");
+    std::os::unix::fs::chown(&download, Some(1001), Some(1001)).expect("chown download");
+    fs::set_permissions(&download, fs::Permissions::from_mode(0o664)).expect("chmod download");
+    std::os::unix::fs::chown(&library, Some(1002), Some(1002)).expect("chown library");
+    fs::set_permissions(&library, fs::Permissions::from_mode(0o640)).expect("chmod library");
+    let download_ino = fs::metadata(&download).expect("download").ino();
+    let report = root.join("report.json");
+    let config = make_config(&downloads, &media, 0);
+
+    run_scan(&config, false, false, Some(&report));
+
+    assert_eq!(
+        fs::metadata(&download).expect("download").ino(),
+        download_ino,
+        "the download is left as it was"
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report).expect("read report"))
+            .expect("parse report");
+    assert_eq!(report["entries"][0]["status"], "failed");
+    let error = report["entries"][0]["error"].as_str().expect("error");
+    assert!(error.contains("could no longer read"), "{error}");
+    assert!(
+        error.contains("uid 1001"),
+        "names who loses access: {error}"
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
+
+#[test]
+fn read_access_lost_compares_who_reads_the_download_before_and_after() {
+    use super::linking::{Access, read_access_lost};
+    let access = |uid, gid, mode| Access { uid, gid, mode };
+
+    // Different owners, library closed to others: the owner loses read.
+    let who = read_access_lost(access(1001, 1001, 0o664), access(1002, 1002, 0o640));
+    assert_eq!(who.as_deref(), Some("its owner (uid 1001)"));
+    // A shared group that can read: nobody loses anything.
+    assert!(read_access_lost(access(1001, 100, 0o664), access(1002, 100, 0o640)).is_none());
+    // Same owner: compare the owner's own bits, then the group's.
+    assert!(read_access_lost(access(1000, 1000, 0o644), access(1000, 1000, 0o640)).is_none());
+    let who = read_access_lost(access(1000, 1000, 0o644), access(1000, 1000, 0o200));
+    assert_eq!(who.as_deref(), Some("its owner (uid 1000)"));
+    let who = read_access_lost(access(1000, 1000, 0o644), access(1000, 1000, 0o600));
+    assert_eq!(who.as_deref(), Some("its group (gid 1000)"));
+    // A world-readable library file is readable by everyone.
+    assert!(read_access_lost(access(1001, 1001, 0o640), access(1002, 1002, 0o644)).is_none());
+    // The download's group read it; the library file shuts it out.
+    let who = read_access_lost(access(0, 1001, 0o640), access(1002, 1002, 0o640));
+    assert_eq!(who.as_deref(), Some("its group (gid 1001)"));
+    // Losing write alone is allowed: seeding only reads.
+    assert!(read_access_lost(access(1001, 100, 0o664), access(1002, 100, 0o644)).is_none());
+}
