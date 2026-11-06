@@ -29,7 +29,7 @@ Ask before acting on these:
 1. Decided: the symlink fallback stays the default (`docs/adr/0001-a-download-that-cannot-be-hardlinked-becomes-a-symlink.md`). S3's other fixes stand.
 2. Decided: files under 1 MiB are skipped by default, empty files always (`docs/adr/0002-files-under-1-mib-are-left-alone.md`). This settles the size floor in S2 and P1.
 3. Decided: add `ctrlc` with its `termination` feature, so SIGINT and SIGTERM cancel a CLI run and keep its hashes (P5). No `jwalk`: the parallel walk uses rayon, already a dependency (P3). No `libc`: set `rust-version = "1.89"` and take the lock with `std::fs::File::try_lock` (C2); the `fadvise` hint (P9) goes with it.
-4. Change what the CLI returns: a distinct exit code for "finished with failures", and timestamped reports instead of one overwritten file.
+4. Decided: exit codes 0, 1, 2 (finished with failures) and 3 (another run holds the lock); one report at the fixed path, left alone by a run that planned nothing and stamped with `started_at` and `finished_at` (`docs/adr/0003-a-run-answers-a-script-with-its-exit-code-and-one-report.md`).
 
 ## Findings
 
@@ -81,7 +81,7 @@ Severity: High, Medium, Low. Evidence tags: **[verified]** reproduced in the mai
 **C2. Medium. No lock against concurrent runs.** **[reproduced]**
 - Where: `src/engine/mod.rs:131-174`, `report.rs:117-128`, `cache.rs:108-121`.
 - Two `link` runs over 300 pairs: no data damage, but 129/171 and 171/129 spurious "source changed" failures, both exit 0, and the second overwrote the first's report. The cache is last-writer-wins (atomic, but hashes are lost). `cache cleanup-temp` during a run can delete an in-flight temp link and force a symlink fallback.
-- Fix (small): a non-blocking exclusive lock (`File::try_lock`, decision 3) on `<downloads>/.dejaview.lock` for scan, link and cleanup-temp; exit with a clear message and a distinct code when held. Fix the README cron line too (absolute binary path, `flock -n`, stdout to /dev/null, dated `--report`).
+- Fix (small): a non-blocking exclusive lock (`File::try_lock`, decision 3) on `<downloads>/.dejaview.lock` for scan, link and cleanup-temp; exit with a clear message and code 3 when held (ADR 0003). Fix the README cron line too (absolute binary path, `flock -n`, stdout to /dev/null, dated `--report`).
 
 **C3. Medium. Reports and errors don't match what happened.** **[reproduced]**
 - Where: `src/engine/mod.rs:186` (total computed before apply), `report.rs:117` (one fixed path), `report.rs:130-160`, `linking.rs:252, 306, 476-479, 500-505`, `mod.rs:297-312`, `hashing.rs:316, 400`.
@@ -91,7 +91,7 @@ Severity: High, Medium, Low. Evidence tags: **[verified]** reproduced in the mai
 - `.dejaview_link_report.json` is overwritten on every run, including a no-op run, and a TUI single-row link leaves a 1-entry report. Reports carry no timestamp, version, roots or link mode.
 - `--json --strict` prints nothing on stdout when it fails.
 - Non-strict runs with failed links exit 0.
-- Fix (small to medium): format errors with `{:#}` everywhere an anyhow error becomes a string; clear method and reason on failure; compute freed bytes from applied actions per inode (add `nlink` to FileInfo); add optional report fields `version`, `started_at`, `finished_at`, `downloads`, `media`, `link_mode`, `outcome` (complete, cancelled, failed), `symlinked` count, `already_linked` pairs/bytes, and split `planned_bytes` / `freed_bytes`; write timestamped reports or skip writing when nothing was planned; emit JSON before returning a strict error; document exit codes and add one for "completed with failures".
+- Fix (small to medium): format errors with `{:#}` everywhere an anyhow error becomes a string; clear method and reason on failure; compute freed bytes from applied actions per inode (add `nlink` to FileInfo); add optional report fields `version`, `started_at`, `finished_at`, `downloads`, `media`, `link_mode`, `outcome` (complete, cancelled, failed), `symlinked` count, `already_linked` pairs/bytes, and split `planned_bytes` / `freed_bytes`; skip writing the report when nothing was planned; emit JSON before returning a strict error; exit codes as ADR 0003 sets them.
 
 **C4. High (blocks Docker and hardened systemd). Logger setup is fatal and paths can't be overridden.** **[verified]**
 - Where: `src/main.rs:169`, `src/logger.rs:35-40, 66, 70`, `src/config.rs:18-22`.
@@ -215,7 +215,7 @@ All reproduced by rendering the TUI in a pty with pyte at 60x20, 80x24, 100x30, 
 
 **U6. Medium. CLI output.**
 - Link with a failure prints "Potential space saved", warnings, "Done" and exits 0; with 0 applied there is no "Applied" line; a successful link never states space actually freed. Nothing found prints "Found duplicates:" over an empty table. The table header is misaligned because the coloured header cells count escape bytes (`linking.rs:384`). Each row repeats both absolute roots (350 rows is about 1,750 lines at 80 columns). No quiet mode for cron; `--json` mails the whole report.
-- Fix (small): "Linked 7 of 8, 8.0 MiB freed, 1 failed: see <report>" and "No duplicates found."; uncoloured header; print roots once and paths relative; `--quiet` (print only when something was linked or failed); exit code for completed-with-failures (C3).
+- Fix (small): "Linked 7 of 8, 8.0 MiB freed, 1 failed: see <report>" and "No duplicates found."; uncoloured header; print roots once and paths relative; `--quiet` (print only when something was linked or failed); exit code 2 for completed-with-failures (ADR 0003).
 
 **U7. Low-Medium. `x` clears the cache with no confirmation.** Lowercase x (next to c, not documented) wipes the cache, which costs a full library rehash. Confirm X/x. Where: `app.rs:483`.
 
