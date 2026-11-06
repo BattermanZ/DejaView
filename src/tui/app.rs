@@ -98,6 +98,93 @@ impl LinkCheck {
     }
 }
 
+/// What the dashboard asks a run to do.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum JobRequest {
+    Scan {
+        strict: bool,
+    },
+    /// Link exactly these reviewed rows.
+    Link {
+        strict: bool,
+        downloads: PathBuf,
+        pairs: Vec<PlannedPair>,
+    },
+}
+
+/// Starts a run: it streams the run's events into the sender, and stops it
+/// when the receiver gets a cancel.
+pub(crate) type Spawner = Box<dyn FnMut(JobRequest, Sender<Result<TuiEvent>>, Receiver<()>)>;
+
+/// Run `dejaview scan` or `dejaview link --plan` with `--tui-events` as a
+/// child process, read on a thread of its own.
+#[cfg_attr(test, allow(dead_code))]
+fn spawn_child_run(request: JobRequest, events: Sender<Result<TuiEvent>>, cancel: Receiver<()>) {
+    thread::spawn(move || {
+        let _ = match request {
+            JobRequest::Scan { strict } => actions::run_scan(strict, events, cancel),
+            JobRequest::Link {
+                strict,
+                downloads,
+                pairs,
+            } => actions::run_link_pairs(strict, &downloads, &pairs, events, cancel),
+        };
+    });
+}
+
+/// The spawner a dashboard starts with: a child process per run. A unit
+/// test's dashboard starts nothing instead and records the request, with
+/// both ends of its channels, for the test to read and to send events
+/// through; see [`test_runs`].
+fn default_spawner() -> Spawner {
+    #[cfg(not(test))]
+    {
+        Box::new(spawn_child_run)
+    }
+    #[cfg(test)]
+    {
+        Box::new(test_runs::record)
+    }
+}
+
+/// The runs a unit test's dashboards asked for, on the test's own thread.
+#[cfg(test)]
+pub(crate) mod test_runs {
+    use super::{JobRequest, Receiver, Result, Sender, TuiEvent};
+    use std::cell::RefCell;
+
+    /// A run a test's dashboard started: what it asked for, the sender a
+    /// test feeds events through, and the receiver its cancel arrives on.
+    pub(crate) struct Started {
+        pub(crate) request: JobRequest,
+        pub(crate) events: Sender<Result<TuiEvent>>,
+        pub(crate) cancel: Receiver<()>,
+    }
+
+    thread_local! {
+        static STARTED: RefCell<Vec<Started>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(
+        request: JobRequest,
+        events: Sender<Result<TuiEvent>>,
+        cancel: Receiver<()>,
+    ) {
+        STARTED.with(|started| {
+            started.borrow_mut().push(Started {
+                request,
+                events,
+                cancel,
+            })
+        });
+    }
+
+    /// The runs started on this thread since the last call, oldest first.
+    pub(crate) fn take() -> Vec<Started> {
+        STARTED.with(|started| std::mem::take(&mut *started.borrow_mut()))
+    }
+}
+
 struct RunningJob {
     kind: JobKind,
     receiver: Receiver<Result<TuiEvent>>,
@@ -148,6 +235,8 @@ pub struct App {
     /// The run being watched, and the report shown.
     run: RunState,
     running_job: Option<RunningJob>,
+    /// Starts each run; see [`default_spawner`].
+    spawner: Spawner,
     link_check: LinkCheck,
     link_check_rx: Option<Receiver<(LinkCheck, Vec<String>)>>,
     should_quit: bool,
@@ -178,6 +267,7 @@ impl App {
             link_check: LinkCheck::Untested,
             link_check_rx: None,
             should_quit: false,
+            spawner: default_spawner(),
         }
     }
 
@@ -688,13 +778,12 @@ impl App {
         self.run.start(&JobKind::Scan);
         self.selected_row = 0;
         self.push_log("Running scan...".to_string());
-        let strict = self.strict;
-        let (tx, rx) = mpsc::channel();
-        let (cancel_tx, cancel_rx) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = actions::run_scan(strict, tx, cancel_rx);
-        });
-        self.running_job = Some(RunningJob::new(JobKind::Scan, rx, cancel_tx));
+        self.start_job(
+            JobKind::Scan,
+            JobRequest::Scan {
+                strict: self.strict,
+            },
+        );
     }
 
     fn start_rescan_job(&mut self) -> Result<()> {
@@ -732,13 +821,14 @@ impl App {
         self.run.start(&JobKind::LinkAll);
         self.selected_row = 0;
         self.push_log("Running link...".to_string());
-        let strict = self.strict;
-        let (tx, rx) = mpsc::channel();
-        let (cancel_tx, cancel_rx) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = actions::run_link_pairs(strict, &downloads, &pairs, tx, cancel_rx);
-        });
-        self.running_job = Some(RunningJob::new(JobKind::LinkAll, rx, cancel_tx));
+        self.start_job(
+            JobKind::LinkAll,
+            JobRequest::Link {
+                strict: self.strict,
+                downloads,
+                pairs,
+            },
+        );
     }
 
     fn start_selected_link_job(&mut self) -> Result<()> {
@@ -764,14 +854,23 @@ impl App {
         self.run.start(&kind);
         self.push_log(format!("Running selected link for {source}"));
 
-        let strict = self.strict;
-        let (tx, rx) = mpsc::channel();
-        let (cancel_tx, cancel_rx) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = actions::run_link_pairs(strict, &downloads, &[pair], tx, cancel_rx);
-        });
-        self.running_job = Some(RunningJob::new(kind, rx, cancel_tx));
+        self.start_job(
+            kind,
+            JobRequest::Link {
+                strict: self.strict,
+                downloads,
+                pairs: vec![pair],
+            },
+        );
         Ok(())
+    }
+
+    /// Start the run and watch it.
+    fn start_job(&mut self, kind: JobKind, request: JobRequest) {
+        let (events, receiver) = mpsc::channel();
+        let (cancel, cancel_rx) = mpsc::channel();
+        (self.spawner)(request, events, cancel_rx);
+        self.running_job = Some(RunningJob::new(kind, receiver, cancel));
     }
 
     fn toggle_path_mode(&mut self) {
@@ -1175,8 +1274,9 @@ mod tests {
 
     use super::super::model::{RunReport, TuiEvent};
     use super::*;
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use std::fs;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
     fn sample_report() -> RunReport {
@@ -1858,6 +1958,9 @@ mod tests {
         assert!(app.run.report.is_none());
         assert_eq!(app.selected_row, 0);
         assert!(app.running_job.is_some());
+        let started = test_runs::take();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].request, JobRequest::Scan { strict: false });
     }
 
     #[test]
@@ -1869,6 +1972,7 @@ mod tests {
             .expect("rescan should start");
 
         assert!(app.running_job.is_some());
+        assert_eq!(test_runs::take().len(), 1, "one scan");
         assert!(
             app.logs
                 .iter()
@@ -1884,6 +1988,76 @@ mod tests {
         let err = app.start_rescan_job_with(|| Err(anyhow::anyhow!("boom")));
         assert!(err.is_err());
         assert!(app.running_job.is_none());
+        assert!(test_runs::take().is_empty());
+    }
+
+    /// L and y start one link of the reviewed planned rows and nothing else;
+    /// the run's events then come back through the channel it was given, and
+    /// c reaches the run as a cancel.
+    #[test]
+    fn link_all_runs_the_reviewed_rows_and_takes_their_events() {
+        let mut app = App::new(&config_with_paths(), true);
+        let row = |source: &str, status: EntryStatus| LinkReportEntry {
+            source: source.to_string(),
+            target: format!("/nonexistent/media{source}"),
+            size: 10,
+            status,
+            method: Some(LinkMethod::TryHardlink),
+            ..Default::default()
+        };
+        app.run.report = Some(RunReport {
+            entries: vec![
+                row("/a.mkv", EntryStatus::Planned),
+                row("/b.mkv", EntryStatus::Applied),
+                row("/c.mkv", EntryStatus::Planned),
+            ],
+            ..sample_report()
+        });
+
+        app.handle_main_key(KeyCode::Char('L')).expect("key");
+        app.handle_key(KeyCode::Char('y'), KeyModifiers::NONE)
+            .expect("key");
+        let mut started = test_runs::take();
+        assert_eq!(started.len(), 1);
+        let JobRequest::Link {
+            strict,
+            downloads,
+            pairs,
+        } = &started[0].request
+        else {
+            panic!("a link run: {:?}", started[0].request);
+        };
+        assert!(*strict);
+        assert_eq!(downloads, Path::new("/nonexistent/downloads"));
+        let sources: Vec<_> = pairs.iter().map(|pair| pair.source.as_str()).collect();
+        assert_eq!(sources, ["/a.mkv", "/c.mkv"], "only the planned rows");
+
+        app.handle_main_key(KeyCode::Char('c')).expect("key");
+        assert!(
+            started[0].cancel.try_recv().is_ok(),
+            "the cancel reaches the run"
+        );
+
+        let run = started.remove(0);
+        let mut linked = RunReport {
+            mode: Mode::Link,
+            entries: vec![
+                row("/a.mkv", EntryStatus::Applied),
+                row("/c.mkv", EntryStatus::Applied),
+            ],
+            applied_actions: 2,
+            ..sample_report()
+        };
+        linked.planned_actions = 2;
+        run.events
+            .send(Ok(TuiEvent::Done {
+                report: Box::new(linked),
+            }))
+            .expect("send done");
+        app.poll_running_job();
+        assert!(app.running_job.is_none());
+        assert!(app.rows().iter().all(LinkReportEntry::is_applied));
+        assert_eq!(app.last_log_line(), "Link finished. Applied actions: 2");
     }
 
     #[test]
