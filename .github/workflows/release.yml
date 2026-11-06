@@ -5,16 +5,27 @@ name: Release
 # that tag. Tag a commit on `main`, at a release, once `version` in
 # Cargo.toml matches the tag and CHANGELOG.md has a `## <version>` section,
 # whose text becomes the release notes.
+#
+# A pull request that changes how the binaries are built builds them too,
+# and publishes nothing, so a broken build shows before a tag needs it.
 
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # What the archives are named after: the tag, or "test" on a pull request.
+  LABEL: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'test' }}
 
 jobs:
   build:
@@ -32,6 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check the tag names the version in Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
@@ -44,11 +56,22 @@ jobs:
           rustup target add "${{ matrix.target }}"
           sudo apt-get update
           sudo apt-get install -y musl-tools
+      # musl-gcc is the C compiler musl-tools installs. Named here because,
+      # for aarch64 musl, cc-rs looks only for aarch64-linux-musl-gcc, which
+      # Ubuntu does not ship, and blake3 compiles C for NEON there.
       - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Run it
+        run: |
+          binary="target/${{ matrix.target }}/release/dejaview"
+          file "$binary"
+          "$binary" --version
       - name: Package
         run: |
-          name="dejaview-$GITHUB_REF_NAME-${{ matrix.target }}"
+          name="dejaview-$LABEL-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/dejaview" README.md CHANGELOG.md LICENSE "$name/"
           tar -czf "$name.tar.gz" "$name"
@@ -60,6 +83,7 @@ jobs:
 
   release:
     name: publish the release
+    if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
     permissions:
