@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use colored::*;
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use pathdiff::diff_paths;
+use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::{Path, PathBuf};
@@ -100,15 +101,36 @@ fn snapshot_path(path: &Path) -> Result<FileSnapshot> {
     })
 }
 
-fn ensure_source_snapshot_matches(path: &Path, expected: &FileSnapshot) -> Result<()> {
+/// The source must be the file the plan saw. One exception: when this run has
+/// already replaced another path of the same inode (cross-seeded downloads are
+/// hardlinks of each other), that replacement changed the inode's link count
+/// and ctime, so a ctime change alone is accepted while size, mtime, device
+/// and inode still match.
+fn ensure_source_snapshot_matches(
+    path: &Path,
+    expected: &FileSnapshot,
+    replaced_inodes: &HashSet<(u64, u64)>,
+) -> Result<()> {
     let current = snapshot_path(path)?;
-    if !expected.matches_source(&current) {
-        return Err(anyhow!(
-            "source changed since planning; rerun scan before linking: {}",
-            path.display()
-        ));
+    if expected.matches_source(&current) {
+        return Ok(());
     }
-    Ok(())
+    if replaced_inodes.contains(&(expected.dev, expected.inode))
+        && expected.matches_target(&current)
+    {
+        logger::info(
+            "link",
+            format!(
+                "{} changed only its ctime, from replacing a hardlinked sibling earlier in this run",
+                path.display()
+            ),
+        );
+        return Ok(());
+    }
+    Err(anyhow!(
+        "source changed since planning; rerun scan before linking: {}",
+        path.display()
+    ))
 }
 
 fn ensure_target_snapshot_matches(path: &Path, expected: &FileSnapshot) -> Result<()> {
@@ -491,6 +513,8 @@ pub(super) fn apply_actions(
     let mut applied_actions = 0usize;
     let mut strict_link_error: Option<anyhow::Error> = None;
     let mut cancelled = false;
+    // Source inodes this run replaced a path of; see ensure_source_snapshot_matches.
+    let mut replaced_inodes: HashSet<(u64, u64)> = HashSet::new();
 
     if actions.is_empty() {
         return ApplyOutcome::default();
@@ -521,7 +545,7 @@ pub(super) fn apply_actions(
                 ),
             );
             ensure_source_outside_media_root(media, &action.src)?;
-            ensure_source_snapshot_matches(&action.src, &action.src_snapshot)?;
+            ensure_source_snapshot_matches(&action.src, &action.src_snapshot, &replaced_inodes)?;
             ensure_target_within_media_root(media, &action.tgt)?;
             ensure_target_snapshot_matches(&action.tgt, &action.tgt_snapshot)?;
             let (method, fallback_reason) =
@@ -574,6 +598,7 @@ pub(super) fn apply_actions(
             }
         }
         applied_actions += 1;
+        replaced_inodes.insert((action.src_snapshot.dev, action.src_snapshot.inode));
         logger::info(
             "link",
             format!(

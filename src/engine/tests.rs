@@ -1488,3 +1488,49 @@ fn link_run_leaves_empty_files_alone() {
     );
     fs::remove_dir_all(&root).expect("cleanup temp dir");
 }
+
+#[test]
+fn cross_seeded_downloads_sharing_an_inode_are_all_linked() {
+    // Two torrents seed one file through two hardlinked paths; the library
+    // holds its own copy. Replacing the first path changes the shared inode's
+    // link count and ctime, which must not fail the second.
+    let root = unique_temp_dir("cross_seed");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    let first = downloads.join("t1").join("movie.mkv");
+    let second = downloads.join("t2").join("movie.mkv");
+    let library = media.join("movie.mkv");
+    write_file(&first, b"cross-seeded-bytes");
+    write_file(&library, b"cross-seeded-bytes");
+    fs::create_dir_all(second.parent().expect("t2")).expect("create t2");
+    fs::hard_link(&first, &second).expect("cross-seed hardlink");
+    let report = root.join("report.json");
+    let config = make_config(&downloads, &media, 0);
+
+    run_scan_with_options(
+        &config,
+        ScanRunOptions {
+            dry_run: false,
+            strict: true,
+            report_path: Some(&report),
+            json_output: false,
+            show_progress: false,
+            require_confirm: false,
+            tui_events: false,
+            link_mode: LinkMode::Best,
+            only_sources: &[],
+            cancel: CancelToken::default(),
+        },
+    )
+    .expect("a strict run links both paths");
+
+    let library_ino = fs::metadata(&library).expect("library").ino();
+    assert_eq!(fs::metadata(&first).expect("first").ino(), library_ino);
+    assert_eq!(fs::metadata(&second).expect("second").ino(), library_ino);
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report).expect("read report"))
+            .expect("parse report");
+    assert_eq!(report["applied_actions"], 2);
+    assert_eq!(report["warnings"]["link_errors"], 0);
+    fs::remove_dir_all(&root).expect("cleanup temp dir");
+}
