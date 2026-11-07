@@ -5,7 +5,8 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use ratatui::layout::{Position, Rect};
 
 use crate::config::{Config, load_config, save_config};
 use crate::engine::LinkMode;
@@ -203,8 +204,17 @@ impl RunningJob {
     }
 }
 
+/// What a click on a spot of the screen does.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Click {
+    /// Select this row.
+    Row(usize),
+    /// Press this key: a key in the footer or on a dialog's border.
+    Key(KeyCode),
+}
+
 /// What the last frame drawn had room for, which paging and scrolling go
-/// by. The view sets it as it draws.
+/// by, and where it drew what can be clicked. The view sets it as it draws.
 #[derive(Default)]
 pub struct ViewSizes {
     /// Result rows the table shows at once.
@@ -212,7 +222,38 @@ pub struct ViewSizes {
     /// Lines an open Help or JSON overlay shows at once, and has in all.
     pub overlay_rows: std::cell::Cell<usize>,
     pub overlay_lines: std::cell::Cell<usize>,
+    /// The spots that can be clicked, in the order drawn. A dialog clears
+    /// the screen's spots behind it, so only its own keys answer a click.
+    clicks: std::cell::RefCell<Vec<(Rect, Click)>>,
+    /// The open Help or JSON dialog, so a click outside it closes it.
+    pub dialog: std::cell::Cell<Option<Rect>>,
 }
+
+impl ViewSizes {
+    /// Forget every spot drawn so far, as a new frame or a dialog starts.
+    pub fn clear_clicks(&self) {
+        self.clicks.borrow_mut().clear();
+        self.dialog.set(None);
+    }
+
+    pub fn add_click(&self, area: Rect, click: Click) {
+        self.clicks.borrow_mut().push((area, click));
+    }
+
+    /// What a click at `column`, `row` does: the spot drawn last there wins.
+    fn click_at(&self, column: u16, row: u16) -> Option<Click> {
+        let at = Position::new(column, row);
+        self.clicks
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(area, _)| area.contains(at))
+            .map(|(_, click)| *click)
+    }
+}
+
+/// Lines a turn of the wheel scrolls Help or the JSON preview by.
+const WHEEL_LINES: usize = 3;
 
 pub struct App {
     pub strict: bool,
@@ -291,6 +332,48 @@ impl App {
                     self.handle_key(key.code, key.modifiers)?;
                 }
             }
+            Event::Mouse(mouse) => self.handle_mouse(mouse.kind, mouse.column, mouse.row)?,
+        }
+        Ok(())
+    }
+
+    /// A click presses the key or selects the row drawn under it; the wheel
+    /// moves the selection, or scrolls Help and the JSON preview. A click
+    /// outside Help or the JSON preview closes it; other dialogs wait for an
+    /// answer.
+    fn handle_mouse(&mut self, kind: MouseEventKind, column: u16, row: u16) -> Result<()> {
+        let scrolling = matches!(self.overlay, Overlay::Help | Overlay::JsonPreview(_));
+        match kind {
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let down = kind == MouseEventKind::ScrollDown;
+                if scrolling {
+                    let code = if down { KeyCode::Down } else { KeyCode::Up };
+                    for _ in 0..WHEEL_LINES {
+                        self.scroll_overlay(code);
+                    }
+                } else if matches!(self.overlay, Overlay::None) {
+                    self.move_selection(if down { 1 } else { -1 });
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => match self.view.click_at(column, row) {
+                Some(Click::Key(code)) => self.handle_key(code, KeyModifiers::NONE)?,
+                Some(Click::Row(index)) => {
+                    if matches!(self.overlay, Overlay::None) && index < self.rows().len() {
+                        self.selected_row = index;
+                    }
+                }
+                None => {
+                    let inside = self
+                        .view
+                        .dialog
+                        .get()
+                        .is_some_and(|area| area.contains(Position::new(column, row)));
+                    if scrolling && !inside {
+                        self.overlay = Overlay::None;
+                    }
+                }
+            },
+            _ => {}
         }
         Ok(())
     }
@@ -1251,6 +1334,11 @@ impl App {
 
     pub(crate) fn handle_key_for_test(&mut self, code: KeyCode, mods: KeyModifiers) {
         self.handle_key(code, mods).expect("key handling");
+    }
+
+    pub(crate) fn mouse_for_test(&mut self, kind: MouseEventKind, column: u16, row: u16) {
+        self.handle_mouse(kind, column, row)
+            .expect("mouse handling");
     }
 }
 

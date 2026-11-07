@@ -5,13 +5,17 @@
 
 mod dialogs;
 mod header;
+#[cfg(test)]
+mod mouse_tests;
 mod pairs;
 
 use ratatui::prelude::*;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
-use crate::tui::app::{App, Overlay};
+use crossterm::event::KeyCode;
+
+use crate::tui::app::{App, Click, Overlay};
 use crate::tui::layout;
 use crate::tui::theme::Theme;
 
@@ -297,8 +301,32 @@ fn footer_keys(app: &App) -> Vec<Key> {
     keys
 }
 
+/// The key a key's name in the footer or on a dialog's border stands for,
+/// for a click on it; `j/k` names two, so a click on it presses neither.
+fn key_code(key: &str) -> Option<KeyCode> {
+    match key {
+        "Esc" => Some(KeyCode::Esc),
+        "Enter" => Some(KeyCode::Enter),
+        "Tab" => Some(KeyCode::Tab),
+        _ => {
+            let mut chars = key.chars();
+            match (chars.next(), chars.next()) {
+                (Some(ch), None) => Some(KeyCode::Char(ch)),
+                _ => None,
+            }
+        }
+    }
+}
+
 /// The keys that fit in `width`, dropping the least needed first.
+#[cfg(test)]
 fn footer_line(app: &App, width: u16) -> Line<'static> {
+    footer(app, width).0
+}
+
+/// The footer's keys that fit in `width`, and where each one's button
+/// starts and how wide it is, key and label together.
+fn footer(app: &App, width: u16) -> (Line<'static>, Vec<(u16, u16, KeyCode)>) {
     let keys = footer_keys(app);
     let cost = |key: &Key| {
         let chip = if key.look == Look::Plain { 1 } else { 4 };
@@ -324,7 +352,12 @@ fn footer_line(app: &App, width: u16) -> Line<'static> {
         }
     }
     let mut spans = vec![Span::raw(" ")];
+    let mut buttons = Vec::new();
     for (key, _) in keys.iter().zip(&shown).filter(|(_, shown)| **shown) {
+        let start = spans
+            .iter()
+            .map(|span| width_of(&span.content))
+            .sum::<usize>();
         match key.look {
             Look::Primary | Look::Chip => {
                 let chip = if key.look == Look::Primary {
@@ -340,10 +373,18 @@ fn footer_line(app: &App, width: u16) -> Line<'static> {
                 spans.push(Span::styled(format!(" {}", key.label), Theme::muted()));
             }
         }
+        let end = spans
+            .iter()
+            .map(|span| width_of(&span.content))
+            .sum::<usize>();
+        if let Some(code) = key_code(key.key) {
+            let at = |columns: usize| u16::try_from(columns).unwrap_or(u16::MAX);
+            buttons.push((at(start), at(end - start), code));
+        }
         spans.push(Span::raw("   "));
     }
     spans.pop();
-    Line::from(spans)
+    (Line::from(spans), buttons)
 }
 
 /// The newest log lines that fit, oldest first, one row each: a line wider than
@@ -409,6 +450,7 @@ fn inset(area: Rect, columns: u16) -> Rect {
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    app.view_sizes().clear_clicks();
     frame.render_widget(Block::default().style(Theme::canvas()), area);
     let l = layout::dashboard(area);
 
@@ -450,15 +492,32 @@ pub fn render(frame: &mut Frame, app: &App) {
     } else {
         l.footer
     };
-    frame.render_widget(Paragraph::new(footer_line(app, keys.width)), keys);
+    let (line, buttons) = footer(app, keys.width);
+    frame.render_widget(Paragraph::new(line), keys);
+    for (start, width, code) in buttons {
+        let x = keys.x.saturating_add(start);
+        if x < keys.right() {
+            let area = Rect {
+                x,
+                width: width.min(keys.right() - x),
+                height: 1,
+                ..keys
+            };
+            app.view_sizes().add_click(area, Click::Key(code));
+        }
+    }
 
+    // A dialog takes every click: the screen behind it is pushed back.
+    if !matches!(app.overlay(), Overlay::None) {
+        app.view_sizes().clear_clicks();
+    }
     match app.overlay() {
         Overlay::None => {}
         Overlay::Help => dialogs::render_help(frame, app),
         Overlay::JsonPreview(json) => dialogs::render_json(frame, app, json),
         Overlay::ConfigEditor(editor) => dialogs::render_config_editor(frame, app, editor),
         Overlay::ConfirmLink(mode) => dialogs::render_confirm_link(frame, app, *mode),
-        Overlay::ConfirmRescan => dialogs::render_confirm_rescan(frame),
+        Overlay::ConfirmRescan => dialogs::render_confirm_rescan(frame, app),
         Overlay::BlockingNotice(message) => dialogs::render_notice(frame, app, message),
     }
 }

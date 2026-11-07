@@ -11,6 +11,7 @@ mod view;
 mod wordmark;
 
 use anyhow::Result;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -20,13 +21,29 @@ use std::io::{self, Write};
 
 use crate::config::Config;
 
-/// Switch to the alternate screen. Mouse reporting stays off: the TUI handles
-/// no mouse events, and capturing them would stop the user selecting text.
-fn enter_screen<W: Write>(out: &mut W) -> io::Result<()> {
-    execute!(out, EnterAlternateScreen)
+/// Whether a screen takes the mouse. The dashboard does, for its clicks and
+/// the wheel; a terminal then selects text with Shift held while dragging.
+/// The logo preview handles no mouse event, so it leaves the mouse to the
+/// terminal.
+#[derive(Copy, Clone, Default)]
+enum Mouse {
+    Capture,
+    #[default]
+    Off,
 }
 
-fn leave_screen<W: Write>(out: &mut W) -> io::Result<()> {
+fn enter_screen<W: Write>(out: &mut W, mouse: Mouse) -> io::Result<()> {
+    execute!(out, EnterAlternateScreen)?;
+    if let Mouse::Capture = mouse {
+        execute!(out, EnableMouseCapture)?;
+    }
+    Ok(())
+}
+
+fn leave_screen<W: Write>(out: &mut W, mouse: Mouse) -> io::Result<()> {
+    if let Mouse::Capture = mouse {
+        execute!(out, DisableMouseCapture)?;
+    }
     execute!(out, LeaveAlternateScreen)
 }
 
@@ -34,12 +51,13 @@ fn leave_screen<W: Write>(out: &mut W) -> io::Result<()> {
 struct TerminalGuard {
     raw_enabled: bool,
     alt_enabled: bool,
+    mouse: Mouse,
 }
 
 impl TerminalGuard {
     fn restore(&mut self) -> Result<()> {
         if self.alt_enabled {
-            leave_screen(&mut io::stdout())?;
+            leave_screen(&mut io::stdout(), self.mouse)?;
             self.alt_enabled = false;
         }
         if self.raw_enabled {
@@ -62,8 +80,10 @@ pub fn run(config: &Config, strict: bool) -> Result<()> {
     guard.raw_enabled = true;
 
     let mut stdout = io::stdout();
-    enter_screen(&mut stdout)?;
+    guard.mouse = Mouse::Capture;
+    // Set first, so a screen entered partway is still left on an error.
     guard.alt_enabled = true;
+    enter_screen(&mut stdout, guard.mouse)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -90,8 +110,8 @@ pub fn run_logo_preview() -> Result<()> {
     guard.raw_enabled = true;
 
     let mut stdout = io::stdout();
-    enter_screen(&mut stdout)?;
     guard.alt_enabled = true;
+    enter_screen(&mut stdout, Mouse::Off)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -108,10 +128,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entering_the_screen_leaves_mouse_reporting_off() {
+    fn the_dashboard_takes_the_mouse_and_gives_it_back() {
         let mut out = Vec::new();
-        enter_screen(&mut out).expect("enter screen");
-        leave_screen(&mut out).expect("leave screen");
+        enter_screen(&mut out, Mouse::Capture).expect("enter screen");
+        let entered = String::from_utf8(out).expect("utf8");
+        assert!(
+            entered.contains("\x1b[?1049h"),
+            "alternate screen on: {entered:?}"
+        );
+        for mouse_mode in ["?1000h", "?1006h"] {
+            assert!(
+                entered.contains(mouse_mode),
+                "mouse mode {mouse_mode} not sent: {entered:?}"
+            );
+        }
+        let mut out = Vec::new();
+        leave_screen(&mut out, Mouse::Capture).expect("leave screen");
+        let left = String::from_utf8(out).expect("utf8");
+        for mouse_mode in ["?1000l", "?1006l"] {
+            assert!(
+                left.contains(mouse_mode),
+                "mouse mode {mouse_mode} not turned off: {left:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_logo_preview_leaves_mouse_reporting_off() {
+        let mut out = Vec::new();
+        enter_screen(&mut out, Mouse::Off).expect("enter screen");
+        leave_screen(&mut out, Mouse::Off).expect("leave screen");
         let out = String::from_utf8(out).expect("utf8");
         assert!(out.contains("\x1b[?1049h"), "alternate screen on: {out:?}");
         for mouse_mode in ["?1000h", "?1002h", "?1003h", "?1006h"] {

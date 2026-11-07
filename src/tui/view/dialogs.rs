@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use super::pairs::{LinkKind, Tally};
 use super::{SYMLINK_BREAKS, format_size, pad, sentence, trim_keep_name, wrap_text};
-use crate::tui::app::{App, ConfigEditor, ConfigField, ConfirmLinkMode, LinkCheck};
+use crate::tui::app::{App, Click, ConfigEditor, ConfigField, ConfirmLinkMode, LinkCheck};
 use crate::tui::theme::Theme;
 
 /// A dialog's frame: rounded, in the focus colour, its title on top and its
@@ -23,6 +23,7 @@ fn frame_block(title: &str, keys: &[(&str, &str)], primary: bool) -> Block<'stat
         } else {
             Theme::key_chip()
         };
+        // `border_key_cells` counts this padding: change both together.
         spans.push(Span::styled(format!(" {key} "), style));
         spans.push(Span::styled(format!(" {label} "), Theme::popup()));
     }
@@ -36,6 +37,45 @@ fn frame_block(title: &str, keys: &[(&str, &str)], primary: bool) -> Block<'stat
         )))
         .title_bottom(Line::from(spans).right_aligned())
         .style(Theme::popup())
+}
+
+/// The cells a key and its label take on a dialog's border, as
+/// `frame_block` pads them: ` key ` then ` label `.
+fn border_key_cells(key: &str, label: &str) -> usize {
+    super::width_of(key) + super::width_of(label) + 4
+}
+
+/// Make the keys `frame_block` puts on the bottom border of a dialog drawn
+/// in `area` clickable, each with its label. They sit right-aligned between
+/// the border's corners; keys too wide for that room lose their left end, as
+/// ratatui draws them, so each spot stays under the key it shows.
+fn add_key_clicks(app: &App, area: Rect, keys: &[(&str, &str)]) {
+    let inner_left = i32::from(area.x) + 1;
+    let inner_right = i32::from(area.right()) - 1;
+    let widths: Vec<i32> = keys
+        .iter()
+        .map(|(key, label)| i32::try_from(border_key_cells(key, label)).unwrap_or(i32::MAX / 4))
+        .collect();
+    let mut x = inner_right - widths.iter().sum::<i32>();
+    let y = area.bottom().saturating_sub(1);
+    for ((key, _), width) in keys.iter().zip(widths) {
+        let (start, end) = (x.max(inner_left), (x + width).min(inner_right));
+        x += width;
+        if let (Some(code), Ok(start), Ok(width)) = (
+            super::key_code(key),
+            u16::try_from(start),
+            u16::try_from(end - start),
+        ) && width > 0
+        {
+            let spot = Rect {
+                x: start,
+                y,
+                width,
+                height: 1,
+            };
+            app.view_sizes().add_click(spot, Click::Key(code));
+        }
+    }
 }
 
 /// A dialog `width` columns wide (within the screen) and as tall as `rows`
@@ -197,6 +237,19 @@ fn help_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         lines.push(key_line(key, meaning));
     }
     lines.push(Line::raw(""));
+    lines.push(section("Mouse"));
+    lines.push(Line::raw(""));
+    for (key, meaning) in [
+        (
+            "Click",
+            "select a pair, or press a key shown at the bottom or on a dialog",
+        ),
+        ("Wheel", "move through the pairs, or scroll this help"),
+        ("Shift-drag", "select text to copy, in most terminals"),
+    ] {
+        lines.push(key_line(key, meaning));
+    }
+    lines.push(Line::raw(""));
     lines.push(section("Settings"));
     lines.push(Line::raw(""));
     for (name, value) in [
@@ -282,6 +335,8 @@ fn render_scrolling(
     sizes.overlay_lines.set(lines.len());
     let scroll = app.overlay_scroll().min(lines.len().saturating_sub(shown));
     let mut block = frame_block(title, keys, false);
+    add_key_clicks(app, area, keys);
+    sizes.dialog.set(Some(area));
     if lines.len() > shown {
         block = block.title_bottom(
             Line::from(Span::styled(
@@ -400,6 +455,7 @@ pub(super) fn render_config_editor(frame: &mut Frame, app: &App, editor: &Config
         ("Esc", "cancel"),
     ];
     let block = frame_block("Choose folders", &keys, saving);
+    add_key_clicks(app, area, &keys);
     show(frame, area, block, lines);
 }
 
@@ -488,22 +544,22 @@ pub(super) fn render_confirm_link(frame: &mut Frame, app: &App, mode: ConfirmLin
         .into_iter()
         .map(|line| Line::from(Span::styled(line, Theme::popup())))
         .collect();
-    let block = frame_block(&title, &[("y", answer.as_str()), ("n", "cancel")], true);
+    let keys = [("y", answer.as_str()), ("n", "cancel")];
+    let block = frame_block(&title, &keys, true);
+    add_key_clicks(app, area, &keys);
     show(frame, area, block, lines);
 }
 
-pub(super) fn render_confirm_rescan(frame: &mut Frame) {
+pub(super) fn render_confirm_rescan(frame: &mut Frame, app: &App) {
     let text = "This clears the cache, so every file in both folders is read again, as on a first run. On a network drive that can take hours.\n\nS scans reading only what changed.";
     let (area, wrapped) = dialog_for(frame.area(), 64, text);
     let lines = wrapped
         .into_iter()
         .map(|line| Line::from(Span::styled(line, Theme::popup())))
         .collect();
-    let block = frame_block(
-        "Scan everything again?",
-        &[("y", "clear and scan"), ("n", "cancel")],
-        false,
-    );
+    let keys = [("y", "clear and scan"), ("n", "cancel")];
+    let block = frame_block("Scan everything again?", &keys, false);
+    add_key_clicks(app, area, &keys);
     show(frame, area, block, lines);
 }
 
@@ -519,6 +575,7 @@ pub(super) fn render_notice(frame: &mut Frame, app: &App, message: &str) {
         &[("Esc", "close")]
     };
     let block = frame_block("Not now", keys, false);
+    add_key_clicks(app, area, keys);
     show(frame, area, block, lines);
 }
 
