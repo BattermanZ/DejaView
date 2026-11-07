@@ -13,7 +13,7 @@ use super::{
     sentence, take_top, trim_keep_name, visible_row_window,
 };
 use crate::protocol::{LinkMethod, Phase};
-use crate::tui::app::App;
+use crate::tui::app::{App, Click};
 use crate::tui::layout;
 use crate::tui::model::LinkReportEntry;
 use crate::tui::theme::Theme;
@@ -422,6 +422,23 @@ pub(super) fn render_pairs(frame: &mut Frame, area: Rect, app: &App) {
         .filter(|item| matches!(item, Item::Pair { .. }))
         .count();
     app.view_sizes().result_rows.set(pairs_shown.max(1));
+
+    // A click on a pair selects it, and one on a release heading selects
+    // the first episode under it.
+    for offset in 0..end - start {
+        let index = items[start + offset..].iter().find_map(|item| match item {
+            Item::Pair { index, .. } => Some(*index),
+            Item::Folder { .. } => None,
+        });
+        if let (Some(index), Ok(line_offset)) = (index, u16::try_from(offset)) {
+            let line = Rect {
+                y: list.y + line_offset,
+                height: 1,
+                ..list
+            };
+            app.view_sizes().add_click(line, Click::Row(index));
+        }
+    }
 
     let rows = app.rows();
     let lines: Vec<Line> = items[start..end]

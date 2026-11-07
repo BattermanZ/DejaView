@@ -216,6 +216,8 @@ Above the rows, the space a link run would free, or the space it freed, is drawn
 | `?` | Help |
 | `q` | Close an overlay, or quit when no run is active |
 
+The mouse works too: click a pair to select it, or a key in the footer or on a dialog to press it, and use the wheel to move through the pairs or scroll Help and the JSON preview. A click outside Help or the JSON preview closes it. The dashboard takes the mouse, so to select text, hold Shift while dragging, as most terminals allow.
+
 After `l` links a row, the selection moves to the next planned row, so a list can be linked row by row.
 
 Cancelling a scan stops it almost at once, even partway through a large file, and keeps every hash already finished in the cache, so the next scan picks up where it stopped. Cancelling a link stops before the next file: files already linked stay linked and the rest stay planned. Quitting is blocked while a run is active, so cancel first.
