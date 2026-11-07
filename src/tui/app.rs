@@ -15,6 +15,7 @@ use crate::protocol::{Mode, Phase, PlannedPair};
 
 use super::actions;
 use super::events::{self, Event};
+use super::live_runs;
 use super::model::{LinkReportEntry, TuiEvent};
 use super::run_state::{JobKind, RunState, Step};
 
@@ -197,13 +198,23 @@ pub(crate) type Spawner = Box<dyn FnMut(JobRequest, Sender<Result<TuiEvent>>, Re
 #[cfg_attr(test, allow(dead_code))]
 fn spawn_child_run(request: JobRequest, events: Sender<Result<TuiEvent>>, cancel: Receiver<()>) {
     thread::spawn(move || {
+        // The run stops on the dashboard's cancel or on the terminal watch's,
+        // whichever comes first. It stays listed until it has ended and
+        // removed its plan file, so the watch waits for both.
+        let (stop, stop_rx) = mpsc::channel();
+        let _live = live_runs::ALL.register(stop.clone());
+        thread::spawn(move || {
+            if cancel.recv().is_ok() {
+                let _ = stop.send(());
+            }
+        });
         let _ = match request {
-            JobRequest::Scan { strict } => actions::run_scan(strict, events, cancel),
+            JobRequest::Scan { strict } => actions::run_scan(strict, events, stop_rx),
             JobRequest::Link {
                 strict,
                 downloads,
                 pairs,
-            } => actions::run_link_pairs(strict, &downloads, &pairs, events, cancel),
+            } => actions::run_link_pairs(strict, &downloads, &pairs, events, stop_rx),
         };
     });
 }

@@ -3,9 +3,11 @@ mod app;
 mod bignum;
 mod events;
 mod layout;
+mod live_runs;
 mod model;
 mod preview;
 mod run_state;
+mod terminal_watch;
 mod theme;
 mod view;
 mod wordmark;
@@ -87,6 +89,8 @@ pub fn run(config: &Config, strict: bool) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    terminal_watch::start();
+
     let mut app = app::App::new(config, strict);
     let run_result = (|| -> Result<()> {
         loop {
@@ -97,6 +101,9 @@ pub fn run(config: &Config, strict: bool) -> Result<()> {
             }
         }
     })();
+    if run_result.is_err() {
+        terminal_watch::exit_if_gone();
+    }
 
     terminal.show_cursor()?;
     guard.restore()?;
@@ -115,7 +122,11 @@ pub fn run_logo_preview() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    terminal_watch::start();
     let run_result = preview::run(&mut terminal);
+    if run_result.is_err() {
+        terminal_watch::exit_if_gone();
+    }
 
     terminal.show_cursor()?;
     guard.restore()?;
