@@ -35,18 +35,21 @@ pub(super) fn print_warning(message: impl std::fmt::Display) {
     print_err(format_args!("{} {message}", "⚠".yellow()));
 }
 
-/// The plan for a person: the two folders once, then one row per pair with
+/// The plan for a person: the folders once, then one row per pair with
 /// paths below them, or that there is nothing to do.
 pub(super) fn print_plan(
     audience: Audience,
     actions: &[LinkAction],
     downloads: &Path,
-    media: &Path,
+    media: &[PathBuf],
     bytes: u64,
 ) {
     let say = |line: String| print_out(audience, line);
     say(format!("Downloads: {}", downloads.display()));
-    say(format!("Media:     {}", media.display()));
+    for (i, folder) in media.iter().enumerate() {
+        let label = if i == 0 { "Media:" } else { "" };
+        say(format!("{label:<10} {}", folder.display()));
+    }
     if actions.is_empty() {
         say(format!("{} No duplicates found.", "✔".green()));
         return;
@@ -350,7 +353,16 @@ pub(super) fn build_run_report(options: &ScanRunOptions<'_>, input: RunReportInp
         started_at: crate::human::rfc3339_utc(input.started_at),
         finished_at: crate::human::rfc3339_utc(std::time::SystemTime::now()),
         downloads: input.downloads.display().to_string(),
-        media: input.media.display().to_string(),
+        media: input
+            .media
+            .first()
+            .map(|folder| folder.display().to_string())
+            .unwrap_or_default(),
+        media_folders: input
+            .media
+            .iter()
+            .map(|folder| folder.display().to_string())
+            .collect(),
         link_mode: options.link_mode,
         dry_run: options.dry_run,
         strict: options.strict,
@@ -386,7 +398,7 @@ pub(super) struct RunReportInput<'a> {
     pub(super) outcome: Outcome,
     pub(super) started_at: std::time::SystemTime,
     pub(super) downloads: &'a Path,
-    pub(super) media: &'a Path,
+    pub(super) media: &'a [PathBuf],
     pub(super) files_seen: usize,
     pub(super) planned_actions: usize,
     pub(super) planned_bytes: u64,

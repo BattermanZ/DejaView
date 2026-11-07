@@ -140,8 +140,11 @@ struct ConfigArgs {
 enum ConfigCommands {
     /// Set the downloads path
     SetDownloads { path: PathBuf },
-    /// Set the media path
-    SetMedia { path: PathBuf },
+    /// Set the library folder, or several: each folder Sonarr or Radarr imports into. Replaces the list
+    SetMedia {
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<PathBuf>,
+    },
     /// Show the current configuration
     Show,
     /// Set the minimum file age in seconds before considering files
@@ -355,10 +358,21 @@ fn run_cli() -> Result<ExitCode> {
                     save_config(&config)?;
                     println!("{} Downloads path set.", "✔".green());
                 }
-                ConfigCommands::SetMedia { path } => {
-                    config.media = Some(normalize_runtime_dir(&path)?);
+                ConfigCommands::SetMedia { paths } => {
+                    config.media = paths
+                        .iter()
+                        .map(|path| normalize_runtime_dir(path))
+                        .collect::<Result<_>>()?;
                     save_config(&config)?;
-                    println!("{} Media path set.", "✔".green());
+                    if config.media.len() == 1 {
+                        println!("{} Media path set.", "✔".green());
+                    } else {
+                        println!(
+                            "{} {} library folders set.",
+                            "✔".green(),
+                            config.media.len()
+                        );
+                    }
                 }
                 ConfigCommands::Show => {
                     println!("{}", serde_json::to_string_pretty(&config)?);
@@ -572,8 +586,9 @@ fn effective_link_mode(config: &config::Config, symlink_only: bool) -> LinkMode 
     }
 }
 
-/// `config validate`: the check every run makes, then a walk of both folders
-/// for a second mount, then one real hardlink. Every problem is listed.
+/// `config validate`: the check every run makes, then a walk of every folder
+/// for a second mount, then one real hardlink into each library folder.
+/// Every problem is listed.
 fn validate_config(config: &config::Config) -> Result<()> {
     let failures = match config::check(config) {
         Ok(folders) => match engine::ensure_roots_not_mounted_inside(
@@ -582,7 +597,9 @@ fn validate_config(config: &config::Config) -> Result<()> {
             config.effective_exclude(),
         ) {
             Ok(()) => {
-                report_hardlink_probe(&folders.downloads, &folders.media);
+                for folder in &folders.media {
+                    report_hardlink_probe(&folders.downloads, folder);
+                }
                 println!("{} Configuration is valid.", "✔".green());
                 return Ok(());
             }
@@ -601,9 +618,11 @@ fn validate_config(config: &config::Config) -> Result<()> {
 /// person should know which cause applies and whether they can fix it.
 fn report_hardlink_probe(downloads: &std::path::Path, media: &std::path::Path) {
     match engine::probe_hardlink(downloads, media) {
-        engine::HardlinkProbe::NoFile => {
-            println!("{} No library file to try a hardlink with yet.", "ℹ".cyan())
-        }
+        engine::HardlinkProbe::NoFile => println!(
+            "{} No file in {} to try a hardlink with yet.",
+            "ℹ".cyan(),
+            media.display()
+        ),
         engine::HardlinkProbe::Works { file, leftover } => {
             println!(
                 "{} A test hardlink of {} into downloads worked: hardlinks work, so link runs free space. On a mergerfs pool this tried one disk; files on others can still fall back to symlinks.",

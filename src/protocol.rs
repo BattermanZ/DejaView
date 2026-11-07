@@ -282,11 +282,15 @@ pub struct RunReport {
     pub started_at: String,
     #[serde(default)]
     pub finished_at: String,
-    /// The downloads and media folders the run used.
+    /// The downloads and media folders the run used. With several library
+    /// folders `media` is the first, kept for scripts written before there
+    /// could be more; `media_folders` lists them all.
     #[serde(default)]
     pub downloads: String,
     #[serde(default)]
     pub media: String,
+    #[serde(default)]
+    pub media_folders: Vec<String>,
     /// `best` (hardlink, else symlink) or `symlink-only`.
     #[serde(default)]
     pub link_mode: LinkMode,
@@ -492,6 +496,7 @@ mod tests {
             finished_at: "2026-11-06T03:17:42Z".to_string(),
             downloads: "/srv/downloads".to_string(),
             media: "/srv/media".to_string(),
+            media_folders: vec!["/srv/media".to_string()],
             link_mode: LinkMode::Best,
             dry_run: false,
             strict: false,

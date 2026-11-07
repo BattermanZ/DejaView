@@ -9,7 +9,10 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use super::pairs::{LinkKind, Tally};
 use super::{SYMLINK_BREAKS, format_size, pad, sentence, trim_keep_name, wrap_text};
-use crate::tui::app::{App, Click, ConfigEditor, ConfigField, ConfirmLinkMode, LinkCheck};
+use crate::tui::app::{
+    App, Click, ConfigEditor, ConfigField, ConfirmLinkMode, LinkCheck, combined_link_check,
+    short_cause,
+};
 use crate::tui::theme::Theme;
 
 /// A dialog's frame: rounded, in the focus colour, its title on top and its
@@ -358,15 +361,57 @@ fn render_scrolling(
 }
 
 /// What the test hardlink between the saved folders showed, for the editor.
-fn link_check_lines(check: &LinkCheck, width: usize) -> Vec<Line<'static>> {
-    let Some(summary) = check.summary() else {
+fn link_check_lines(checks: &[(String, LinkCheck)], width: usize) -> Vec<Line<'static>> {
+    let combined = combined_link_check(checks);
+    let Some(summary) = combined.summary() else {
         return plain(
-            "Saving tries one hardlink between the two folders, to tell whether links will be hardlinks or symlinks.",
+            "Saving tries one hardlink between downloads and each library folder, to tell whether links will be hardlinks or symlinks.",
             width,
             Theme::popup_dim(),
         );
     };
-    let (mark, style) = match check {
+    // One line per library folder, once each has its own answer.
+    let per_folder = checks.len() > 1
+        && !matches!(
+            combined,
+            LinkCheck::Testing | LinkCheck::Refused { .. } | LinkCheck::SymlinkOnly
+        );
+    if !per_folder {
+        let (mark, style) = check_mark(&combined);
+        return plain(&format!("{mark}Saved folders: {summary}."), width, style);
+    }
+    let name_width = checks
+        .iter()
+        .map(|(name, _)| super::width_of(name))
+        .max()
+        .unwrap_or(0)
+        + 2;
+    checks
+        .iter()
+        .map(|(name, check)| {
+            let (mark, style) = check_mark(check);
+            let what = match check {
+                LinkCheck::Hardlinks => "hardlinks work".to_string(),
+                LinkCheck::Symlinks { cause, .. } => {
+                    format!("symlinks: {}", short_cause(cause))
+                }
+                LinkCheck::NoLibraryFile => "no library file to test with yet".to_string(),
+                other => other.summary().unwrap_or_default(),
+            };
+            Line::from(vec![
+                Span::styled(pad(name, name_width), Theme::popup_strong()),
+                Span::styled(
+                    super::cut(&format!("{mark}{what}"), width.saturating_sub(name_width)),
+                    style,
+                ),
+            ])
+        })
+        .collect()
+}
+
+/// The mark and colour a test hardlink's answer is shown in.
+fn check_mark(check: &LinkCheck) -> (&'static str, Style) {
+    match check {
         LinkCheck::Hardlinks => ("✓ ", Theme::on_popup(Theme::hardlinked())),
         LinkCheck::Symlinks { .. } | LinkCheck::SymlinkOnly => {
             ("! ", Theme::on_popup(Theme::symlinked()))
@@ -375,20 +420,31 @@ fn link_check_lines(check: &LinkCheck, width: usize) -> Vec<Line<'static>> {
         LinkCheck::Untested | LinkCheck::Testing | LinkCheck::NoLibraryFile => {
             ("", Theme::popup_dim())
         }
-    };
-    plain(&format!("{mark}Saved folders: {summary}."), width, style)
+    }
 }
 
 /// A field of the editor: its name and what it is for, then its text, the
 /// end kept in view as it is typed.
 fn field(name: &str, purpose: &str, value: &str, active: bool, width: usize) -> Vec<Line<'static>> {
-    let heading = Line::from(vec![
+    vec![
+        field_heading(name, purpose, width),
+        input_line(value, active, width),
+    ]
+}
+
+/// A field's name and what it is for.
+fn field_heading(name: &str, purpose: &str, width: usize) -> Line<'static> {
+    Line::from(vec![
         Span::styled(pad(name, 11), Theme::popup_strong()),
         Span::styled(
             super::cut(purpose, width.saturating_sub(11)),
             Theme::popup_dim(),
         ),
-    ]);
+    ])
+}
+
+/// One line of typed text, the end kept in view as it is typed.
+fn input_line(value: &str, active: bool, width: usize) -> Line<'static> {
     let room = width.saturating_sub(3);
     let shown = if super::width_of(value) > room {
         // The end of what is typed stays in view.
@@ -408,7 +464,7 @@ fn field(name: &str, purpose: &str, value: &str, active: bool, width: usize) -> 
         " ".repeat(width.saturating_sub(used)),
         Theme::input(active),
     ));
-    vec![heading, Line::from(input)]
+    Line::from(input)
 }
 
 pub(super) fn render_config_editor(frame: &mut Frame, app: &App, editor: &ConfigEditor) {
@@ -425,15 +481,20 @@ pub(super) fn render_config_editor(frame: &mut Frame, app: &App, editor: &Config
         room,
     );
     lines.push(Line::raw(""));
-    lines.extend(field(
+    lines.push(field_heading(
         "Library",
         "where Sonarr and Radarr import your movies and shows",
-        &editor.media,
-        editor.active_field == ConfigField::Media,
         room,
     ));
+    for (line, value) in editor.library.iter().enumerate() {
+        lines.push(input_line(
+            value,
+            editor.active_field == ConfigField::Library(line),
+            room,
+        ));
+    }
     lines.push(Line::raw(""));
-    lines.extend(link_check_lines(app.link_check(), room));
+    lines.extend(link_check_lines(app.link_checks(), room));
     // An error is read whole, however long.
     if let Some(error) = &editor.error {
         lines.push(Line::raw(""));
@@ -441,17 +502,17 @@ pub(super) fn render_config_editor(frame: &mut Frame, app: &App, editor: &Config
     }
     lines.push(Line::raw(""));
     let tip = format!(
-        "Full paths to existing folders; ~ is your home folder. Both are checked before they are saved to {}.",
+        "Full paths to existing folders; ~ is your home folder. Type on the empty Library line to add a folder, clear a line to remove it. All are checked before they are saved to {}.",
         crate::config::config_path()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| "the config file".to_string())
     );
     lines.extend(plain(&tip, room, Theme::popup_dim()));
     let area = centred(screen, width, lines.len());
-    let saving = editor.active_field == ConfigField::Media;
+    let saving = matches!(editor.active_field, ConfigField::Library(_));
     let keys = [
         ("Enter", if saving { "save" } else { "next" }),
-        ("Tab", "switch"),
+        ("Tab", "next line"),
         ("Esc", "cancel"),
     ];
     let block = frame_block("Choose folders", &keys, saving);
@@ -758,6 +819,7 @@ mod tests {
         assert!(text.contains("Saving tries one hardlink"), "{text}");
         app.set_link_check_for_test(LinkCheck::Symlinks {
             cause: "different filesystems: two disks",
+            folder: None,
         });
         let text = screen(&app, 120, 40);
         assert!(
@@ -765,6 +827,66 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("links will be symlinks"), "{text}");
+    }
+
+    #[test]
+    fn the_folder_editor_shows_a_line_per_library_folder_and_each_ones_test() {
+        let config = crate::config::Config {
+            downloads: Some("/srv/downloads".into()),
+            media: vec!["/srv/movies".into(), "/srv/tv".into()],
+            ..crate::config::Config::default()
+        };
+        let mut app = App::new(&config, false);
+        press(&mut app, KeyCode::Char('e'));
+        app.set_link_checks_for_test(vec![
+            ("movies".to_string(), LinkCheck::Hardlinks),
+            (
+                "tv".to_string(),
+                LinkCheck::Symlinks {
+                    cause: "different filesystems: two disks",
+                    folder: None,
+                },
+            ),
+        ]);
+        let text = screen(&app, 120, 40);
+        let lines: Vec<&str> = text.lines().collect();
+        let row = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}:\n{text}"))
+        };
+        let (movies, tv) = (row(" /srv/movies"), row(" /srv/tv"));
+        assert_eq!(tv, movies + 1, "one line each:\n{text}");
+        // Below them, the empty line to add one, where the cursor goes,
+        // then the blank row above the test results.
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
+        let typing = screen(&app, 120, 40);
+        assert!(
+            typing
+                .lines()
+                .nth(tv + 1)
+                .is_some_and(|line| line.contains("▏")),
+            "the cursor on the empty line:\n{typing}"
+        );
+        assert_eq!(
+            row("movies  ✓"),
+            tv + 3,
+            "an empty line to add one:\n{text}"
+        );
+        assert!(text.contains("movies  ✓ hardlinks work"), "{text}");
+        assert!(
+            text.contains("tv      ! symlinks: different filesystems"),
+            "{text}"
+        );
+        assert!(text.contains("Type on the empty Library"), "{text}");
+        // The line above the pairs names the folder whose test failed.
+        assert!(
+            text.contains("A test hardlink into tv failed (different filesystems)"),
+            "{text}"
+        );
     }
 
     #[test]

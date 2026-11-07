@@ -810,7 +810,7 @@ mod tests {
     }
 
     fn keys() -> CacheKeys {
-        CacheKeys::new(Path::new("/dl"), Path::new("/media"))
+        CacheKeys::new(Path::new("/dl"), &[Path::new("/media")])
     }
 
     fn key(file: &FileInfo) -> String {

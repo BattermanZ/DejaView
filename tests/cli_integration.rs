@@ -2174,3 +2174,136 @@ fn a_cache_that_cannot_be_parsed_is_logged_and_replaced() {
         .collect();
     assert_eq!(keys, ["downloads/a.mkv", "media/a.mkv"]);
 }
+
+fn set_library(root: &Path, folders: &[&Path]) {
+    let mut args = vec!["config", "set-media"];
+    args.extend(
+        folders
+            .iter()
+            .map(|folder| folder.to_str().expect("folder str")),
+    );
+    run_ok(root, &args);
+}
+
+#[test]
+fn downloads_are_matched_against_every_library_folder() {
+    let root = TempDir::new("several_library_folders");
+    let downloads = root.join("downloads");
+    let movies = root.join("movies");
+    let tv = root.join("tv");
+    fs::create_dir_all(downloads.join("Show.S01")).expect("create downloads");
+    fs::create_dir_all(movies.join("Movie (2020)")).expect("create movies");
+    fs::create_dir_all(tv.join("Show").join("Season 1")).expect("create tv");
+    fs::write(downloads.join("Movie.2020.mkv"), b"the movie").expect("write");
+    fs::write(
+        movies.join("Movie (2020)").join("Movie (2020).mkv"),
+        b"the movie",
+    )
+    .expect("write");
+    fs::write(
+        downloads.join("Show.S01").join("e1.mkv"),
+        b"the first episode",
+    )
+    .expect("write");
+    let episode = tv.join("Show").join("Season 1").join("Show - S01E01.mkv");
+    fs::write(&episode, b"the first episode").expect("write");
+
+    configure_small_files(&root, &downloads, &movies);
+    set_library(&root, &[&movies, &tv]);
+    run_ok(&root, &["config", "validate"]);
+
+    let out = run_cmd(&root, &["link", "--json", "--no-progress"]);
+    assert!(
+        out.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("report json");
+    assert_eq!(report["applied_actions"], 2, "{report:#}");
+    assert_eq!(report["media"], movies.to_str().expect("movies str"));
+    assert_eq!(
+        report["media_folders"],
+        serde_json::json!([movies.to_str().expect("str"), tv.to_str().expect("str")])
+    );
+    let download = downloads.join("Show.S01").join("e1.mkv");
+    assert_eq!(
+        fs::metadata(&download).expect("download").ino(),
+        fs::metadata(&episode).expect("episode").ino(),
+        "the episode download is now the tv library file"
+    );
+    // The library only gained a second name for each file.
+    assert_eq!(fs::read(&episode).expect("episode"), b"the first episode");
+    assert_eq!(
+        fs::read_dir(tv.join("Show").join("Season 1"))
+            .expect("tv")
+            .count(),
+        1
+    );
+
+    let cache: serde_json::Value =
+        serde_json::from_slice(&fs::read(downloads.join(".dejaview_cache.json")).expect("cache"))
+            .expect("cache json");
+    let mut keys: Vec<&String> = cache.as_object().expect("cache object").keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "downloads/Movie.2020.mkv",
+            "downloads/Show.S01/e1.mkv",
+            "library/movies/Movie (2020)/Movie (2020).mkv",
+            "library/tv/Show/Season 1/Show - S01E01.mkv",
+        ]
+    );
+}
+
+#[test]
+fn adding_or_removing_a_library_folder_reads_no_file_again() {
+    let root = TempDir::new("library_folder_added");
+    let downloads = root.join("downloads");
+    let movies = root.join("movies");
+    let tv = root.join("tv");
+    for dir in [&downloads, &movies, &tv] {
+        fs::create_dir_all(dir).expect("create folder");
+    }
+    fs::write(downloads.join("movie.mkv"), b"the movie").expect("write");
+    fs::write(movies.join("movie.mkv"), b"the movie").expect("write");
+    fs::write(downloads.join("episode.mkv"), b"the first episode").expect("write");
+    fs::write(tv.join("episode.mkv"), b"the first episode").expect("write");
+    configure_small_files(&root, &downloads, &movies);
+
+    let first = paths_read_by_scan(&root);
+    assert!(
+        first.iter().any(|read| read.contains("movies/movie.mkv")),
+        "{first:?}"
+    );
+
+    set_library(&root, &[&movies, &tv]);
+    let added = paths_read_by_scan(&root);
+    assert!(
+        added.iter().all(|read| read.contains("episode.mkv")),
+        "only the new pair is read: {added:?}"
+    );
+    assert!(!added.is_empty(), "the new pair is read");
+
+    set_library(&root, &[&movies]);
+    let removed = paths_read_by_scan(&root);
+    assert!(removed.is_empty(), "nothing is read again: {removed:?}");
+}
+
+#[test]
+fn a_scan_refuses_two_library_folders_with_one_name() {
+    let root = TempDir::new("library_same_name");
+    let downloads = root.join("downloads");
+    let first = root.join("a").join("movies");
+    let second = root.join("b").join("movies");
+    for dir in [&downloads, &first, &second] {
+        fs::create_dir_all(dir).expect("create folder");
+    }
+    configure_small_files(&root, &downloads, &first);
+    set_library(&root, &[&first, &second]);
+    let out = run_cmd(&root, &["scan"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("both named movies"), "{stderr}");
+}

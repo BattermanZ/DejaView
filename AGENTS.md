@@ -20,7 +20,7 @@ change that breaks one is wrong whatever else it fixes.
   `ensure_source_outside_media_root` in `src/engine/linking.rs` guard it, and
   `nested_media_root_is_rejected_and_library_is_untouched` in
   `tests/cli_integration.rs` holds it. Both guards compare paths, so the walk
-  in `src/engine/collect.rs` also refuses a directory with the other root's
+  in `src/engine/collect.rs` also refuses a directory with another root's
   device and inode (a bind mount), and planning in `linking.rs` skips a
   download that is a library file seen through a second mount (a mergerfs
   branch). `library_bind_mounted_inside_downloads_is_refused` holds the first
@@ -176,8 +176,8 @@ terminal; say so in the pull request when you could not.
   `src/config.rs` is the one check a configuration passes, for `config
   validate`, every run and the dashboard's path editor: a new requirement on
   the folders goes there.
-- `src/engine/` does the work, in this order: `collect.rs` walks both roots
-  and groups files by size, `hashing.rs` hashes them (a quick hash of the
+- `src/engine/` does the work, in this order: `collect.rs` walks downloads
+  and every library folder and groups files by size, `hashing.rs` hashes them (a quick hash of the
   first and last MiB, a full hash only when quick hashes collide), `cache.rs`
   keeps hashes between runs, `linking.rs` plans and applies, `report.rs`
   writes the report.

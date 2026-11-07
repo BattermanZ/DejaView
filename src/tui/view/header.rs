@@ -339,7 +339,7 @@ fn caption(app: &App) -> (Line<'static>, Line<'static>) {
         };
         return (Line::from(left), right);
     }
-    let left = link_check_line(app.link_check()).unwrap_or_else(|| {
+    let left = link_check_line(&app.link_check()).unwrap_or_else(|| {
         Line::from(Span::styled(
             if app.planned_actions() > 0 {
                 "Nothing freed yet"
@@ -508,7 +508,7 @@ fn render_intro(frame: &mut Frame, area: Rect, app: &App) {
         .into_iter()
         .map(|line| Line::from(Span::styled(line, Theme::muted()))),
     );
-    if let Some(check) = link_check_line(app.link_check()) {
+    if let Some(check) = link_check_line(&app.link_check()) {
         lines.push(Line::raw(""));
         lines.push(check);
     }
@@ -648,7 +648,7 @@ mod tests {
     fn a_link_run_with_every_kind_keeps_its_unlinked_pairs_in_view() {
         let config = crate::config::Config {
             downloads: Some("/dl".into()),
-            media: Some("/media".into()),
+            media: vec!["/media".into()],
             ..crate::config::Config::default()
         };
         let mut app = App::new(&config, false);
@@ -685,7 +685,7 @@ mod tests {
     fn a_scan_with_planned_symlinks_counts_them_apart() {
         let config = crate::config::Config {
             downloads: Some("/dl".into()),
-            media: Some("/media".into()),
+            media: vec!["/media".into()],
             ..crate::config::Config::default()
         };
         let mut app = App::new(&config, false);

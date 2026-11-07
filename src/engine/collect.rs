@@ -197,29 +197,45 @@ fn lexical_join(base: &Path, rel: &Path) -> PathBuf {
     out
 }
 
-/// A symlink in downloads that points into the library and no longer resolves:
-/// most likely a link DejaView made whose library file Sonarr or Radarr has
-/// since upgraded, renamed or deleted, so its torrent cannot seed.
-fn is_dangling_link_into(link: &Path, media: &RootId) -> bool {
+/// A symlink in downloads that points into a library folder and no longer
+/// resolves: most likely a link DejaView made whose library file Sonarr or
+/// Radarr has since upgraded, renamed or deleted, so its torrent cannot seed.
+fn is_dangling_link_into(link: &Path, library: &[&RootId]) -> bool {
     let Ok(dest) = fs::read_link(link) else {
         return false;
     };
     let parent = link.parent().unwrap_or(Path::new("/"));
-    media.contains(&lexical_join(parent, &dest))
+    let dest = lexical_join(parent, &dest);
+    library.iter().any(|folder| folder.contains(&dest))
         && matches!(fs::metadata(link), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
 }
 
-/// Refuse a directory that is the other root seen through a second mount.
+/// Refuse a directory that is another root seen through a second mount.
 /// Path checks cannot see a bind mount, so the walk compares device and inode:
 /// without this, a library reached from inside downloads is walked as
 /// downloads and its files get rewritten.
-pub(super) fn ensure_not_other_root(dir: &Path, walking: &RootId, other: &RootId) -> Result<()> {
+pub(super) fn ensure_not_other_root(
+    dir: &Path,
+    walking: &RootId,
+    others: &[&RootId],
+) -> Result<()> {
     let meta = match fs::metadata(dir) {
         Ok(meta) => meta,
         // An unreadable directory is the walk's own error to report.
         Err(_) => return Ok(()),
     };
-    if meta.dev() == other.dev && meta.ino() == other.ino {
+    if let Some(other) = others
+        .iter()
+        .find(|other| meta.dev() == other.dev && meta.ino() == other.ino)
+    {
+        if walking.name == "media" && other.name == "media" {
+            return Err(anyhow!(
+                "the library folder {} reaches the library folder {} at {}: the same directory through a second mount, such as a bind mount, so its files would be counted twice. List only one of them, or point them at folders that do not contain each other on disk.",
+                walking.path.display(),
+                other.path.display(),
+                dir.display()
+            ));
+        }
         return Err(anyhow!(
             "the {} folder {} reaches the {} folder {} at {}: the same directory through a second mount, such as a bind mount. DejaView would treat library files as downloads and replace them. Point downloads and media at separate folders that neither contains the other on disk.",
             walking.name,
@@ -232,12 +248,12 @@ pub(super) fn ensure_not_other_root(dir: &Path, walking: &RootId, other: &RootId
     Ok(())
 }
 
-/// Walk only the directories of `walking` and refuse if one of them is `other`.
-/// `config validate` runs this both ways; a scan does the same check as part of
-/// its own walk.
+/// Walk only the directories of `walking` and refuse if one of them is one of
+/// `others`. `config validate` runs this from every root; a scan does the
+/// same check as part of its own walk.
 pub(super) fn ensure_root_not_reached(
     walking: &RootId,
-    other: &RootId,
+    others: &[&RootId],
     exclude: &Exclude,
 ) -> Result<()> {
     for entry in WalkDir::new(&walking.path)
@@ -247,10 +263,23 @@ pub(super) fn ensure_root_not_reached(
     {
         let Ok(entry) = entry else { continue };
         if entry.file_type().is_dir() {
-            ensure_not_other_root(entry.path(), walking, other)?;
+            ensure_not_other_root(entry.path(), walking, others)?;
         }
     }
     Ok(())
+}
+
+/// Every root of a run but `root`: downloads and the other library folders,
+/// which no folder of `root` may be.
+pub(super) fn other_roots<'a>(
+    root: &RootId,
+    downloads: &'a RootId,
+    library: &'a [RootId],
+) -> Vec<&'a RootId> {
+    std::iter::once(downloads)
+        .chain(library.iter())
+        .filter(|other| !std::ptr::eq(*other, root))
+        .collect()
 }
 
 /// What the walk of one root found. Each folder fills its own and merges it
@@ -318,7 +347,8 @@ struct WalkShared {
 /// sized for how many the drive answers at once, not for the CPU.
 struct Walk<'a> {
     root: &'a RootId,
-    other: &'a RootId,
+    /// Every other root of the run, which no folder of this one may be.
+    others: Vec<&'a RootId>,
     in_downloads: bool,
     deadline: SystemTime,
     options: &'a CollectOptions<'a>,
@@ -328,14 +358,14 @@ struct Walk<'a> {
 impl<'a> Walk<'a> {
     fn new(
         root: &'a RootId,
-        other: &'a RootId,
+        others: Vec<&'a RootId>,
         in_downloads: bool,
         min_age: Duration,
         options: &'a CollectOptions<'a>,
     ) -> Self {
         Walk {
             root,
-            other,
+            others,
             in_downloads,
             deadline: SystemTime::now() - min_age,
             options,
@@ -402,13 +432,13 @@ impl<'a> Walk<'a> {
                 }
             };
             if file_type.is_dir() {
-                if let Err(err) = ensure_not_other_root(&path, self.root, self.other) {
+                if let Err(err) = ensure_not_other_root(&path, self.root, &self.others) {
                     shared.stop.set(err);
                     return;
                 }
                 scope.spawn(move |scope| self.walk_folder(scope, shared, path));
             } else if file_type.is_symlink() {
-                if self.in_downloads && is_dangling_link_into(&path, self.other) {
+                if self.in_downloads && is_dangling_link_into(&path, &self.others) {
                     found.dangling_symlinks.push(path);
                 }
             } else if file_type.is_file() && !is_own_file(&name) {
@@ -498,7 +528,7 @@ fn walk_roots(
 ) -> Result<Vec<Vec<FileInfo>>> {
     let shared = WalkShared::default();
     for walk in walks {
-        ensure_not_other_root(&walk.root.path, walk.root, walk.other)?;
+        ensure_not_other_root(&walk.root.path, walk.root, &walk.others)?;
     }
     rayon::scope(|scope| {
         for walk in walks {
@@ -533,15 +563,21 @@ pub(super) fn collect_files(
     warnings: &mut WarningSummary,
     metrics: &mut RunMetrics,
 ) -> Result<Vec<FileInfo>> {
-    let walks = [Walk::new(root, other_root, in_downloads, min_age, options)];
+    let walks = [Walk::new(
+        root,
+        vec![other_root],
+        in_downloads,
+        min_age,
+        options,
+    )];
     let mut files = walk_roots(&walks, warnings, metrics)?;
     Ok(files.pop().unwrap_or_default())
 }
 
-/// Walk downloads and media at once, on `pool`.
-pub(super) fn collect_run_files(
+/// Walk downloads and every library folder at once, on `pool`.
+pub(super) fn collect_run_files<P: AsRef<Path>>(
     downloads: &Path,
-    media: &Path,
+    media: &[P],
     min_age: Duration,
     options: CollectOptions<'_>,
     pool: &rayon::ThreadPool,
@@ -564,11 +600,21 @@ pub(super) fn collect_run_files(
     };
 
     let downloads_root = RootId::of("downloads", downloads)?;
-    let media_root = RootId::of("media", media)?;
-    let walks = [
-        Walk::new(&downloads_root, &media_root, true, min_age, &options),
-        Walk::new(&media_root, &downloads_root, false, min_age, &options),
-    ];
+    let library = media
+        .iter()
+        .map(|folder| RootId::of("media", folder.as_ref()))
+        .collect::<Result<Vec<_>>>()?;
+    let mut walks = vec![Walk::new(
+        &downloads_root,
+        other_roots(&downloads_root, &downloads_root, &library),
+        true,
+        min_age,
+        &options,
+    )];
+    for folder in &library {
+        let others = other_roots(folder, &downloads_root, &library);
+        walks.push(Walk::new(folder, others, false, min_age, &options));
+    }
     let files = pool.install(|| walk_roots(&walks, warnings, metrics))?;
 
     if let Some(spinner) = spinner {

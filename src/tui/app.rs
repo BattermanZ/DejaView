@@ -39,15 +39,72 @@ pub enum ConfirmLinkMode {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ConfigField {
     Downloads,
-    Media,
+    /// One line of the library folders, counted from the top.
+    Library(usize),
 }
 
+/// The path editor. Each library folder has a line, and the last line is
+/// always empty: typing there adds a folder. A line cleared stays until the
+/// folders are saved, which leaves it out.
 #[derive(Clone, Debug)]
 pub struct ConfigEditor {
     pub downloads: String,
-    pub media: String,
+    pub library: Vec<String>,
     pub active_field: ConfigField,
     pub error: Option<String>,
+}
+
+impl ConfigEditor {
+    /// Keep one empty line at the end, for the next folder.
+    fn keep_an_empty_last_line(&mut self) {
+        if self.library.last().is_none_or(|line| !line.is_empty()) {
+            self.library.push(String::new());
+        }
+    }
+}
+
+/// The test hardlink's answer for each library folder, by name, and the
+/// lines it logs: what the dashboard's test hardlink sends back.
+pub type LinkChecks = (Vec<(String, LinkCheck)>, Vec<String>);
+
+/// The test hardlink's answer for each library folder, by name, and what
+/// they add up to for one line: the first that needs the person's eye.
+pub fn combined_link_check(checks: &[(String, LinkCheck)]) -> LinkCheck {
+    if let [(_, only)] = checks {
+        return only.clone();
+    }
+    let first = |wanted: fn(&LinkCheck) -> bool| {
+        checks
+            .iter()
+            .map(|(_, check)| check)
+            .find(|check| wanted(check))
+    };
+    let symlinks: Vec<&(String, LinkCheck)> = checks
+        .iter()
+        .filter(|(_, check)| matches!(check, LinkCheck::Symlinks { .. }))
+        .collect();
+    if let (Some((_, LinkCheck::Symlinks { cause, .. })), None) = (
+        symlinks.first(),
+        first(|check| matches!(check, LinkCheck::Refused { .. } | LinkCheck::Testing)),
+    ) {
+        // Name the folders whose test failed, when not all did, and give
+        // the cause only when they share it.
+        let names: Vec<&str> = symlinks.iter().map(|(name, _)| name.as_str()).collect();
+        let shared = symlinks
+            .iter()
+            .all(|(_, check)| matches!(check, LinkCheck::Symlinks { cause: other, .. } if other == cause));
+        return LinkCheck::Symlinks {
+            cause: if shared { cause } else { "" },
+            folder: (symlinks.len() < checks.len()).then(|| names.join(" and ")),
+        };
+    }
+    first(|check| matches!(check, LinkCheck::Refused { .. }))
+        .or_else(|| first(|check| matches!(check, LinkCheck::Testing)))
+        .or_else(|| first(|check| matches!(check, LinkCheck::SymlinkOnly)))
+        .or_else(|| first(|check| matches!(check, LinkCheck::Hardlinks)))
+        .or_else(|| first(|check| matches!(check, LinkCheck::NoLibraryFile)))
+        .cloned()
+        .unwrap_or(LinkCheck::Untested)
 }
 
 /// What a test hardlink from the library into downloads showed, as
@@ -61,9 +118,11 @@ pub enum LinkCheck {
     Testing,
     Hardlinks,
     /// The test failed, so link runs will make symlinks; `cause` says why,
-    /// in words a person can act on.
+    /// in words a person can act on. With several library folders, `folder`
+    /// names the one whose test failed, when the others' did not.
     Symlinks {
         cause: &'static str,
+        folder: Option<String>,
     },
     /// The library holds no file to try with yet.
     NoLibraryFile,
@@ -76,6 +135,12 @@ pub enum LinkCheck {
     },
 }
 
+/// The part of a hardlink failure's cause before its explanation:
+/// `different filesystems` of `different filesystems: two disks`.
+pub fn short_cause(cause: &str) -> &str {
+    cause.split(':').next().unwrap_or(cause)
+}
+
 impl LinkCheck {
     /// What link runs will make, in one line, once a test has an answer.
     pub fn summary(&self) -> Option<String> {
@@ -86,10 +151,20 @@ impl LinkCheck {
                 "A test hardlink worked: the folders share a filesystem, so links free space"
                     .to_string()
             }
-            Self::Symlinks { cause } => format!(
-                "A test hardlink failed ({}): links will be symlinks",
-                cause.split(':').next().unwrap_or(cause)
-            ),
+            Self::Symlinks { cause, folder } => {
+                // No cause when the folders' tests failed for different ones;
+                // the path editor gives each.
+                let why = match short_cause(cause) {
+                    "" => String::new(),
+                    cause => format!(" ({cause})"),
+                };
+                match folder {
+                    None => format!("A test hardlink failed{why}: links will be symlinks"),
+                    Some(folder) => format!(
+                        "A test hardlink into {folder} failed{why}: links there will be symlinks"
+                    ),
+                }
+            }
             Self::NoLibraryFile => "No library file to test a hardlink with yet".to_string(),
             Self::SymlinkOnly => {
                 "The link mode is symlink-only: links will be symlinks".to_string()
@@ -264,7 +339,8 @@ pub struct App {
     pub overlay: Overlay,
     logs: VecDeque<String>,
     downloads: Option<PathBuf>,
-    media: Option<PathBuf>,
+    /// The library folders, in the config's order.
+    media: Vec<PathBuf>,
     min_age: Option<u64>,
     min_size: u64,
     threads: usize,
@@ -278,8 +354,9 @@ pub struct App {
     running_job: Option<RunningJob>,
     /// Starts each run; see [`default_spawner`].
     spawner: Spawner,
-    link_check: LinkCheck,
-    link_check_rx: Option<Receiver<(LinkCheck, Vec<String>)>>,
+    /// The test hardlink's answer for each library folder, by name.
+    link_checks: Vec<(String, LinkCheck)>,
+    link_check_rx: Option<Receiver<LinkChecks>>,
     should_quit: bool,
 }
 
@@ -305,7 +382,7 @@ impl App {
             expand_paths: false,
             run: RunState::default(),
             running_job: None,
-            link_check: LinkCheck::Untested,
+            link_checks: Vec::new(),
             link_check_rx: None,
             should_quit: false,
             spawner: default_spawner(),
@@ -464,9 +541,18 @@ impl App {
         self.downloads.as_deref()
     }
 
-    /// The media folder, which the table shows each library file below.
-    pub fn media_root(&self) -> Option<&std::path::Path> {
-        self.media.as_deref()
+    /// The library folders, which the table shows each library file below.
+    pub fn media_roots(&self) -> &[PathBuf] {
+        &self.media
+    }
+
+    /// The library folder `path` is in, if any.
+    pub fn library_folder_of(&self, path: &str) -> Option<&std::path::Path> {
+        let path = std::path::Path::new(path);
+        self.media
+            .iter()
+            .map(PathBuf::as_path)
+            .find(|folder| path.starts_with(folder))
     }
 
     pub fn min_age_secs(&self) -> u64 {
@@ -582,9 +668,9 @@ impl App {
         self.expand_paths
     }
 
-    /// Whether both folders are set.
+    /// Whether downloads and at least one library folder are set.
     pub fn has_paths(&self) -> bool {
-        self.downloads.is_some() && self.media.is_some()
+        self.downloads.is_some() && !self.media.is_empty()
     }
 
     pub fn is_running(&self) -> bool {
@@ -647,8 +733,14 @@ impl App {
             .is_some_and(|job| job.cancel_requested)
     }
 
-    pub fn link_check(&self) -> &LinkCheck {
-        &self.link_check
+    /// What the test hardlinks add up to, for one line.
+    pub fn link_check(&self) -> LinkCheck {
+        combined_link_check(&self.link_checks)
+    }
+
+    /// The test hardlink's answer for each library folder, by name.
+    pub fn link_checks(&self) -> &[(String, LinkCheck)] {
+        &self.link_checks
     }
 
     /// How long the last finished run took, if one finished this session.
@@ -785,12 +877,18 @@ impl App {
     }
 
     fn open_config_editor(&mut self) {
-        self.overlay = Overlay::ConfigEditor(ConfigEditor {
+        let mut editor = ConfigEditor {
             downloads: self.downloads_label_or_empty(),
-            media: self.media_label_or_empty(),
+            library: self
+                .media
+                .iter()
+                .map(|folder| folder.display().to_string())
+                .collect(),
             active_field: ConfigField::Downloads,
             error: None,
-        });
+        };
+        editor.keep_an_empty_last_line();
+        self.overlay = Overlay::ConfigEditor(editor);
     }
 
     /// How far PgUp and PgDn move: the rows the table showed last.
@@ -833,17 +931,18 @@ impl App {
     }
 
     /// Open the path editor when a scan has nowhere to look, saying so in
-    /// the editor, and return false; true when both paths are set.
+    /// the editor, and return false; true when downloads and a library folder
+    /// are set.
     fn paths_are_set_or_ask(&mut self) -> bool {
-        if self.downloads.is_some() && self.media.is_some() {
+        if self.has_paths() {
             return true;
         }
         self.open_config_editor();
         self.set_config_editor_error(
-            "Set the downloads and media folders first: type each path, Tab to switch, Enter to save."
+            "Set the downloads and library folders first: type each path, Tab for the next line, Enter on a Library line to save."
                 .to_string(),
         );
-        self.push_log("Set the downloads and media folders before scanning.".to_string());
+        self.push_log("Set the downloads and library folders before scanning.".to_string());
         false
     }
 
@@ -992,13 +1091,18 @@ impl App {
         Ok(())
     }
 
+    /// Move to the next line, or the one before, round from the last
+    /// library line to downloads and back.
     fn cycle_config_field(&mut self, forward: bool) {
         if let Overlay::ConfigEditor(editor) = &mut self.overlay {
+            let last = editor.library.len().saturating_sub(1);
             editor.active_field = match (editor.active_field, forward) {
-                (ConfigField::Downloads, true) => ConfigField::Media,
-                (ConfigField::Media, true) => ConfigField::Downloads,
-                (ConfigField::Downloads, false) => ConfigField::Media,
-                (ConfigField::Media, false) => ConfigField::Downloads,
+                (ConfigField::Downloads, true) => ConfigField::Library(0),
+                (ConfigField::Library(line), true) if line < last => ConfigField::Library(line + 1),
+                (ConfigField::Library(_), true) => ConfigField::Downloads,
+                (ConfigField::Downloads, false) => ConfigField::Library(last),
+                (ConfigField::Library(0), false) => ConfigField::Downloads,
+                (ConfigField::Library(line), false) => ConfigField::Library(line - 1),
             };
             editor.error = None;
         }
@@ -1011,9 +1115,13 @@ impl App {
         if let Overlay::ConfigEditor(editor) = &mut self.overlay {
             let field = match editor.active_field {
                 ConfigField::Downloads => &mut editor.downloads,
-                ConfigField::Media => &mut editor.media,
+                ConfigField::Library(line) => match editor.library.get_mut(line) {
+                    Some(field) => field,
+                    None => return,
+                },
             };
             update(field);
+            editor.keep_an_empty_last_line();
             editor.error = None;
         }
     }
@@ -1032,18 +1140,27 @@ impl App {
     /// folder reaches the other through a second mount, so the test file is
     /// never made inside the library.
     fn start_link_check(&mut self) {
-        let (Some(downloads), Some(media)) = (self.downloads.clone(), self.media.clone()) else {
+        let Some(downloads) = self.downloads.clone() else {
             return;
         };
+        if self.media.is_empty() {
+            return;
+        }
+        let every_folder = |check: LinkCheck| {
+            self.media
+                .iter()
+                .map(|folder| (crate::config::library_name(folder), check.clone()))
+                .collect()
+        };
         if self.link_mode == LinkMode::SymlinkOnly {
-            self.link_check = LinkCheck::SymlinkOnly;
+            self.link_checks = every_folder(LinkCheck::SymlinkOnly);
             self.link_check_rx = None;
             return;
         }
-        self.link_check = LinkCheck::Testing;
+        self.link_checks = every_folder(LinkCheck::Testing);
         self.link_check_rx = Some(actions::spawn_link_check(
             downloads,
-            media,
+            self.media.clone(),
             self.exclude.clone(),
         ));
     }
@@ -1052,11 +1169,11 @@ impl App {
         let Some(receiver) = &self.link_check_rx else {
             return;
         };
-        let (check, lines) = match receiver.try_recv() {
+        let (checks, lines) = match receiver.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => (
-                LinkCheck::Untested,
+                Vec::new(),
                 vec!["The test hardlink stopped before it could say how it went.".to_string()],
             ),
         };
@@ -1064,7 +1181,7 @@ impl App {
         for line in lines {
             self.push_log(line);
         }
-        self.link_check = check;
+        self.link_checks = checks;
     }
 
     fn save_config_from_editor_with<L, S>(&mut self, load_fn: L, save_fn: S) -> Result<()>
@@ -1115,7 +1232,18 @@ impl App {
                 .map_err(|err| anyhow::anyhow!("{field}: {err:#}"))
         };
         config.downloads = Some(folder("Downloads", &editor.downloads)?);
-        config.media = Some(folder("Media", &editor.media)?);
+        // A cleared line is a folder taken out of the list.
+        config.media = editor
+            .library
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| folder("Library", line))
+            .collect::<Result<_>>()?;
+        if config.media.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Library: type the path of at least one folder Sonarr or Radarr imports into"
+            ));
+        }
         crate::config::check(&config)?;
         Ok(config)
     }
@@ -1128,13 +1256,6 @@ impl App {
 
     fn downloads_label_or_empty(&self) -> String {
         self.downloads
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default()
-    }
-
-    fn media_label_or_empty(&self) -> String {
-        self.media
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default()
@@ -1331,7 +1452,11 @@ impl App {
     }
 
     pub(crate) fn set_link_check_for_test(&mut self, check: LinkCheck) {
-        self.link_check = check;
+        self.link_checks = vec![("media".to_string(), check)];
+    }
+
+    pub(crate) fn set_link_checks_for_test(&mut self, checks: Vec<(String, LinkCheck)>) {
+        self.link_checks = checks;
     }
 
     pub(crate) fn push_log_for_test(&mut self, line: &str) {
@@ -1881,7 +2006,7 @@ mod tests {
     fn config_with_paths() -> Config {
         Config {
             downloads: Some(PathBuf::from("/nonexistent/downloads")),
-            media: Some(PathBuf::from("/nonexistent/media")),
+            media: vec![PathBuf::from("/nonexistent/media")],
             ..Config::default()
         }
     }
@@ -1965,7 +2090,7 @@ mod tests {
             editor
                 .error
                 .as_deref()
-                .is_some_and(|error| error.starts_with("Set the downloads and media folders")),
+                .is_some_and(|error| error.starts_with("Set the downloads and library folders")),
             "{editor:?}"
         );
     }
@@ -2571,8 +2696,8 @@ mod tests {
         let mut app = App::new(&config, false);
         app.overlay = Overlay::ConfigEditor(ConfigEditor {
             downloads: "/does/not/exist".to_string(),
-            media: "/also/missing".to_string(),
-            active_field: ConfigField::Media,
+            library: vec!["/also/missing".to_string(), String::new()],
+            active_field: ConfigField::Library(0),
             error: None,
         });
 
@@ -2595,8 +2720,8 @@ mod tests {
         let mut app = App::new(&Config::default(), false);
         app.overlay = Overlay::ConfigEditor(ConfigEditor {
             downloads: "~".to_string(),
-            media: "/nonexistent/media".to_string(),
-            active_field: ConfigField::Media,
+            library: vec!["/nonexistent/media".to_string(), String::new()],
+            active_field: ConfigField::Library(0),
             error: None,
         });
 
@@ -2609,7 +2734,7 @@ mod tests {
             .and_then(|editor| editor.error.clone())
             .expect("an error");
         assert!(
-            error.starts_with("Media:"),
+            error.starts_with("Library:"),
             "{error} (home {})",
             home.display()
         );
@@ -2627,8 +2752,8 @@ mod tests {
         let mut app = App::new(&config, false);
         app.overlay = Overlay::ConfigEditor(ConfigEditor {
             downloads: downloads.display().to_string(),
-            media: media.display().to_string(),
-            active_field: ConfigField::Media,
+            library: vec![media.display().to_string(), String::new()],
+            active_field: ConfigField::Library(0),
             error: None,
         });
 
@@ -2638,7 +2763,7 @@ mod tests {
             || {
                 Ok(Config {
                     downloads: Some(PathBuf::from("/stale/downloads")),
-                    media: Some(PathBuf::from("/stale/media")),
+                    media: vec![PathBuf::from("/stale/media")],
                     min_age: Some(900),
                     min_size: None,
                     threads: Some(8),
@@ -2665,7 +2790,7 @@ mod tests {
 
         assert!(matches!(app.overlay, Overlay::None));
         assert_eq!(app.downloads, Some(downloads.clone()));
-        assert_eq!(app.media, Some(media.clone()));
+        assert_eq!(app.media, vec![media.clone()]);
         assert_eq!(
             saved
                 .lock()
@@ -2686,6 +2811,154 @@ mod tests {
         );
     }
 
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(code, KeyModifiers::NONE)
+            .expect("key handling should not fail");
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn the_editor_gives_each_library_folder_a_line_and_one_empty_line_to_add_another() {
+        let config = Config {
+            downloads: Some(PathBuf::from("/dl")),
+            media: vec![PathBuf::from("/srv/movies"), PathBuf::from("/srv/tv")],
+            ..Config::default()
+        };
+        let mut app = App::new(&config, false);
+        press(&mut app, KeyCode::Char('e'));
+        let editor = app.config_editor().expect("editor open");
+        assert_eq!(editor.library, vec!["/srv/movies", "/srv/tv", ""]);
+        assert_eq!(editor.active_field, ConfigField::Downloads);
+
+        // Down three times reaches the empty line; typing there adds a line.
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
+        assert_eq!(
+            app.config_editor().expect("editor").active_field,
+            ConfigField::Library(2)
+        );
+        type_text(&mut app, "/srv/anime");
+        let editor = app.config_editor().expect("editor");
+        assert_eq!(
+            editor.library,
+            vec!["/srv/movies", "/srv/tv", "/srv/anime", ""]
+        );
+        // And on round to Downloads, and back up to the last line.
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            app.config_editor().expect("editor").active_field,
+            ConfigField::Downloads
+        );
+        press(&mut app, KeyCode::Up);
+        assert_eq!(
+            app.config_editor().expect("editor").active_field,
+            ConfigField::Library(3)
+        );
+    }
+
+    #[test]
+    fn the_combined_test_hardlink_names_each_failing_folder_and_a_shared_cause_only() {
+        let failed = |cause: &'static str| LinkCheck::Symlinks {
+            cause,
+            folder: None,
+        };
+        let disks = "different filesystems: two disks";
+        let checks = vec![
+            ("movies".to_string(), LinkCheck::Hardlinks),
+            ("tv".to_string(), failed(disks)),
+            ("anime".to_string(), failed(disks)),
+        ];
+        assert_eq!(
+            combined_link_check(&checks).summary().expect("a summary"),
+            "A test hardlink into tv and anime failed (different filesystems): links there will be symlinks"
+        );
+        let checks = vec![
+            ("movies".to_string(), LinkCheck::Hardlinks),
+            ("tv".to_string(), failed(disks)),
+            ("anime".to_string(), failed("not permitted: owner")),
+        ];
+        assert_eq!(
+            combined_link_check(&checks).summary().expect("a summary"),
+            "A test hardlink into tv and anime failed: links there will be symlinks"
+        );
+        // Every folder failing needs no names.
+        let checks = vec![
+            ("tv".to_string(), failed(disks)),
+            ("anime".to_string(), failed(disks)),
+        ];
+        assert_eq!(
+            combined_link_check(&checks).summary().expect("a summary"),
+            "A test hardlink failed (different filesystems): links will be symlinks"
+        );
+    }
+
+    #[test]
+    fn the_editor_saves_every_library_line_and_drops_the_cleared_ones() {
+        let root = TempDir::new("config_editor_several");
+        let downloads = root.join("downloads");
+        let movies = root.join("movies");
+        let tv = root.join("tv");
+        for dir in [&downloads, &movies, &tv] {
+            fs::create_dir_all(dir).expect("create folder");
+        }
+        let mut app = App::new(&Config::default(), false);
+        app.overlay = Overlay::ConfigEditor(ConfigEditor {
+            downloads: downloads.display().to_string(),
+            library: vec![
+                movies.display().to_string(),
+                "   ".to_string(),
+                tv.display().to_string(),
+                String::new(),
+            ],
+            active_field: ConfigField::Library(0),
+            error: None,
+        });
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let saved_clone = Arc::clone(&saved);
+        app.save_config_from_editor_with(
+            || Ok(Config::default()),
+            |config| {
+                *saved_clone.lock().expect("lock") = config.media.clone();
+                Ok(())
+            },
+        )
+        .expect("save should succeed");
+        assert!(matches!(app.overlay, Overlay::None), "{:?}", app.overlay);
+        assert_eq!(
+            *saved.lock().expect("lock"),
+            vec![movies.clone(), tv.clone()]
+        );
+        assert_eq!(app.media, vec![movies, tv]);
+    }
+
+    #[test]
+    fn the_editor_asks_for_a_library_folder_when_every_line_is_empty() {
+        let root = TempDir::new("config_editor_no_library");
+        let downloads = root.join("downloads");
+        fs::create_dir_all(&downloads).expect("create downloads");
+        let mut app = App::new(&Config::default(), false);
+        app.overlay = Overlay::ConfigEditor(ConfigEditor {
+            downloads: downloads.display().to_string(),
+            library: vec![String::new()],
+            active_field: ConfigField::Library(0),
+            error: None,
+        });
+        app.save_config_from_editor_with(|| Ok(Config::default()), |_| Ok(()))
+            .expect("save flow should not hard fail");
+        let error = app
+            .config_editor()
+            .and_then(|editor| editor.error.clone())
+            .expect("an error");
+        assert!(error.starts_with("Library:"), "{error}");
+    }
+
     #[test]
     fn config_editor_save_failure_stays_in_overlay() {
         let root = TempDir::new("config_editor_save_failure");
@@ -2698,8 +2971,8 @@ mod tests {
         let mut app = App::new(&config, false);
         app.overlay = Overlay::ConfigEditor(ConfigEditor {
             downloads: downloads.display().to_string(),
-            media: media.display().to_string(),
-            active_field: ConfigField::Media,
+            library: vec![media.display().to_string(), String::new()],
+            active_field: ConfigField::Library(0),
             error: None,
         });
 

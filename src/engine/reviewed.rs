@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use super::cache::{CacheKeys, is_media_key};
-use super::collect::{Exclude, RootId, ensure_not_other_root, is_own_file};
+use super::collect::{Exclude, RootId, ensure_not_other_root, is_own_file, other_roots};
 use super::types::{Cache, FileSnapshot, LinkAction};
 
 /// What a file must pass to be a candidate at all, as the walk applies it.
@@ -29,12 +29,12 @@ type NotVouched = String;
 
 /// The actions for the reviewed rows, each checked against the cache, or
 /// None when one of them cannot be, with the reason. An error is a refusal
-/// the walk would make too: a folder on a row's path is the other root seen
+/// the walk would make too: a folder on a row's path is another root seen
 /// through a second mount.
 pub(super) fn plan_from_cache(
     pairs: &[(PathBuf, PathBuf)],
     downloads: &RootId,
-    media: &RootId,
+    media: &[RootId],
     cache: &Cache,
     keys: &CacheKeys,
     filters: &Filters<'_>,
@@ -43,13 +43,21 @@ pub(super) fn plan_from_cache(
     let mut actions = Vec::with_capacity(pairs.len());
     for (src, tgt) in pairs {
         let checked = (|| -> Result<std::result::Result<LinkAction, NotVouched>> {
+            let folders: Vec<&RootId> = media.iter().collect();
             let (src_snapshot, src_hash) =
-                match vouch_for_file(src, downloads, media, true, cache, keys, filters)? {
+                match vouch_for_file(src, downloads, &folders, true, cache, keys, filters)? {
                     Ok(known) => known,
                     Err(why) => return Ok(Err(why)),
                 };
+            let Some(folder) = media.iter().find(|folder| tgt.starts_with(&folder.path)) else {
+                return Ok(Err(format!(
+                    "{} is not under a library folder",
+                    tgt.display()
+                )));
+            };
+            let others = other_roots(folder, downloads, media);
             let (tgt_snapshot, tgt_hash) =
-                match vouch_for_file(tgt, media, downloads, false, cache, keys, filters)? {
+                match vouch_for_file(tgt, folder, &others, false, cache, keys, filters)? {
                     Ok(known) => known,
                     Err(why) => return Ok(Err(why)),
                 };
@@ -145,7 +153,7 @@ impl LibraryIndex {
 fn vouch_for_file(
     path: &Path,
     root: &RootId,
-    other: &RootId,
+    others: &[&RootId],
     in_downloads: bool,
     cache: &Cache,
     keys: &CacheKeys,
@@ -167,10 +175,10 @@ fn vouch_for_file(
     if path.file_name().is_none_or(is_own_file) {
         return not("is one of DejaView's own files");
     }
-    // The walk refuses a folder that is the other root through a second
+    // The walk refuses a folder that is another root through a second
     // mount; check every folder from this file up to its root the same way.
     for dir in path.ancestors().skip(1) {
-        ensure_not_other_root(dir, root, other)?;
+        ensure_not_other_root(dir, root, others)?;
         if dir == root.path {
             break;
         }
