@@ -20,6 +20,7 @@
 
 ### Added
 
+- The library can be several folders, such as `movies`, `tv` and `anime` side by side: `dejaview config set-media` takes one or more, every scan and link matches downloads against all of them, and the dashboard's path editor gives each folder a line, with its own test hardlink. The report lists them in `media_folders`. Before, a download that was a copy of a file in a second library folder was never found, and switching the library folder between runs read the whole library again. [#11]
 - The dashboard answers the mouse: a click selects a pair or presses a key shown in the footer or on a dialog's border, the wheel moves through the pairs or scrolls Help and the JSON preview, and a click outside Help or the JSON preview closes it. Since the dashboard now takes the mouse, select text with Shift held while dragging, as most terminals allow. [#9]
 - Each release has a static Linux binary for `x86_64` and `aarch64`, which needs no Rust and no system library, with a `SHA256SUMS` file to check it against; the README says how to install one. [#7]
 - Saving the folders in the dashboard's path editor tries one hardlink between them, as `dejaview config validate` does and after the same check that neither folder reaches the other through a second mount, and the dashboard says whether link runs will make hardlinks or symlinks, and why. In symlink-only mode it makes no test. [#6]
@@ -92,3 +93,4 @@
 [#7]: https://github.com/BattermanZ/DejaView/pull/7
 [#9]: https://github.com/BattermanZ/DejaView/pull/9
 [#10]: https://github.com/BattermanZ/DejaView/pull/10
+[#11]: https://github.com/BattermanZ/DejaView/issues/11

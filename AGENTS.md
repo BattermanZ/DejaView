@@ -20,7 +20,7 @@ change that breaks one is wrong whatever else it fixes.
   `ensure_source_outside_media_root` in `src/engine/linking.rs` guard it, and
   `nested_media_root_is_rejected_and_library_is_untouched` in
   `tests/cli_integration.rs` holds it. Both guards compare paths, so the walk
-  in `src/engine/collect.rs` also refuses a directory with the other root's
+  in `src/engine/collect.rs` also refuses a directory with another root's
   device and inode (a bind mount), and planning in `linking.rs` skips a
   download that is a library file seen through a second mount (a mergerfs
   branch). `library_bind_mounted_inside_downloads_is_refused` holds the first
@@ -147,7 +147,8 @@ just check          # cargo fmt --check, then clippy on every target with warnin
 just test           # every test; under root, the unit tests again as nobody
 just format         # apply cargo fmt
 just perf           # the perf harness, in a release build
-just sandbox        # a fresh scratch downloads and media tree under .dev/sandbox
+just sandbox        # a fresh scratch tree under .dev/sandbox, Movies and TV as two library folders
+just sandbox one    # the same tree with media as the one library folder
 just try <args>     # run dejaview against it: just try scan, just try link --json
 ```
 
@@ -164,7 +165,9 @@ tests return early and still report `ok`. Run `just test` rather than `cargo
 test` in a root shell, which a cloud container is.
 
 **The live check is `just sandbox`, then `just try`.** Run the change the way
-a person would (`just try scan`, `just try link`) and look at the disk:
+a person would (`just try scan`, `just try link`) and look at the disk. A
+change to the walk, the cache, the report or the paths shown runs on both
+layouts: `just sandbox` (two library folders) and `just sandbox one` (one).
 `ls -li .dev/sandbox/downloads/*` shows a hardlink as an inode shared with the
 library file. `just try` keeps the config and log under `.dev/home`, so the
 real ones are never touched. A change to the TUI is looked at by a person in a
@@ -176,8 +179,8 @@ terminal; say so in the pull request when you could not.
   `src/config.rs` is the one check a configuration passes, for `config
   validate`, every run and the dashboard's path editor: a new requirement on
   the folders goes there.
-- `src/engine/` does the work, in this order: `collect.rs` walks both roots
-  and groups files by size, `hashing.rs` hashes them (a quick hash of the
+- `src/engine/` does the work, in this order: `collect.rs` walks downloads
+  and every library folder and groups files by size, `hashing.rs` hashes them (a quick hash of the
   first and last MiB, a full hash only when quick hashes collide), `cache.rs`
   keeps hashes between runs, `linking.rs` plans and applies, `report.rs`
   writes the report.

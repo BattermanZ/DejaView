@@ -23,14 +23,20 @@ pub(super) fn ensure_target_within_media_root(media_root: &Path, target: &Path) 
         fs::symlink_metadata(target).with_context(|| format!("metadata {}", target.display()))?;
     let canonical_media = fs::canonicalize(media_root)
         .with_context(|| format!("canonicalize {}", media_root.display()))?;
-    refuse_target_outside_media_root(media_root, &canonical_media, target, &target_meta)
+    refuse_target_outside_library(
+        &[(media_root.to_path_buf(), canonical_media)],
+        target,
+        &target_meta,
+    )
 }
 
-/// Refuse a target that is a symlink or lies outside the media root, given
-/// the target's `lstat` and the media root resolved once per run.
-fn refuse_target_outside_media_root(
-    media_root: &Path,
-    canonical_media: &Path,
+/// A library folder as given and as resolved, once per run.
+pub(super) type LibraryFolder = (PathBuf, PathBuf);
+
+/// Refuse a target that is a symlink or lies outside every library folder,
+/// given the target's `lstat` and the folders resolved once per run.
+fn refuse_target_outside_library(
+    library: &[LibraryFolder],
     target: &Path,
     target_meta: &fs::Metadata,
 ) -> Result<()> {
@@ -41,14 +47,17 @@ fn refuse_target_outside_media_root(
         ));
     }
 
-    if target.starts_with(media_root) {
+    if library.iter().any(|(folder, _)| target.starts_with(folder)) {
         return Ok(());
     }
 
     let canonical_target =
         fs::canonicalize(target).with_context(|| format!("canonicalize {}", target.display()))?;
 
-    if !canonical_target.starts_with(canonical_media) {
+    if !library
+        .iter()
+        .any(|(_, canonical)| canonical_target.starts_with(canonical))
+    {
         return Err(anyhow!(
             "refusing to link to target outside media root: {}",
             target.display()
@@ -290,20 +299,34 @@ pub(super) fn link_failure_message(err: &anyhow::Error, src: &Path) -> String {
     format!("{what} The system said: {io}.")
 }
 
-/// The downloads and media roots, resolved once per run.
+/// The downloads folder and every library folder, resolved once per run.
 pub(super) struct CanonicalRoots {
     pub(super) downloads: PathBuf,
-    pub(super) media: PathBuf,
+    pub(super) media: Vec<PathBuf>,
 }
 
 impl CanonicalRoots {
-    pub(super) fn new(downloads: &Path, media: &Path) -> Result<Self> {
+    pub(super) fn new<P: AsRef<Path>>(downloads: &Path, media: &[P]) -> Result<Self> {
         Ok(CanonicalRoots {
             downloads: fs::canonicalize(downloads)
                 .with_context(|| format!("resolve the downloads folder {}", downloads.display()))?,
-            media: fs::canonicalize(media)
-                .with_context(|| format!("resolve the media folder {}", media.display()))?,
+            media: media
+                .iter()
+                .map(|folder| {
+                    let folder = folder.as_ref();
+                    fs::canonicalize(folder).with_context(|| {
+                        format!(
+                            "cannot resolve the media folder {}; check that it is mounted and readable, then run again",
+                            folder.display()
+                        )
+                    })
+                })
+                .collect::<Result<_>>()?,
         })
+    }
+
+    fn in_library(&self, path: &Path) -> bool {
+        self.media.iter().any(|folder| path.starts_with(folder))
     }
 }
 
@@ -347,7 +370,7 @@ impl PinnedDir {
 }
 
 fn ensure_dir_inside_downloads(real_dir: &Path, src: &Path, roots: &CanonicalRoots) -> Result<()> {
-    if real_dir.starts_with(&roots.media) || !real_dir.starts_with(&roots.downloads) {
+    if roots.in_library(real_dir) || !real_dir.starts_with(&roots.downloads) {
         return Err(anyhow!(
             "refusing to replace {}: its folder is {}, which is not inside the downloads folder {}. A folder in downloads may be a symlink to somewhere else; remove the symlink or scan again",
             src.display(),
@@ -434,7 +457,7 @@ fn check_temp_link(tmp: &Path, req: &LinkRequest<'_>) -> Result<TempLink> {
     if meta.file_type().is_symlink()
         && let (Ok(resolved), Ok(target)) = (fs::canonicalize(tmp), fs::canonicalize(req.tgt))
         && resolved == target
-        && target.starts_with(&req.roots.media)
+        && req.roots.in_library(&target)
     {
         return Ok(TempLink::FilesystemSymlink);
     }
@@ -810,14 +833,36 @@ pub(super) fn plan_actions(groups: &[Vec<FileInfo>]) -> Plan {
 }
 
 /// The table a person reads: one row per planned action, each path below
-/// its folder, which the caller prints once above it. The header is plain:
-/// colour codes would count as width and push the columns out of line.
-pub(super) fn action_table(actions: &[LinkAction], downloads: &Path, media: &Path) -> Table {
+/// its folder, which the caller prints once above it. With several library
+/// folders a library path starts with its folder's name. The header is
+/// plain: colour codes would count as width and push the columns out of line.
+pub(super) fn action_table<P: AsRef<Path>>(
+    actions: &[LinkAction],
+    downloads: &Path,
+    media: &[P],
+) -> Table {
     let below = |path: &Path, root: &Path| {
         path.strip_prefix(root)
             .unwrap_or(path)
             .to_string_lossy()
             .into_owned()
+    };
+    let in_library = |path: &Path| match media {
+        [one] => below(path, one.as_ref()),
+        several => several
+            .iter()
+            .map(AsRef::as_ref)
+            .find(|folder| path.starts_with(folder))
+            .map_or_else(
+                || path.to_string_lossy().into_owned(),
+                |folder| {
+                    format!(
+                        "{}/{}",
+                        crate::config::library_name(folder),
+                        below(path, folder)
+                    )
+                },
+            ),
     };
     let mut table = Table::new();
     table
@@ -827,7 +872,7 @@ pub(super) fn action_table(actions: &[LinkAction], downloads: &Path, media: &Pat
     for action in actions {
         table.add_row(vec![
             below(&action.src, downloads),
-            below(&action.tgt, media),
+            in_library(&action.tgt),
             crate::human::format_size(action.size),
         ]);
     }
@@ -865,9 +910,9 @@ pub(super) struct ApplyOutcome {
     pub(super) cancelled: bool,
 }
 
-pub(super) fn apply_actions(
+pub(super) fn apply_actions<P: AsRef<Path>>(
     actions: &[LinkAction],
-    media: &Path,
+    media: &[P],
     options: &ApplyOptions<'_>,
     warnings: &mut WarningSummary,
     report_entries: &mut [LinkReportEntry],
@@ -894,8 +939,22 @@ pub(super) fn apply_actions(
     }
 
     let roots = CanonicalRoots::new(downloads, media);
-    // Resolved once per run, not once per pair.
-    let canonical_media = fs::canonicalize(media);
+    // Resolved once per run, not once per pair, and apart from downloads, so
+    // the library guards run even when downloads cannot be resolved.
+    let library: Result<Vec<LibraryFolder>> = media
+        .iter()
+        .map(|folder| {
+            let folder = folder.as_ref();
+            fs::canonicalize(folder)
+                .map(|canonical| (folder.to_path_buf(), canonical))
+                .map_err(|err| {
+                    anyhow!(
+                        "cannot resolve the media folder {}: {err}; check that it is mounted and readable, then run again",
+                        folder.display()
+                    )
+                })
+        })
+        .collect();
 
     for (index, action) in actions.iter().enumerate() {
         if cancel.is_cancelled() {
@@ -917,13 +976,10 @@ pub(super) fn apply_actions(
                     action.tgt.display()
                 ),
             );
-            let canonical_media = canonical_media.as_ref().map_err(|err| {
-                anyhow!(
-                    "cannot resolve the media folder {}: {err}; check that it is mounted and readable, then run again",
-                    media.display()
-                )
-            })?;
-            ensure_source_outside_media_root(media, canonical_media, &action.src)?;
+            let library = library.as_ref().map_err(|err| anyhow!("{err:#}"))?;
+            for (folder, canonical) in library {
+                ensure_source_outside_media_root(folder, canonical, &action.src)?;
+            }
             // One lstat of each file serves every check below.
             let src_meta = lstat(&action.src)?;
             ensure_source_snapshot_matches(
@@ -933,7 +989,7 @@ pub(super) fn apply_actions(
                 &replaced_inodes,
             )?;
             let tgt_meta = lstat(&action.tgt)?;
-            refuse_target_outside_media_root(media, canonical_media, &action.tgt, &tgt_meta)?;
+            refuse_target_outside_library(library, &action.tgt, &tgt_meta)?;
             ensure_target_snapshot_matches(&action.tgt, &tgt_meta, &action.tgt_snapshot)?;
             // A download's bytes come back only with its last path: a
             // cross-seeded sibling still holds them until it is replaced too.

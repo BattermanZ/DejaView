@@ -4,20 +4,20 @@ This guide explains the app in simple terms and shows the flow with Mermaid diag
 
 ## 1) Big Picture
 
-DejaView compares two folders:
+DejaView compares the downloads folder with the library:
 - `downloads`: where duplicates usually exist
-- `media`: the canonical library, which DejaView only reads
+- `media`: the canonical library, which DejaView only reads. It can be one folder or several, such as `movies` and `tv` side by side
 
 It finds exact duplicates and can replace each duplicate file in `downloads` with:
 - a hardlink (preferred when possible)
 - a relative symlink (fallback)
 
-The two folders must be separate: neither may contain the other.
+The folders must be separate: none may contain another, and no two library folders may share a name.
 
 ```mermaid
 flowchart LR
     A[downloads folder] --> C[DejaView scan engine]
-    B[media folder] --> C
+    B[library folders] --> C
     C --> D[duplicate plan]
     D -->|scan| E[preview + summary]
     D -->|link| F[apply hardlink/symlink]
@@ -70,12 +70,12 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[Load config] --> B{downloads/media set, valid and not overlapping?}
+    A[Load config] --> B{downloads and library folders set, valid and not overlapping?}
     B -- no --> X[Stop with actionable error]
     B -- yes --> RV{link --plan from the dashboard, and the cache vouches for every row?}
     RV -- yes --> M2[Plan the reviewed rows from the cache, walking neither folder]
     M2 --> N
-    RV -- no --> C[Walk downloads + media at once, many folders in parallel]
+    RV -- no --> C[Walk downloads and every library folder at once, many folders in parallel]
     C --> D[Leave out names on the exclude list, symlinks, .dejaview_ files, files under min_size and files younger than min_age]
     D --> E[Group by size]
     E --> F[Within a group, paths of one physical file count once]
@@ -100,7 +100,7 @@ A run started from the TUI can be cancelled at any point, and a run from the com
 
 ## 4) Link Method Decision
 
-Before any replacement, DejaView checks that the source is outside the media folder, that the target is inside it and is not a symlink, and that neither file changed since the scan.
+Before any replacement, DejaView checks that the source is outside every library folder, that the target is inside one and is not a symlink, and that neither file changed since the scan.
 
 ```mermaid
 flowchart TD
@@ -153,7 +153,7 @@ flowchart TD
 
 1. Set paths:
    - `dejaview config set-downloads /path/to/downloads`
-   - `dejaview config set-media /path/to/media`
+   - `dejaview config set-media /path/to/media`, or several folders: `dejaview config set-media /path/to/movies /path/to/tv`
 2. Validate setup:
    - `dejaview config validate`
 3. Preview first:

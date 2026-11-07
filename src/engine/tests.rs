@@ -22,7 +22,7 @@ use crate::protocol::{EntryStatus, LinkMethod, LinkReportEntry};
 fn make_config(downloads: &Path, media: &Path, min_age: u64) -> Config {
     Config {
         downloads: Some(downloads.to_path_buf()),
-        media: Some(media.to_path_buf()),
+        media: vec![media.to_path_buf()],
         min_age: Some(min_age),
         // Test files are a few bytes; only the empty-file rule applies.
         min_size: Some(1),
@@ -105,7 +105,7 @@ where
     F: Fn(&Path, &Path) -> std::io::Result<()>,
     G: Fn(&Path, &Path) -> std::io::Result<()>,
 {
-    let roots = CanonicalRoots::new(downloads, media).expect("resolve roots");
+    let roots = CanonicalRoots::new(downloads, &[media]).expect("resolve roots");
     let src_snapshot = snapshot_of(src);
     let tgt_snapshot = snapshot_of(tgt);
     replace_file_with_best_link_with(
@@ -509,7 +509,7 @@ fn partially_linked_groups_still_plan_remaining_download_duplicates() {
     let mut metrics = RunMetrics::default();
     let mut files = collect_run_files(
         &downloads,
-        &media,
+        &[&media],
         Duration::from_secs(0),
         CollectOptions {
             min_size: 1,
@@ -650,7 +650,7 @@ fn apply_actions_rejects_source_metadata_change_after_planning() {
         ..
     } = apply_actions(
         &[action],
-        &media,
+        &[&media],
         &ApplyOptions {
             downloads: &downloads,
             strict: false,
@@ -706,7 +706,7 @@ fn apply_actions_rejects_target_metadata_change_after_planning() {
         ..
     } = apply_actions(
         &[action],
-        &media,
+        &[&media],
         &ApplyOptions {
             downloads: &downloads,
             strict: false,
@@ -774,7 +774,7 @@ fn apply_actions_allow_multiple_sources_for_same_target_in_one_run() {
         ..
     } = apply_actions(
         &actions,
-        &media,
+        &[&media],
         &ApplyOptions {
             downloads: &downloads,
             strict: false,
@@ -1222,7 +1222,7 @@ fn apply_actions_refuses_to_replace_a_file_inside_the_media_root() {
         ..
     } = apply_actions(
         &[action],
-        &media,
+        &[&media],
         &ApplyOptions {
             downloads: &root.join("downloads"),
             strict: false,
@@ -1287,16 +1287,30 @@ fn collect_refuses_a_directory_that_is_the_other_root() {
         "names where: {message}"
     );
 
+    // Two library folders that are one directory: the advice is about them.
+    let movies = RootId::of("media", &downloads).expect("movies id");
+    let tv = RootId::of("media", &downloads).expect("tv id");
+    let message = format!(
+        "{:#}",
+        super::collect::ensure_not_other_root(&downloads, &movies, &[&tv]).expect_err("refused")
+    );
+    assert!(message.contains("the library folder"), "{message}");
+    assert!(message.contains("List only one of them"), "{message}");
+
     // The same root reached at the top, as when both are one folder.
     let same = RootId::of("media", &downloads).expect("same id");
     assert!(
-        super::collect::ensure_root_not_reached(&test_root(&downloads), &same, &Exclude::default())
-            .is_err()
+        super::collect::ensure_root_not_reached(
+            &test_root(&downloads),
+            &[&same],
+            &Exclude::default()
+        )
+        .is_err()
     );
     assert!(
         super::collect::ensure_root_not_reached(
             &test_root(&downloads),
-            &unrelated_root(),
+            &[&unrelated_root()],
             &Exclude::default()
         )
         .is_ok()
@@ -1540,7 +1554,7 @@ fn apply_actions_stops_before_the_next_file_when_cancelled() {
 
     let outcome = apply_actions(
         &[action],
-        &root.join("media"),
+        &[root.join("media")],
         &ApplyOptions {
             downloads: &root.join("downloads"),
             strict: false,
@@ -1729,7 +1743,7 @@ fn a_download_found_to_be_the_library_file_at_link_time_is_already_linked() {
 
     let outcome = apply_actions(
         &[action],
-        &media,
+        &[&media],
         &ApplyOptions {
             downloads: &downloads,
             strict: true,
@@ -2093,7 +2107,7 @@ fn excluded_folders_are_never_walked() {
 
     let files = collect_run_files(
         &downloads,
-        &media,
+        &[&media],
         Duration::ZERO,
         CollectOptions {
             min_size: 1,
@@ -2143,7 +2157,7 @@ fn the_parallel_walk_finds_every_file_in_a_wide_tree() {
 
     let files = collect_run_files(
         &downloads,
-        &media,
+        &[&media],
         Duration::ZERO,
         CollectOptions {
             min_size: 2,
@@ -2186,7 +2200,7 @@ fn a_cancelled_walk_stops_with_cancelled() {
 
     let result = collect_run_files(
         &downloads,
-        &media,
+        &[&media],
         Duration::ZERO,
         CollectOptions {
             min_size: 1,
@@ -2260,10 +2274,10 @@ fn an_unchanged_cache_is_not_written_again() {
 fn cache_keys_name_the_root_so_two_mounts_of_one_share_agree() {
     let host = super::cache::CacheKeys::new(
         Path::new("/mnt/pool/torrents"),
-        Path::new("/mnt/pool/media"),
+        &[Path::new("/mnt/pool/media")],
     );
     let container =
-        super::cache::CacheKeys::new(Path::new("/data/torrents"), Path::new("/data/media"));
+        super::cache::CacheKeys::new(Path::new("/data/torrents"), &[Path::new("/data/media")]);
     assert_eq!(
         host.key(Path::new("/mnt/pool/media/Movies/a.mkv"), false),
         container.key(Path::new("/data/media/Movies/a.mkv"), false)
@@ -2302,6 +2316,64 @@ fn cache_keys_name_the_root_so_two_mounts_of_one_share_agree() {
 }
 
 #[test]
+fn with_several_library_folders_a_key_names_the_folder() {
+    let several = super::cache::CacheKeys::new(
+        Path::new("/pool/downloads"),
+        &[Path::new("/pool/movies"), Path::new("/pool/tv")],
+    );
+    assert_eq!(
+        several.key(Path::new("/pool/tv/Show/e1.mkv"), false),
+        "library/tv/Show/e1.mkv"
+    );
+    // A second mount of the same folders agrees, whatever the parent.
+    let container = super::cache::CacheKeys::new(
+        Path::new("/data/downloads"),
+        &[Path::new("/data/movies"), Path::new("/data/tv")],
+    );
+    assert_eq!(
+        container.key(Path::new("/data/tv/Show/e1.mkv"), false),
+        "library/tv/Show/e1.mkv"
+    );
+    // One folder keeps the key it always had, whatever its name.
+    let one = super::cache::CacheKeys::new(Path::new("/pool/downloads"), &[Path::new("/pool/tv")]);
+    assert_eq!(
+        one.key(Path::new("/pool/tv/Show/e1.mkv"), false),
+        "media/Show/e1.mkv"
+    );
+}
+
+#[test]
+fn going_back_to_one_library_folder_renames_that_folders_keys_back() {
+    let one = super::cache::CacheKeys::new(Path::new("/pool/downloads"), &[Path::new("/pool/tv")]);
+    let entry = CacheEntry {
+        snapshot: FileSnapshot {
+            size: 1,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            dev: 1,
+            inode: 1,
+        },
+        hash: Some("h".into()),
+        sample: None,
+    };
+    let mut cache = Cache::new();
+    cache.insert("library/tv/Show/e1.mkv".into(), entry.clone());
+    cache.insert("library/movies/m.mkv".into(), entry.clone());
+    cache.insert("downloads/e1.mkv".into(), entry);
+    assert_eq!(one.migrate(&mut cache), 1);
+    let mut keys: Vec<&String> = cache.keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "downloads/e1.mkv",
+            "library/movies/m.mkv",
+            "media/Show/e1.mkv"
+        ]
+    );
+}
+
+#[test]
 fn hashing_saves_the_cache_as_it_goes() {
     use super::hashing::{Checkpoint, HashOptions, hash_groups_and_update_cache};
     let root = TempDir::new("checkpoint");
@@ -2313,7 +2385,7 @@ fn hashing_saves_the_cache_as_it_goes() {
     let mut warnings = WarningSummary::default();
     let files = collect_run_files(
         &downloads,
-        &media,
+        &[&media],
         Duration::ZERO,
         CollectOptions {
             min_size: 1,
@@ -2334,7 +2406,7 @@ fn hashing_saves_the_cache_as_it_goes() {
         strict: true,
         ..ScanRunOptions::for_test(true)
     };
-    let keys = super::cache::CacheKeys::new(&downloads, &media);
+    let keys = super::cache::CacheKeys::new(&downloads, &[&media]);
     let mut cache = Cache::new();
 
     let hashed = hash_groups_and_update_cache(
@@ -2378,7 +2450,7 @@ fn the_cache_vouches_only_for_rows_the_walk_would_plan_the_same() {
     config.exclude = Some(Vec::new());
     run_scan(&config, true, false, None);
     let cache = load_cache(&downloads.join(".dejaview_cache.json"));
-    let keys = super::cache::CacheKeys::new(&downloads, &media);
+    let keys = super::cache::CacheKeys::new(&downloads, &[&media]);
     let roots = (
         RootId::of("downloads", &downloads).expect("downloads"),
         RootId::of("media", &media).expect("media"),
@@ -2393,7 +2465,7 @@ fn the_cache_vouches_only_for_rows_the_walk_would_plan_the_same() {
         super::reviewed::plan_from_cache(
             &[(src.to_path_buf(), tgt.to_path_buf())],
             &roots.0,
-            &roots.1,
+            std::slice::from_ref(&roots.1),
             &cache,
             &keys,
             &filters,
@@ -2426,7 +2498,7 @@ fn the_cache_does_not_vouch_for_a_download_that_is_a_library_file_through_a_moun
     let config = make_config(&downloads, &media, 0);
     run_scan(&config, true, false, None);
     let mut cache = load_cache(&downloads.join(".dejaview_cache.json"));
-    let keys = super::cache::CacheKeys::new(&downloads, &media);
+    let keys = super::cache::CacheKeys::new(&downloads, &[&media]);
     let roots = (
         RootId::of("downloads", &downloads).expect("downloads"),
         RootId::of("media", &media).expect("media"),
@@ -2439,8 +2511,15 @@ fn the_cache_does_not_vouch_for_a_download_that_is_a_library_file_through_a_moun
     };
     let pair = [(downloads.join("a.mkv"), media.join("A/a.mkv"))];
     let vouch = |cache: &Cache| {
-        super::reviewed::plan_from_cache(&pair, &roots.0, &roots.1, cache, &keys, &filters)
-            .expect("no refusal")
+        super::reviewed::plan_from_cache(
+            &pair,
+            &roots.0,
+            std::slice::from_ref(&roots.1),
+            cache,
+            &keys,
+            &filters,
+        )
+        .expect("no refusal")
     };
     assert!(vouch(&cache).is_ok(), "a plain copy is vouched for");
     let download = cache["downloads/a.mkv"].clone();
@@ -2512,7 +2591,7 @@ fn a_failed_pair_names_the_os_error_and_drops_the_planned_method() {
     let mut report_entries = vec![entry];
     apply_actions(
         &[action],
-        &media,
+        &[&media],
         &ApplyOptions {
             downloads: &downloads,
             strict: false,
@@ -2684,8 +2763,8 @@ fn the_plan_table_lines_up_with_colours_on() {
         src_snapshot: snapshot_of(Path::new("/")),
         tgt_snapshot: snapshot_of(Path::new("/")),
     };
-    let table =
-        super::linking::action_table(&[action], Path::new("/dl"), Path::new("/media")).to_string();
+    let table = super::linking::action_table(&[action], Path::new("/dl"), &[Path::new("/media")])
+        .to_string();
     colored::control::unset_override();
 
     let widths: Vec<usize> = table.lines().map(|line| line.chars().count()).collect();
@@ -2705,7 +2784,7 @@ fn the_plan_table_lines_up_with_colours_on() {
 fn cache_keys_keep_bytes_that_are_not_utf8() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
-    let keys = super::cache::CacheKeys::new(Path::new("/dl"), Path::new("/media"));
+    let keys = super::cache::CacheKeys::new(Path::new("/dl"), &[Path::new("/media")]);
     let path = |bytes: &[u8]| PathBuf::from(OsStr::from_bytes(bytes));
 
     let ff = keys.key(&path(b"/dl/a\xff.mkv"), true);

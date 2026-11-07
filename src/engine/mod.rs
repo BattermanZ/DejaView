@@ -58,18 +58,26 @@ pub fn cleanup_temp_artifacts(config: &Config) -> Result<Vec<std::path::PathBuf>
     cache::cleanup_temp_artifacts(config)
 }
 
-/// Refuse downloads and media that reach each other through a second mount,
-/// which a comparison of their paths cannot see. Walks the directories of both.
+/// Refuse downloads and library folders that reach one another through a
+/// second mount, which a comparison of their paths cannot see. Walks the
+/// directories of every folder.
 pub fn ensure_roots_not_mounted_inside(
     downloads: &std::path::Path,
-    media: &std::path::Path,
+    media: &[std::path::PathBuf],
     exclude: Vec<String>,
 ) -> Result<()> {
     let downloads = collect::RootId::of("downloads", downloads)?;
-    let media = collect::RootId::of("media", media)?;
+    let library = media
+        .iter()
+        .map(|folder| collect::RootId::of("media", folder))
+        .collect::<Result<Vec<_>>>()?;
     let exclude = collect::Exclude::new(exclude);
-    collect::ensure_root_not_reached(&downloads, &media, &exclude)?;
-    collect::ensure_root_not_reached(&media, &downloads, &exclude)
+    // Each folder is walked once, against every other.
+    for root in std::iter::once(&downloads).chain(&library) {
+        let others = collect::other_roots(root, &downloads, &library);
+        collect::ensure_root_not_reached(root, &others, &exclude)?;
+    }
+    Ok(())
 }
 
 /// What one real hardlink from the library into downloads did.
@@ -224,10 +232,10 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
         .downloads
         .as_ref()
         .ok_or_else(|| anyhow!("Downloads path not set"))?;
-    let media = config
-        .media
-        .as_ref()
-        .ok_or_else(|| anyhow!("Media path not set"))?;
+    let media = config.media.as_slice();
+    if media.is_empty() {
+        return Err(anyhow!("Media path not set"));
+    }
     let min_age = std::time::Duration::from_secs(config.min_age.unwrap_or(0));
     let audience = options.audience();
     logger::info(
@@ -236,7 +244,11 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
             "starting mode={} downloads={} media={} dry_run={} strict={} min_size={}",
             if options.dry_run { "scan" } else { "link" },
             downloads.display(),
-            media.display(),
+            media
+                .iter()
+                .map(|folder| folder.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
             options.dry_run,
             options.strict,
             config.effective_min_size()
@@ -254,7 +266,10 @@ fn run(config: &Config, options: ScanRunOptions<'_>) -> Result<RunEnd> {
     logger::info("run", format!("using cache path {}", cache_path.display()));
     let roots = Roots {
         downloads: collect::RootId::of("downloads", downloads)?,
-        media: collect::RootId::of("media", media)?,
+        media: media
+            .iter()
+            .map(|folder| collect::RootId::of("media", folder))
+            .collect::<Result<_>>()?,
     };
     let filters = reviewed::Filters {
         min_size: config.effective_min_size(),
@@ -516,7 +531,7 @@ fn stopped_before_planning(
     err: anyhow::Error,
     options: &ScanRunOptions<'_>,
     started_at: std::time::SystemTime,
-    (downloads, media): (&std::path::Path, &std::path::Path),
+    (downloads, media): (&std::path::Path, &[std::path::PathBuf]),
     metrics: RunMetrics,
     warnings: WarningSummary,
 ) -> anyhow::Error {
@@ -553,10 +568,20 @@ fn stopped_before_planning(
     })
 }
 
-/// The two roots of a run, as the filesystem knows them.
+/// The roots of a run, as the filesystem knows them: downloads and every
+/// library folder.
 struct Roots {
     downloads: collect::RootId,
-    media: collect::RootId,
+    media: Vec<collect::RootId>,
+}
+
+impl Roots {
+    fn media_paths(&self) -> Vec<std::path::PathBuf> {
+        self.media
+            .iter()
+            .map(|folder| folder.path.clone())
+            .collect()
+    }
 }
 
 /// The run's two worker pools.
@@ -577,7 +602,7 @@ struct Planned {
 /// renamed from an earlier version's.
 fn load_keyed_cache(cache_path: &std::path::Path, roots: &Roots) -> (Cache, CacheKeys, usize) {
     let mut cache = load_cache(cache_path);
-    let keys = CacheKeys::new(&roots.downloads.path, &roots.media.path);
+    let keys = CacheKeys::new(&roots.downloads.path, &roots.media_paths());
     let migrated = keys.migrate(&mut cache);
     if migrated > 0 {
         logger::info(
@@ -659,7 +684,7 @@ fn plan_by_walking(
     }
     let files = collect_run_files(
         &roots.downloads.path,
-        &roots.media.path,
+        &roots.media_paths(),
         std::time::Duration::from_secs(config.min_age.unwrap_or(0)),
         CollectOptions {
             min_size: filters.min_size,

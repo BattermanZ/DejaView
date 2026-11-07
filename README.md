@@ -43,11 +43,11 @@ What it is not:
 
 ## Safety model
 
-- **The library is read-only to DejaView.** Every replaced file is in downloads, and a link run refuses any source that resolves inside the media folder.
-- **Downloads and media must be separate folders.** If one is inside the other, or both are the same folder (also through a symlink), `scan`, `link`, `config validate` and the TUI path editor refuse to run. A bind mount can show one folder at two paths, so every walk also compares each folder's device and inode with the other root, and a run that finds the library inside downloads that way stops before changing anything.
+- **The library is read-only to DejaView.** Every replaced file is in downloads, and a link run refuses any source that resolves inside a library folder.
+- **Downloads and media must be separate folders.** If one is inside the other, or both are the same folder (also through a symlink), `scan`, `link`, `config validate` and the TUI path editor refuse to run. With several library folders, each is checked against downloads and against the others: none may be inside another, and no two may share a name. A bind mount can show one folder at two paths, so every walk also compares each folder's device and inode with the other root, and a run that finds the library inside downloads that way stops before changing anything.
 - **A library file is never mistaken for a download.** A download that shares an inode with any library file is already linked and left alone. One on another device with the same size and timestamps as a library file is that file seen through a second mount, such as a mergerfs branch, and is left alone too; the run warns and counts it in the report's `skipped_as_library_file`.
 - **Each replacement is atomic.** DejaView creates the link under a temporary name next to the download, then renames it over the download. An interrupted run leaves either the old file or the link, plus at worst a `.dejaview_*.tmp.*` file that `dejaview cache cleanup-temp` removes.
-- **Nothing changes behind its back.** Right before replacing a file, it checks the size, timestamps and inode of both files again and skips the pair if either changed since the scan. It also refuses a target that is a symlink or sits outside the media folder. On Linux it then opens the download's folder once and does the rest through that open folder, so a folder swapped for a symlink in the meantime cannot send the replacement anywhere else, and it checks that the link it made is the planned library file before that link replaces the download.
+- **Nothing changes behind its back.** Right before replacing a file, it checks the size, timestamps and inode of both files again and skips the pair if either changed since the scan. It also refuses a target that is a symlink or sits outside every library folder. On Linux it then opens the download's folder once and does the rest through that open folder, so a folder swapped for a symlink in the meantime cannot send the replacement anywhere else, and it checks that the link it made is the planned library file before that link replaces the download.
 - **A link never locks out the torrent client.** A hardlinked download is the library file, so it takes on that file's owner and permissions (and its ACLs, extended attributes and SELinux label); a symlinked one is read with them. Before linking, DejaView checks that the download's owner and group could still read it, and leaves the pair alone with the reason in the report when they could not.
 - **`scan` leaves your files alone.** It does write its cache, `.dejaview_cache.json`, in the downloads folder, so downloads must be writable.
 
@@ -83,6 +83,12 @@ dejaview config set-downloads /srv/torrents
 dejaview config set-media /srv/media
 ```
 
+If Sonarr and Radarr import into separate folders, such as `/srv/movies` and `/srv/tv` beside the downloads folder, give them all; every scan matches downloads against each:
+
+```bash
+dejaview config set-media /srv/movies /srv/tv
+```
+
 ```bash
 dejaview config validate
 ```
@@ -107,9 +113,9 @@ dejaview link --confirm
 | `dejaview link` | Find duplicates and replace each download copy with a link. |
 | `dejaview tui` | Open the terminal dashboard. |
 | `dejaview config show` | Print the configuration. |
-| `dejaview config validate` | Check that both folders exist and are separate (also through a mount), downloads is writable and media is readable, and try one real hardlink from the library into downloads to say whether links will be hardlinks or symlinks, and why. |
+| `dejaview config validate` | Check that the folders exist and are separate (also through a mount), downloads is writable and each library folder is readable, and try one real hardlink from each library folder into downloads to say whether links will be hardlinks or symlinks, and why. |
 | `dejaview config set-downloads PATH` | Set the downloads folder. The path is stored resolved and absolute. |
-| `dejaview config set-media PATH` | Set the media folder. |
+| `dejaview config set-media PATH...` | Set the library folder, or several, replacing the list. Each must have its own name: `/srv/movies` and `/srv/tv`, not two folders called `movies`. |
 | `dejaview config set-min-age SECONDS` | Skip files modified more recently than this. |
 | `dejaview config set-min-size BYTES` | Skip files smaller than this. At least 1: empty files are always skipped. |
 | `dejaview config set-threads N` | Set how many files are walked and quick-hashed at once. |
@@ -166,7 +172,8 @@ Ctrl+C, SIGTERM (a cron timeout, `docker stop`) or SIGHUP stops a scan or link b
 | `mode` | `scan` or `link`. |
 | `outcome` | `complete` (the run reached its end, whatever failed on the way), `cancelled` (stopped on request) or `failed` (`--strict` stopped it). |
 | `started_at`, `finished_at` | When the run started and ended, UTC, as RFC 3339. |
-| `version`, `downloads`, `media`, `link_mode` | The DejaView version and the settings the run used. |
+| `version`, `downloads`, `media`, `link_mode` | The DejaView version and the settings the run used. With several library folders, `media` is the first. |
+| `media_folders` | Every library folder the run used, in the config's order. |
 | `planned_actions`, `applied_actions` | Pairs planned, and pairs this run replaced with a link. |
 | `symlinked` | Applied pairs whose download became a symlink. |
 | `already_linked`, `already_linked_bytes` | Pairs found to be one file already, which changed nothing, and their size. |
@@ -209,7 +216,7 @@ Above the rows, the space a link run would free, or the space it freed, is drawn
 | `j` / `k` or arrows | Move the selection; in Help or the JSON preview, scroll |
 | `PgUp` / `PgDn` | Move the selection a screen at a time, or scroll a screen |
 | `g` / `G` or `Home` / `End` | Go to the first or last row, or the start or end of Help or the JSON preview |
-| `e` | Edit the downloads and media paths; `~` stands for the home folder |
+| `e` | Edit the downloads and library folders, one library folder per line; type on the empty last line to add one, clear a line to remove it. `~` stands for the home folder |
 | `p` | Show the rows' paths in full, or below their folders |
 | `R` | Save the current report to `.dejaview_tui_report.json` in downloads |
 | `J` | Show the current report as JSON; `J` or `Esc` closes it |
@@ -242,7 +249,7 @@ If the log cannot be written, DejaView warns once, naming the path, and runs wit
 | Setting | Default | Purpose |
 |---|---|---|
 | `downloads` | unset | Folder whose duplicates get replaced. Must be writable. |
-| `media` | unset | The library. Read, never written. |
+| `media` | unset | The library: one folder, or a list of folders, each read and never written. |
 | `min_age` | `0` | Seconds. Files modified more recently are skipped, which keeps DejaView away from files a client is still writing. |
 | `min_size` | `1048576` (1 MiB) | Bytes. Smaller files are skipped: `.nfo` files, text subtitles and artwork save almost nothing and cost a read on every run. Empty files are always skipped, because a torrent client creates a file empty before writing into it. |
 | `threads` | `16` | Files walked and quick-hashed at once. Both wait on the drive, mostly on its answer to each `stat` or short read, so a network drive keeps many busy whatever the CPU count. |
@@ -254,7 +261,7 @@ If the log cannot be written, DejaView warns once, naming the path, and runs wit
 
 | File | When |
 |---|---|
-| `<downloads>/.dejaview_cache.json` | Every scan and link that learns a hash or drops an entry. Each entry is keyed by its folder (`downloads` or `media`) and its path below it, so the same share mounted at another path, as in a Docker container, uses the same entries. Entries for files that no longer exist are dropped after each run that finishes hashing, except under a folder the run could not read. |
+| `<downloads>/.dejaview_cache.json` | Every scan and link that learns a hash or drops an entry. Each entry is keyed by its folder (`downloads` or `media`) and its path below it, so the same share mounted at another path, as in a Docker container, uses the same entries. With several library folders, a library entry's key also names its folder (`library/tv/…`), so a container must mount each library folder under the same name. Adding or removing a library folder renames the entries in place and reads nothing again. Entries for files that no longer exist are dropped after each run that finishes hashing, except under a folder the run could not read. |
 | `<downloads>/.dejaview_link_report.json` | Every link run without `--report` that planned something. |
 | `<downloads>/.dejaview_tui_report.json` | When you press `R` in the dashboard. |
 | `<downloads>/.dejaview_lock` | Every scan, link and `cache cleanup-temp`, which lock it while they run. It stays, empty; deleting it between runs is harmless. |
@@ -289,11 +296,11 @@ Files whose name starts with `.dejaview_` are never treated as duplicates.
 
 ## How it works
 
-1. Walk both folders without following symlinks, leaving out the names on the `exclude` list. Skip files smaller than `min_size` (and every empty file), files younger than `min_age`, and DejaView's own files.
+1. Walk downloads and every library folder without following symlinks, leaving out the names on the `exclude` list. Skip files smaller than `min_size` (and every empty file), files younger than `min_age`, and DejaView's own files.
 2. Group files by size. Paths that are already the same file count once. A group is skipped when it is all one file, holds no download or no library file, or every download in it already is a library file.
 3. Quick hash (BLAKE3 of the first and last MiB) of each remaining file the cache does not already know. A file of 1 MiB or less is read whole, so its quick hash is its full hash.
 4. Full BLAKE3 hash of the files whose quick hashes collide, unless cached.
-5. In each set of identical files, the first media file by path is the target. Every download copy that is not already a link to it gets an action.
+5. In each set of identical files, the first library file by path is the target. Every download copy that is not already a link to it gets an action.
 6. `link` only: check both files again, link to a temporary name, rename it over the download.
 
 [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) has diagrams of the pipeline and the link decision.

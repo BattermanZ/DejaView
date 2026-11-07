@@ -9,7 +9,10 @@ use crate::fsutil::{normalize_runtime_dir, safe_write_bytes};
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Config {
     pub downloads: Option<PathBuf>,
-    pub media: Option<PathBuf>,
+    /// The library folders. The file holds one as a string, as it always
+    /// did, several as a list, and none as null.
+    #[serde(default, with = "library_folders")]
+    pub media: Vec<PathBuf>,
     pub min_age: Option<u64>,
     /// Files smaller than this many bytes are skipped. Unset means
     /// [`DEFAULT_MIN_SIZE`]; empty files are skipped whatever it says.
@@ -27,6 +30,47 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude: Option<Vec<String>>,
     pub link_mode: Option<LinkMode>,
+}
+
+/// How the config file holds the library folders: a string for one, so a
+/// file written before several were possible reads and writes the same, a
+/// list for several, and null for none.
+mod library_folders {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::path::PathBuf;
+
+    #[derive(Deserialize, Serialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(PathBuf),
+        Many(Vec<PathBuf>),
+    }
+
+    pub fn serialize<S: Serializer>(folders: &[PathBuf], out: S) -> Result<S::Ok, S::Error> {
+        match folders {
+            [] => out.serialize_none(),
+            [one] => one.serialize(out),
+            many => many.serialize(out),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(input: D) -> Result<Vec<PathBuf>, D::Error> {
+        Ok(match Option::<OneOrMany>::deserialize(input)? {
+            None => Vec::new(),
+            Some(OneOrMany::One(one)) => vec![one],
+            Some(OneOrMany::Many(many)) => many,
+        })
+    }
+}
+
+/// The name that tells a library folder apart from the others: its last
+/// component. The cache keys each library file by it, so no two library
+/// folders may share one.
+pub fn library_name(folder: &Path) -> String {
+    folder
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| folder.display().to_string())
 }
 
 /// The size floor when the config sets none: 1 MiB (ADR 0002).
@@ -165,19 +209,21 @@ impl std::fmt::Display for Problems {
 
 impl std::error::Error for Problems {}
 
-/// The two folders of a configuration that [`check`] passed, resolved.
+/// The folders of a configuration that [`check`] passed, resolved: downloads
+/// and every library folder, in the order the config lists them.
 #[derive(Debug)]
 pub struct Folders {
     pub downloads: PathBuf,
-    pub media: PathBuf,
+    pub media: Vec<PathBuf>,
 }
 
 /// Everything a configuration must pass before a run may use it, the one
 /// check `config validate`, every scan and link, and the dashboard's path
-/// editor make: both folders set, absolute and existing; downloads writable,
-/// since every run writes its cache and lock there and a link run its links;
-/// media readable; and neither folder inside the other, nesting behind a
-/// symlink included. It reports every problem, not just the first.
+/// editor make: downloads and at least one library folder set, absolute and
+/// existing; downloads writable, since every run writes its cache and lock
+/// there and a link run its links; each library folder readable; no folder
+/// inside another, nesting behind a symlink included; and no two library
+/// folders with one name. It reports every problem, not just the first.
 ///
 /// It does not walk the folders. A library reached through a second mount
 /// (a bind mount, a mergerfs branch) is found by
@@ -191,7 +237,6 @@ pub fn check(config: &Config) -> std::result::Result<Folders, Problems> {
         "set-downloads",
         &mut problems,
     );
-    let media = check_folder("media", config.media.as_deref(), "set-media", &mut problems);
     if let Some(downloads) = &downloads
         && let Err(err) = probe_directory_writable(downloads)
     {
@@ -200,23 +245,80 @@ pub fn check(config: &Config) -> std::result::Result<Folders, Problems> {
             downloads.display()
         ));
     }
-    if let Some(media) = &media
-        && let Err(err) = fs::read_dir(media)
-    {
-        problems.push(format!(
-            "media path is not readable: {} ({err}); let the user DejaView runs as read it",
-            media.display()
-        ));
+    let media: Vec<Option<PathBuf>> = if config.media.is_empty() {
+        vec![check_folder("media", None, "set-media", &mut problems)]
+    } else {
+        config
+            .media
+            .iter()
+            .map(|folder| check_folder("media", Some(folder), "set-media", &mut problems))
+            .collect()
+    };
+    for folder in media.iter().flatten() {
+        if let Err(err) = fs::read_dir(folder) {
+            problems.push(format!(
+                "media path is not readable: {} ({err}); let the user DejaView runs as read it",
+                folder.display()
+            ));
+        }
     }
-    match (downloads, media) {
-        (Some(downloads), Some(media)) if problems.is_empty() => {
-            match ensure_roots_disjoint(&downloads, &media) {
-                Ok(()) => Ok(Folders { downloads, media }),
-                Err(err) => Err(Problems(vec![format!("{err:#}")])),
+    let (Some(downloads), true) = (downloads, problems.is_empty()) else {
+        return Err(Problems(problems));
+    };
+    let media: Vec<PathBuf> = media.into_iter().flatten().collect();
+    for folder in &media {
+        if let Err(err) = ensure_roots_disjoint(&downloads, folder) {
+            problems.push(format!("{err:#}"));
+        }
+    }
+    // Nesting is judged on the resolved folders, names on the paths the
+    // config gives, which are what a run keys the cache by.
+    let given: Vec<(&PathBuf, &PathBuf)> = media.iter().zip(&config.media).collect();
+    for (i, first) in given.iter().enumerate() {
+        for second in &given[i + 1..] {
+            if let Err(err) = ensure_library_folders_apart(*first, *second) {
+                problems.push(format!("{err:#}"));
             }
         }
-        _ => Err(Problems(problems)),
     }
+    if problems.is_empty() {
+        Ok(Folders { downloads, media })
+    } else {
+        Err(Problems(problems))
+    }
+}
+
+/// Two library folders, each resolved and as the config gives it, must be
+/// separate trees with different names. One inside the other would walk its
+/// files twice; two with one name would share cache keys.
+fn ensure_library_folders_apart(
+    (first, first_given): (&PathBuf, &PathBuf),
+    (second, second_given): (&PathBuf, &PathBuf),
+) -> Result<()> {
+    if first == second {
+        return Err(anyhow!(
+            "the library folder {} is listed twice; list it once",
+            first.display()
+        ));
+    }
+    for (inner, outer) in [(first, second), (second, first)] {
+        if inner.starts_with(outer) {
+            return Err(anyhow!(
+                "library folder {} is inside library folder {}; list only one of them",
+                inner.display(),
+                outer.display()
+            ));
+        }
+    }
+    let name = library_name(first_given);
+    if name == library_name(second_given) {
+        return Err(anyhow!(
+            "two library folders are both named {name}: {} and {}. DejaView tells library folders apart by name, so each needs its own; rename one, or remove it from the list",
+            first_given.display(),
+            second_given.display()
+        ));
+    }
+    Ok(())
 }
 
 /// One folder of the configuration, resolved, or None with its problem
@@ -342,7 +444,7 @@ mod tests {
         let path = root.join("config").join("config.json");
         let config = Config {
             downloads: Some(root.join("downloads")),
-            media: Some(root.join("media")),
+            media: vec![root.join("media")],
             min_age: Some(60),
             min_size: Some(4096),
             threads: Some(4),
@@ -359,6 +461,141 @@ mod tests {
         assert_eq!(loaded.min_size, config.min_size);
         assert_eq!(loaded.threads, config.threads);
         assert_eq!(loaded.link_mode, config.link_mode);
+    }
+
+    #[test]
+    fn a_config_file_with_one_library_folder_loads_and_saves_as_before() {
+        let root = TempDir::new("one_library_folder");
+        let path = root.join("config.json");
+        fs::write(&path, br#"{"downloads": "/dl", "media": "/srv/movies"}"#).expect("write");
+        let loaded = load_config_from_path(&path).expect("load config");
+        assert_eq!(loaded.media, vec![PathBuf::from("/srv/movies")]);
+
+        save_config_to_path(&path, &loaded).expect("save config");
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(saved["media"], serde_json::json!("/srv/movies"));
+    }
+
+    #[test]
+    fn a_config_file_lists_several_library_folders() {
+        let root = TempDir::new("several_library_folders");
+        let path = root.join("config.json");
+        fs::write(&path, br#"{"media": ["/srv/movies", "/srv/tv"]}"#).expect("write");
+        let loaded = load_config_from_path(&path).expect("load config");
+        assert_eq!(
+            loaded.media,
+            vec![PathBuf::from("/srv/movies"), PathBuf::from("/srv/tv")]
+        );
+
+        save_config_to_path(&path, &loaded).expect("save config");
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(
+            saved["media"],
+            serde_json::json!(["/srv/movies", "/srv/tv"])
+        );
+    }
+
+    #[test]
+    fn a_config_file_with_no_library_folder_has_none() {
+        let root = TempDir::new("no_library_folder");
+        let path = root.join("config.json");
+        fs::write(&path, br#"{"media": null}"#).expect("write");
+        assert!(load_config_from_path(&path).expect("load").media.is_empty());
+        fs::write(&path, br#"{}"#).expect("write");
+        assert!(load_config_from_path(&path).expect("load").media.is_empty());
+    }
+
+    #[test]
+    fn check_accepts_several_library_folders() {
+        let root = TempDir::new("validate_several");
+        let downloads = root.join("downloads");
+        let movies = root.join("movies");
+        let tv = root.join("tv");
+        for dir in [&downloads, &movies, &tv] {
+            fs::create_dir_all(dir).expect("create folder");
+        }
+        let config = Config {
+            downloads: Some(downloads),
+            media: vec![movies.clone(), tv.clone()],
+            ..Config::default()
+        };
+        let folders = check(&config).expect("several library folders validate");
+        assert_eq!(folders.media, vec![movies, tv]);
+    }
+
+    #[test]
+    fn check_refuses_a_library_folder_inside_another() {
+        let root = TempDir::new("validate_library_nested");
+        let downloads = root.join("downloads");
+        let library = root.join("library");
+        let movies = library.join("movies");
+        for dir in [&downloads, &movies] {
+            fs::create_dir_all(dir).expect("create folder");
+        }
+        let config = Config {
+            downloads: Some(downloads),
+            media: vec![library, movies],
+            ..Config::default()
+        };
+        assert_overlap_rejected(&config, "library folder");
+    }
+
+    #[test]
+    fn check_refuses_two_library_folders_with_the_same_name() {
+        let root = TempDir::new("validate_same_name");
+        let downloads = root.join("downloads");
+        let first = root.join("a").join("movies");
+        let second = root.join("b").join("movies");
+        for dir in [&downloads, &first, &second] {
+            fs::create_dir_all(dir).expect("create folder");
+        }
+        let config = Config {
+            downloads: Some(downloads),
+            media: vec![first, second],
+            ..Config::default()
+        };
+        assert_overlap_rejected(&config, "both named movies");
+    }
+
+    #[test]
+    fn check_compares_library_names_as_the_config_gives_them() {
+        // The cache names a folder by the path the config gives, so a
+        // symlink that resolves to another name does not make two alike.
+        let root = TempDir::new("validate_same_name_symlink");
+        let downloads = root.join("downloads");
+        let movies = root.join("a").join("movies");
+        let tv = root.join("tv");
+        for dir in [&downloads, &movies, &tv] {
+            fs::create_dir_all(dir).expect("create folder");
+        }
+        fs::create_dir_all(root.join("b")).expect("create b");
+        let also_movies = root.join("b").join("movies");
+        std::os::unix::fs::symlink(&tv, &also_movies).expect("symlink");
+        let config = Config {
+            downloads: Some(downloads),
+            media: vec![movies, also_movies],
+            ..Config::default()
+        };
+        assert_overlap_rejected(&config, "both named movies");
+    }
+
+    #[test]
+    fn check_refuses_a_library_folder_inside_downloads_among_several() {
+        let root = TempDir::new("validate_second_nested");
+        let downloads = root.join("downloads");
+        let movies = root.join("movies");
+        let tv = downloads.join("tv");
+        for dir in [&movies, &tv] {
+            fs::create_dir_all(dir).expect("create folder");
+        }
+        let config = Config {
+            downloads: Some(downloads),
+            media: vec![movies, tv],
+            ..Config::default()
+        };
+        assert_overlap_rejected(&config, "media path is inside");
     }
 
     #[test]
@@ -407,7 +644,7 @@ mod tests {
 
         let config = Config {
             downloads: Some(downloads),
-            media: Some(media),
+            media: vec![media],
             min_age: None,
             min_size: None,
             threads: None,
@@ -427,7 +664,7 @@ mod tests {
 
         let config = Config {
             downloads: Some(downloads),
-            media: Some(root.join("missing-media")),
+            media: vec![root.join("missing-media")],
             min_age: None,
             min_size: None,
             threads: None,
@@ -443,7 +680,7 @@ mod tests {
     fn config_for(downloads: &Path, media: &Path) -> Config {
         Config {
             downloads: Some(downloads.to_path_buf()),
-            media: Some(media.to_path_buf()),
+            media: vec![media.to_path_buf()],
             min_age: None,
             min_size: None,
             threads: None,
@@ -513,7 +750,7 @@ mod tests {
 
         let config = Config {
             downloads: Some(PathBuf::from("downloads")),
-            media: Some(PathBuf::from("media")),
+            media: vec![PathBuf::from("media")],
             min_age: None,
             min_size: None,
             threads: None,

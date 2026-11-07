@@ -147,6 +147,9 @@ enum Item {
     Folder {
         download: String,
         library: String,
+        /// The library folder every file under the heading is in, when
+        /// there are several.
+        tag: Option<String>,
         bytes: u64,
     },
     Pair {
@@ -164,12 +167,41 @@ fn release_folder<'a>(app: &App, entry: &'a LinkReportEntry) -> Option<&'a str> 
         .map(|(folder, _)| folder)
 }
 
-/// The folder the library files share, below the media folder.
+/// A library file's path below its library folder, or the whole path with
+/// `p`.
+fn library_path<'a>(app: &App, path: &'a str, expand: bool) -> &'a str {
+    row_path(path, app.library_folder_of(path), expand)
+}
+
+/// The name of the library folder a library file is in, shown in a column of
+/// its own when there are several folders and paths are not shown whole.
+fn library_tag(app: &App, path: &str) -> Option<String> {
+    if app.media_roots().len() < 2 || app.expand_paths() {
+        return None;
+    }
+    app.library_folder_of(path).map(crate::config::library_name)
+}
+
+/// The width of the folder-name column: the longest name and a space, or
+/// nothing with one library folder.
+fn tag_width(app: &App) -> usize {
+    if app.media_roots().len() < 2 || app.expand_paths() {
+        return 0;
+    }
+    app.media_roots()
+        .iter()
+        .map(|folder| super::width_of(&crate::config::library_name(folder)))
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+/// The folder the library files share, below their library folder.
 fn shared_library_folder(app: &App, rows: &[LinkReportEntry]) -> String {
     let folders: Vec<Vec<&str>> = rows
         .iter()
         .map(|row| {
-            let path = row_path(&row.target, app.media_root(), false);
+            let path = library_path(app, &row.target, false);
             let folder = path.rsplit_once('/').map_or("", |(folder, _)| folder);
             folder.split('/').collect()
         })
@@ -186,8 +218,9 @@ fn shared_library_folder(app: &App, rows: &[LinkReportEntry]) -> String {
 }
 
 /// The pairs in order, a season's episodes under their release folder: two
-/// or more rows in a row that share one. Full paths show no folders, since
-/// each row then names its own.
+/// or more rows in a row that share one, and their library folder too, since
+/// a heading names one. Full paths show no folders, since each row then
+/// names its own.
 fn items(app: &App) -> Vec<Item> {
     let rows = app.rows();
     let mut items = Vec::new();
@@ -197,8 +230,12 @@ fn items(app: &App) -> Vec<Item> {
             .then(|| release_folder(app, &rows[start]))
             .flatten();
         let mut end = start + 1;
+        let tag = library_tag(app, &rows[start].target);
         if let Some(folder) = folder {
-            while end < rows.len() && release_folder(app, &rows[end]) == Some(folder) {
+            while end < rows.len()
+                && release_folder(app, &rows[end]) == Some(folder)
+                && library_tag(app, &rows[end].target) == tag
+            {
                 end += 1;
             }
         }
@@ -207,6 +244,7 @@ fn items(app: &App) -> Vec<Item> {
                 items.push(Item::Folder {
                     download: folder.to_string(),
                     library: shared_library_folder(app, &rows[start..end]),
+                    tag,
                     bytes: rows[start..end].iter().map(|row| row.size).sum(),
                 });
                 items.extend((start..end).map(|index| Item::Pair {
@@ -264,11 +302,11 @@ fn download_text(app: &App, entry: &LinkReportEntry, nested: bool, width: usize)
     }
 }
 
-/// The library file as its row names it: its path below the media folder
+/// The library file as its row names it: its path below its library folder
 /// when that fits in `width`, else its file name, which Sonarr and Radarr
 /// make tell one file from another; the whole path with `p`.
 fn library_text(app: &App, entry: &LinkReportEntry, nested: bool, width: usize) -> String {
-    let path = row_path(&entry.target, app.media_root(), app.expand_paths());
+    let path = library_path(app, &entry.target, app.expand_paths());
     if app.expand_paths() {
         return path.to_string();
     }
@@ -326,7 +364,7 @@ fn row(
     selected: bool,
     download: Span<'static>,
     link: Span<'static>,
-    library: Span<'static>,
+    library: Vec<Span<'static>>,
     size: Span<'static>,
 ) -> Line<'static> {
     let marker = if selected {
@@ -337,7 +375,7 @@ fn row(
     let mut spans = vec![marker, Span::raw(" "), download, Span::raw(GAP), link];
     if columns.library > 0 {
         spans.push(Span::raw(GAP));
-        spans.push(library);
+        spans.extend(library);
     }
     spans.push(Span::raw(GAP));
     spans.push(size);
@@ -354,17 +392,53 @@ fn row(
     line
 }
 
+/// The library folders as the Library heading names them, in `room` cells:
+/// the one folder's path, or the folders' names and where they live,
+/// `movies, tv in /srv`, when they share that folder, the place shortened
+/// from its start to whole folder names to fit; else the names alone.
+fn library_heading(app: &App, room: usize) -> Option<String> {
+    match app.media_roots() {
+        [] => None,
+        [one] => Some(one.display().to_string()),
+        several => {
+            let names = several
+                .iter()
+                .map(|folder| crate::config::library_name(folder))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let parent = several[0].parent().filter(|parent| {
+                parent.parent().is_some()
+                    && several.iter().all(|folder| folder.parent() == Some(parent))
+            });
+            let place_room = room.saturating_sub(super::width_of(&names) + " in ".len());
+            let place = parent.map(|parent| {
+                let whole = parent.display().to_string();
+                let place = trim_keep_name(&whole, place_room);
+                (place == whole || place.starts_with("…/")).then_some(place)
+            });
+            Some(match place.flatten() {
+                Some(place) => format!("{names} in {place}"),
+                None => names,
+            })
+        }
+    }
+}
+
 /// The column headings: each folder named with its path, the link, the size.
 fn headings(app: &App, width: u16, columns: &Columns) -> Line<'static> {
-    let named = |name: &str, root: Option<&std::path::Path>, width: usize| -> Span<'static> {
-        let path = root.map_or_else(|| "not set".to_string(), |root| root.display().to_string());
+    let named = |name: &str, root: Option<String>, width: usize| -> Span<'static> {
+        let path = root.unwrap_or_else(|| "not set".to_string());
         let room = width.saturating_sub(name.chars().count() + 1);
         Span::styled(pad(&trim_keep_name(&path, room), room), Theme::dim())
     };
     let mut spans = vec![
         Span::raw("  "),
         Span::styled("Downloads ", Theme::heading()),
-        named("Downloads", app.downloads_root(), columns.download),
+        named(
+            "Downloads",
+            app.downloads_root().map(|root| root.display().to_string()),
+            columns.download,
+        ),
         Span::raw(GAP),
         Span::styled(
             pad(
@@ -377,7 +451,12 @@ fn headings(app: &App, width: u16, columns: &Columns) -> Line<'static> {
     if columns.library > 0 {
         spans.push(Span::raw(GAP));
         spans.push(Span::styled("Library ", Theme::heading()));
-        spans.push(named("Library", app.media_root(), columns.library));
+        let room = columns.library.saturating_sub("Library ".len());
+        spans.push(named(
+            "Library",
+            library_heading(app, room),
+            columns.library,
+        ));
     }
     spans.push(Span::raw(GAP));
     spans.push(Span::styled(pad_left("Size", SIZE_WIDTH), Theme::dim()));
@@ -441,12 +520,14 @@ pub(super) fn render_pairs(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let rows = app.rows();
+    let tag_width = tag_width(app).min(columns.library / 3);
     let lines: Vec<Line> = items[start..end]
         .iter()
         .map(|item| match item {
             Item::Folder {
                 download,
                 library,
+                tag,
                 bytes,
             } => row(
                 area.width,
@@ -463,8 +544,12 @@ pub(super) fn render_pairs(frame: &mut Frame, area: Rect, app: &App) {
                     Theme::muted(),
                 ),
                 Span::raw(" ".repeat(columns.link())),
-                Span::styled(
-                    pad(&trim_keep_name(library, columns.library), columns.library),
+                library_cell(
+                    tag.as_deref(),
+                    tag_width,
+                    library,
+                    columns.library,
+                    Theme::library_tag(),
                     Theme::muted(),
                 ),
                 Span::styled(pad_left(&format_size(*bytes), SIZE_WIDTH), Theme::muted()),
@@ -499,13 +584,28 @@ pub(super) fn render_pairs(frame: &mut Frame, area: Rect, app: &App) {
                         style,
                     ),
                     Span::styled(kind.drawing(columns.wide_link), kind.style()),
-                    Span::styled(
-                        text(
-                            library_text(app, entry, *nested, columns.library),
+                    {
+                        // An episode under its season's heading, which names
+                        // the folder, is indented below it instead.
+                        let tag_width = if *nested { 0 } else { tag_width };
+                        let tag = library_tag(app, &entry.target);
+                        let room = columns.library - tag_width.min(columns.library);
+                        let rest = text(library_text(app, entry, *nested, room), room);
+                        let tag_style = match kind {
+                            LinkKind::Failed | LinkKind::Already | LinkKind::Skipped => {
+                                kind.text_style()
+                            }
+                            _ => Theme::library_tag(),
+                        };
+                        library_cell(
+                            tag.as_deref(),
+                            tag_width,
+                            &rest,
                             columns.library,
-                        ),
-                        library_style,
-                    ),
+                            tag_style,
+                            library_style,
+                        )
+                    },
                     Span::styled(
                         pad_left(&format_size(entry.size), SIZE_WIDTH),
                         kind.text_style(),
@@ -515,6 +615,32 @@ pub(super) fn render_pairs(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), list);
+}
+
+/// The library column of a row: the library folder's name in a column of
+/// its own when there are several, then the path below it.
+fn library_cell(
+    tag: Option<&str>,
+    tag_width: usize,
+    path: &str,
+    width: usize,
+    tag_style: Style,
+    style: Style,
+) -> Vec<Span<'static>> {
+    if tag_width == 0 {
+        return vec![Span::styled(
+            pad(&trim_keep_name(path, width), width),
+            style,
+        )];
+    }
+    let room = width.saturating_sub(tag_width);
+    vec![
+        Span::styled(
+            pad(&cut(tag.unwrap_or(""), tag_width - 1), tag_width),
+            tag_style,
+        ),
+        Span::styled(pad(&trim_keep_name(path, room), room), style),
+    ]
 }
 
 /// What the selected pair's link is, or will be.
@@ -684,7 +810,7 @@ fn root_name(app: &App, path: &str) -> &'static str {
         .is_some_and(|root| path.starts_with(root))
     {
         "Downloads"
-    } else if app.media_root().is_some_and(|root| path.starts_with(root)) {
+    } else if app.media_roots().iter().any(|root| path.starts_with(root)) {
         "Library"
     } else {
         ""
@@ -701,15 +827,16 @@ pub(super) fn render_scan(frame: &mut Frame, area: Rect, app: &App) {
         .take(3)
         .map(|(_, path)| {
             let name = root_name(app, path);
-            let root = if name == "Downloads" {
-                app.downloads_root()
+            let shown = if name == "Downloads" {
+                row_path(path, app.downloads_root(), app.expand_paths()).to_string()
             } else {
-                app.media_root()
+                let below = library_path(app, path, app.expand_paths());
+                match library_tag(app, path) {
+                    Some(tag) => format!("{tag}/{below}"),
+                    None => below.to_string(),
+                }
             };
-            (
-                name,
-                trim_keep_name(row_path(path, root, app.expand_paths()), width),
-            )
+            (name, trim_keep_name(&shown, width))
         })
         .collect();
     if reading.is_empty()
@@ -778,7 +905,7 @@ pub(super) fn render_empty(frame: &mut Frame, area: Rect, app: &App) {
                 false,
                 Span::styled(pad(left, columns.download), Theme::muted()),
                 Span::styled(link, Theme::faint()),
-                Span::styled(pad(right, columns.library), Theme::muted()),
+                vec![Span::styled(pad(right, columns.library), Theme::muted())],
                 Span::raw(" ".repeat(SIZE_WIDTH)),
             )
         };
@@ -971,6 +1098,160 @@ mod tests {
         );
     }
 
+    /// A scan with a movie in one library folder and two episodes of a
+    /// season in another.
+    fn app_with_two_library_folders() -> App {
+        let config = crate::config::Config {
+            downloads: Some("/srv/downloads".into()),
+            media: vec!["/srv/movies".into(), "/srv/tv".into()],
+            ..crate::config::Config::default()
+        };
+        let mut app = App::new(&config, false);
+        let planned = |source: &str, target: &str| LinkReportEntry {
+            source: source.to_string(),
+            target: target.to_string(),
+            size: 1_000_000_000,
+            status: EntryStatus::Planned,
+            method: Some(LinkMethod::TryHardlink),
+            ..Default::default()
+        };
+        app.set_report_for_test(crate::tui::model::RunReport {
+            mode: Mode::Scan,
+            planned_actions: 3,
+            entries: vec![
+                planned(
+                    "/srv/downloads/Arrival.2016.mkv",
+                    "/srv/movies/Arrival (2016)/Arrival (2016).mkv",
+                ),
+                planned(
+                    "/srv/downloads/Show.S01/Show.S01E01.mkv",
+                    "/srv/tv/Show/Season 1/Show - S01E01.mkv",
+                ),
+                planned(
+                    "/srv/downloads/Show.S01/Show.S01E02.mkv",
+                    "/srv/tv/Show/Season 1/Show - S01E02.mkv",
+                ),
+            ],
+            ..Default::default()
+        });
+        app
+    }
+
+    #[test]
+    fn with_several_library_folders_each_row_names_its_folder_in_a_column() {
+        let mut app = app_with_two_library_folders();
+        let text = screen(&app, 160, 40);
+        assert!(text.contains("Library movies, tv in /srv"), "{text}");
+
+        // A long parent is shortened from its start; the names stay whole.
+        let long = "/home/someone/a/rather/long/path/to/the/pool/of/every/library";
+        let config = crate::config::Config {
+            downloads: Some("/srv/downloads".into()),
+            media: vec![format!("{long}/movies").into(), format!("{long}/tv").into()],
+            ..crate::config::Config::default()
+        };
+        let narrow = screen(&App::new(&config, false), 160, 40);
+        let heading = narrow
+            .lines()
+            .find(|line| line.contains("Library "))
+            .unwrap_or_else(|| panic!("the heading:\n{narrow}"));
+        assert!(heading.contains("Library movies, tv in …/"), "{heading}");
+        assert!(heading.contains("/of/every/library"), "{heading}");
+        // Where no whole folder name of the place fits, the names stand alone.
+        let pool = "/mnt/the-one-pool-that-holds-every-library-folder-we-keep";
+        let tight_config = crate::config::Config {
+            downloads: Some("/srv/downloads".into()),
+            media: vec![format!("{pool}/movies").into(), format!("{pool}/tv").into()],
+            ..crate::config::Config::default()
+        };
+        let tight = screen(&App::new(&tight_config, false), 160, 40);
+        let heading = tight
+            .lines()
+            .find(|line| line.contains("Library "))
+            .unwrap_or_else(|| panic!("the heading:\n{tight}"));
+        assert!(heading.contains("Library movies, tv "), "{heading}");
+        assert!(!heading.contains(" in "), "{heading}");
+        // Folders in different places share no place to name.
+        let apart = crate::config::Config {
+            downloads: Some("/srv/downloads".into()),
+            media: vec!["/srv/a/movies".into(), "/srv/b/tv".into()],
+            ..crate::config::Config::default()
+        };
+        let apart_text = screen(&App::new(&apart, false), 160, 40);
+        assert!(apart_text.contains("Library movies, tv "), "{apart_text}");
+        assert!(!apart_text.contains("movies, tv in"), "{apart_text}");
+        let movie = text
+            .lines()
+            .find(|line| line.contains("Arrival.2016.mkv"))
+            .unwrap_or_else(|| panic!("the movie row:\n{text}"));
+        assert!(
+            movie.contains("movies Arrival (2016)/Arrival (2016).mkv"),
+            "{movie}"
+        );
+        let season = text
+            .lines()
+            .find(|line| line.contains("▾ Show.S01"))
+            .unwrap_or_else(|| panic!("the season heading:\n{text}"));
+        assert!(season.contains("tv     Show/Season 1"), "{season}");
+        let episode = text
+            .lines()
+            .find(|line| line.contains("Show.S01E01.mkv"))
+            .unwrap_or_else(|| panic!("the episode row:\n{text}"));
+        // Columns in characters: the link drawings take several bytes each.
+        let column =
+            |line: &str, text: &str| line.find(text).map(|byte| line[..byte].chars().count());
+        assert_eq!(
+            column(episode, "  Show - S01E01.mkv"),
+            column(season, "tv     Show"),
+            "indented under the heading:\n{text}"
+        );
+
+        // Full paths need no folder column.
+        app.toggle_path_mode_for_test();
+        let text = screen(&app, 160, 40);
+        assert!(
+            text.contains("/srv/movies/Arrival (2016)/Arrival (2016).mkv"),
+            "{text}"
+        );
+        assert!(!text.contains("movies Arrival"), "{text}");
+    }
+
+    #[test]
+    fn a_release_folder_spanning_two_library_folders_still_names_each_files_folder() {
+        let config = crate::config::Config {
+            downloads: Some("/srv/downloads".into()),
+            media: vec!["/srv/movies".into(), "/srv/tv".into()],
+            ..crate::config::Config::default()
+        };
+        let mut app = App::new(&config, false);
+        let planned = |source: &str, target: &str| LinkReportEntry {
+            source: source.to_string(),
+            target: target.to_string(),
+            size: 1_000_000_000,
+            status: EntryStatus::Planned,
+            method: Some(LinkMethod::TryHardlink),
+            ..Default::default()
+        };
+        app.set_report_for_test(crate::tui::model::RunReport {
+            mode: Mode::Scan,
+            planned_actions: 2,
+            entries: vec![
+                planned("/srv/downloads/complete/a.mkv", "/srv/movies/A/a.mkv"),
+                planned("/srv/downloads/complete/b.mkv", "/srv/tv/B/b.mkv"),
+            ],
+            ..Default::default()
+        });
+        let text = screen(&app, 160, 40);
+        let row = |name: &str| {
+            text.lines()
+                .find(|line| line.contains(name) && line.contains("╌"))
+                .unwrap_or_else(|| panic!("the {name} row:\n{text}"))
+                .to_string()
+        };
+        assert!(row("a.mkv").contains("movies A/a.mkv"), "{text}");
+        assert!(row("b.mkv").contains("tv     B/b.mkv"), "{text}");
+    }
+
     #[test]
     fn a_narrow_table_leaves_the_library_file_to_the_details() {
         let app = app_with_episodes(2);
@@ -1037,7 +1318,7 @@ mod tests {
     fn app_with_a_planned_symlink() -> App {
         let config = crate::config::Config {
             downloads: Some("/downloads".into()),
-            media: Some("/media".into()),
+            media: vec!["/media".into()],
             ..crate::config::Config::default()
         };
         let mut app = App::new(&config, false);
@@ -1096,7 +1377,7 @@ mod tests {
     fn a_wide_name_keeps_the_columns_in_line() {
         let config = crate::config::Config {
             downloads: Some("/dl".into()),
-            media: Some("/media".into()),
+            media: vec!["/media".into()],
             ..crate::config::Config::default()
         };
         let mut app = App::new(&config, false);
@@ -1138,7 +1419,7 @@ mod tests {
         use crossterm::event::{KeyCode, KeyModifiers};
         let config = crate::config::Config {
             downloads: Some("/dl".into()),
-            media: Some("/media".into()),
+            media: vec!["/media".into()],
             ..crate::config::Config::default()
         };
         let mut app = App::new(&config, false);
@@ -1178,7 +1459,7 @@ mod tests {
     fn a_release_with_a_subfolder_has_one_heading() {
         let config = crate::config::Config {
             downloads: Some("/dl".into()),
-            media: Some("/media".into()),
+            media: vec!["/media".into()],
             ..crate::config::Config::default()
         };
         let mut app = App::new(&config, false);

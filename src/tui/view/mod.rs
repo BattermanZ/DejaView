@@ -687,7 +687,7 @@ pub(crate) mod test_support {
         let downloads = "/tmp/claude-0/-home-user/a-very-long-session-folder/downloads";
         let config = crate::config::Config {
             downloads: Some(std::path::PathBuf::from(downloads)),
-            media: Some(std::path::PathBuf::from("/srv/media")),
+            media: vec![std::path::PathBuf::from("/srv/media")],
             ..crate::config::Config::default()
         };
         let mut app = App::new(&config, false);
@@ -720,7 +720,7 @@ pub(crate) mod test_support {
     pub(crate) fn app_with_link_report() -> App {
         let config = crate::config::Config {
             downloads: Some(std::path::PathBuf::from("/downloads")),
-            media: Some(std::path::PathBuf::from("/media")),
+            media: vec![std::path::PathBuf::from("/media")],
             ..crate::config::Config::default()
         };
         let mut app = App::new(&config, false);

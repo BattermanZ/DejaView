@@ -122,6 +122,12 @@ impl Theme {
         Style::default().bg(Self::SURFACE0)
     }
 
+    /// The name of the library folder a library file is in, when there are
+    /// several.
+    pub fn library_tag() -> Style {
+        Self::fg(Self::TEAL)
+    }
+
     /// The bar at the selected row's left edge.
     pub fn marker() -> Style {
         Style::default().fg(Self::TEAL).bg(Self::SURFACE0)

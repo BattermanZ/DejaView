@@ -52,12 +52,18 @@ perf:
 # shows): rows that become hardlinks, rows that become symlinks because their
 # library file is on a second filesystem, rows already linked, files that
 # differ, and a link and a read that fail. It starts over each time, and
-# points the config `just try` uses at itself.
+# points the config `just try` uses at itself: with media/Movies and
+# media/TV as two library folders, or with `just sandbox one`, media as the
+# one library folder, the setup most people have.
 #
-# A fresh scratch library to run DejaView against.
-sandbox:
+# A fresh scratch library to run DejaView against: `just sandbox [one]`.
+sandbox layout="several":
     #!/usr/bin/env bash
     set -euo pipefail
+    case "{{ layout }}" in
+        several | one) ;;
+        *) echo "error: unknown layout {{ layout }}; use just sandbox, or just sandbox one" >&2; exit 1 ;;
+    esac
     rm -rf "{{ dev_dir }}/home"
     # The second disk lives in memory, under a name unique to this checkout.
     shm=""
@@ -68,9 +74,15 @@ sandbox:
     fi
     scripts/sandbox.sh "$PWD/{{ sandbox }}" "$shm"
     just try config set-downloads "$PWD/{{ sandbox }}/downloads" >/dev/null
-    just try config set-media "$PWD/{{ sandbox }}/media" >/dev/null
+    if [ "{{ layout }}" = one ]; then
+        just try config set-media "$PWD/{{ sandbox }}/media" >/dev/null
+        library="one library folder, media"
+    else
+        just try config set-media "$PWD/{{ sandbox }}/media/Movies" "$PWD/{{ sandbox }}/media/TV" >/dev/null
+        library="two library folders, Movies and TV"
+    fi
     just try config set-min-age 0 >/dev/null
-    echo "Sandbox ready under {{ sandbox }}. Try: just try tui"
+    echo "Sandbox ready under {{ sandbox }}, with $library. Try: just try tui"
 
 # Its config and log are kept under .dev/home, so the real ones are never
 # touched. The cache lives in the downloads folder, as always. When the
