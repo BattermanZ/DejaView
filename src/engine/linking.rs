@@ -262,6 +262,34 @@ pub(super) fn hardlink_failure_cause(err: &anyhow::Error) -> Option<&'static str
     })
 }
 
+/// What a person reads for a pair that failed: what happened and what to do
+/// about it, then the system's own words. Without an OS error in the chain,
+/// or with one no advice fits, it is the chain itself: those messages already
+/// name the file and the next step. The log keeps the whole chain either way.
+pub(super) fn link_failure_message(err: &anyhow::Error, src: &Path) -> String {
+    use std::io::ErrorKind;
+    let Some(io) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+    else {
+        return format!("{err:#}");
+    };
+    let folder = src.parent().unwrap_or(src).display();
+    let what = match io.kind() {
+        ErrorKind::PermissionDenied => format!(
+            "DejaView was not allowed to change the folder {folder}, so the download was left as it was. Give the user that runs DejaView write access to that folder, then link again."
+        ),
+        ErrorKind::ReadOnlyFilesystem => format!(
+            "The folder {folder} is on a filesystem mounted read-only, so the download was left as it was. Mount it read-write, then link again."
+        ),
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => format!(
+            "The disk that holds {folder} is full, so the download was left as it was. Free some space there, then link again."
+        ),
+        _ => return format!("{err:#}"),
+    };
+    format!("{what} The system said: {io}.")
+}
+
 /// The downloads and media roots, resolved once per run.
 pub(super) struct CanonicalRoots {
     pub(super) downloads: PathBuf,
@@ -512,8 +540,10 @@ where
         Ok(())
     })();
     if let Err(err) = result {
+        // As context, so the OS error stays in the chain for
+        // link_failure_message to read.
         let note = clean_up_temp(&tmp, "symlink", req.src);
-        return Err(anyhow!("{err:#}; {note}"));
+        return Err(err.context(note));
     }
     Ok(())
 }
@@ -947,9 +977,11 @@ pub(super) fn apply_actions(
             Ok(outcome) => outcome,
             Err(err) => {
                 warnings.link_errors += 1;
-                // The whole chain: the outer context alone names the step,
-                // and the OS error that says why is in its cause.
-                let err = format!("{err:#}");
+                // The log gets the whole chain: the outer context names the
+                // step, and the OS error that says why is in its cause. The
+                // report and the screen get what happened and what to do.
+                let chain = format!("{err:#}");
+                let err = link_failure_message(&err, &action.src);
                 let entry = &mut report_entries[index];
                 entry.status = EntryStatus::Failed;
                 // What the plan expected no longer applies to a pair that
@@ -960,7 +992,7 @@ pub(super) fn apply_actions(
                 logger::error(
                     "link",
                     format!(
-                        "failed {} -> {}: {err}",
+                        "failed {} -> {}: {chain}",
                         action.src.display(),
                         action.tgt.display(),
                     ),

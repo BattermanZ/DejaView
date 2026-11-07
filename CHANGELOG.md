@@ -35,6 +35,7 @@
 
 ### Changed
 
+- A pair that fails to link because of a system error (no permission to write in the download's folder, a read-only or full disk) now says in the report, the summary and the dashboard what happened and what to do, followed by the system's own words. Before, it gave the steps that failed, such as `ln -s … beside …: Permission denied (os error 13)`; the log still does. In the dashboard, the details under the pairs grow to show such a message whole. [#10]
 - `scan` and `link` print the downloads and media folders once and each path below its folder, with a size column, where every row repeated both absolute paths. A link run ends with one line saying what it did, such as `Linked 7 of 8, 8.0 MiB freed, 1 failed: see <report>`, naming any downloads that became symlinks, and a run that finds nothing says `No duplicates found.` over no table. Before, a run with failed links still ended with "Potential space saved" and "Done", and none said how much space it freed. Sizes are in KiB, MiB and GiB. [#5]
 - A scan or link run from the dashboard reports which file it is on and how many it has found or hashed up to ten times a second, instead of once for every file, which on a large library sent the dashboard hundreds of thousands of updates. [#4]
 - Hashing makes fewer round trips to a network drive: quick and full hashes read exactly the bytes they hash, where each spent one or two more reads finding the end of the file, and a full hash reads 8 MiB at a time instead of 1 MiB. [#4]
@@ -90,3 +91,4 @@
 [#6]: https://github.com/BattermanZ/DejaView/pull/6
 [#7]: https://github.com/BattermanZ/DejaView/pull/7
 [#9]: https://github.com/BattermanZ/DejaView/pull/9
+[#10]: https://github.com/BattermanZ/DejaView/pull/10

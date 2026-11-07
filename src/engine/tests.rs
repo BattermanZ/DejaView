@@ -950,11 +950,24 @@ fn a_link_run_with_one_failed_pair_reports_each_pair_as_it_ended() {
     );
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["method"], serde_json::Value::Null);
+    // The error says what happened and what to do, in a person's words,
+    // then the system's own.
+    let error = failed["error"].as_str().unwrap_or_default();
+    let locked_name = locked.display().to_string();
     assert!(
-        failed["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("Permission denied")),
-        "{failed}"
+        error.starts_with(&format!(
+            "DejaView was not allowed to change the folder {locked_name}"
+        )),
+        "{error}"
+    );
+    assert!(error.contains("write access to that folder"), "{error}");
+    assert!(
+        error.ends_with("Permission denied (os error 13)."),
+        "{error}"
+    );
+    assert!(
+        !error.contains("ln -s"),
+        "the steps stay in the log: {error}"
     );
     assert_eq!(report["entries"][1]["status"], "applied");
     assert_eq!(report["entries"][1]["method"], "hardlink");

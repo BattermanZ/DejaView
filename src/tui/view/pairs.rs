@@ -574,6 +574,20 @@ fn note(entry: &LinkReportEntry, kind: LinkKind) -> (String, Style) {
     }
 }
 
+/// The lines above the note in the details: name and size, folder, link.
+const DETAILS_HEAD: usize = 3;
+
+/// The rows the details need to show the selected pair's note whole in an
+/// area `width` wide: the rule, the three lines above the note, the note.
+pub(super) fn details_rows(app: &App, width: u16) -> usize {
+    let Some(entry) = app.selected_entry() else {
+        return 0;
+    };
+    let (note, _) = note(entry, LinkKind::of(entry));
+    let width = usize::from(super::inset(Rect::new(0, 0, width, 1), 2).width);
+    1 + DETAILS_HEAD + super::wrap_text(&note, width).len()
+}
+
 /// The selected pair in full: its download, the link it has or will have to
 /// which library file, and what to know about it.
 pub(super) fn render_details(frame: &mut Frame, area: Rect, app: &App) {
@@ -971,6 +985,31 @@ mod tests {
             .find(|line| line.contains("becomes a hardlink to"))
             .unwrap_or_else(|| panic!("the details:\n{text}"));
         assert!(details.contains("Show Name S01E01.mkv"), "{details}");
+    }
+
+    #[test]
+    fn the_details_grow_to_show_a_long_failure_whole() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_with_link_report();
+        let long = "DejaView was not allowed to change the folder /downloads/Gamma.2022, so the download was left as it was. Give the user that runs DejaView write access to that folder, then link again. The system said: Permission denied (os error 13).";
+        app.set_entry_error_for_test(2, long);
+        app.handle_key_for_test(KeyCode::End, KeyModifiers::NONE);
+        for (cols, rows) in [(120u16, 40u16), (80, 30)] {
+            let text = screen(&app, cols, rows);
+            // Its last words, wherever the lines break.
+            assert!(text.contains("The system said"), "{cols}x{rows}:\n{text}");
+            assert!(text.contains("13)."), "{cols}x{rows}:\n{text}");
+            assert!(text.contains("write access"), "{cols}x{rows}:\n{text}");
+            for name in ["Alpha.2020", "Beta.2021", "Gamma.2022"] {
+                assert!(text.contains(name), "{cols}x{rows}: rows kept:\n{text}");
+            }
+        }
+        // A pair with a short note keeps the panel as it was.
+        app.handle_key_for_test(KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(
+            screen(&app, 120, 40),
+            screen(&app_with_link_report(), 120, 40)
+        );
     }
 
     #[test]
