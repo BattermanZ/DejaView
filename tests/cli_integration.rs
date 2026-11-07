@@ -4,6 +4,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 fn run_cmd(root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_dejaview"))
@@ -2306,4 +2307,211 @@ fn a_scan_refuses_two_library_folders_with_one_name() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("both named movies"), "{stderr}");
+}
+
+/// A dashboard started on a terminal of its own by `script`, with SIGHUP
+/// ignored as `nohup` leaves it, so that closing the terminal sends it
+/// nothing: the way a terminal that dies without its hang-up reaching the
+/// dashboard looks from inside it.
+struct TerminalSession {
+    script: std::process::Child,
+    keys: std::process::ChildStdin,
+    pid: u32,
+    drawn: std::sync::mpsc::Receiver<()>,
+}
+
+impl TerminalSession {
+    fn start(root: &Path, args: &[&str]) -> Self {
+        use std::io::Read;
+        use std::process::Stdio;
+
+        let pid_file = root.join("dashboard.pid");
+        let command = format!(
+            "stty cols 120 rows 40; echo $$ > '{}'; exec '{}' {}",
+            pid_file.display(),
+            env!("CARGO_BIN_EXE_dejaview"),
+            args.join(" ")
+        );
+        let mut script = Command::new("nohup")
+            .args([
+                "script",
+                "--quiet",
+                "--flush",
+                "--command",
+                &command,
+                "/dev/null",
+            ])
+            .env("SHELL", "/bin/sh")
+            .env("TERM", "xterm-256color")
+            .env("XDG_CONFIG_HOME", root.join("xdg"))
+            .env("HOME", root.join("home"))
+            .env("DEJAVIEW_LOG", root.join("dejaview.log"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start script, from util-linux");
+        let keys = script.stdin.take().expect("stdin");
+        let mut screen = script.stdout.take().expect("stdout");
+        let (drawn_tx, drawn) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = screen.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buf[..n]);
+                // The alternate screen, then something drawn on it.
+                if let Some(at) = seen.windows(8).position(|w| w == b"\x1b[?1049h")
+                    && seen.len() > at + 200
+                {
+                    let _ = drawn_tx.send(());
+                    // Keep draining, so the terminal never blocks a write.
+                    while matches!(screen.read(&mut buf), Ok(n) if n > 0) {}
+                    break;
+                }
+            }
+        });
+        let pid = wait_for(Duration::from_secs(30), || {
+            fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|pid| pid.trim().parse().ok())
+        })
+        .expect("the dashboard's pid");
+        let session = TerminalSession {
+            script,
+            keys,
+            pid,
+            drawn,
+        };
+        session
+            .drawn
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the dashboard draws its screen");
+        session
+    }
+
+    fn press(&mut self, key: &str) {
+        use std::io::Write;
+        self.keys.write_all(key.as_bytes()).expect("press a key");
+        self.keys.flush().expect("flush key");
+    }
+
+    /// Close the terminal: `script` holds its other end, and dies at once.
+    fn close_terminal(&mut self) {
+        self.script.kill().expect("kill script");
+        self.script.wait().expect("reap script");
+    }
+
+    fn exited_within(&self, limit: Duration) -> bool {
+        wait_for(limit, || (!process_alive(self.pid)).then_some(())).is_some()
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = self.script.kill();
+        let _ = self.script.wait();
+        // A failed test leaves the dashboard, or a scan it started that
+        // outlived it. `script` made the dashboard a session leader, and the
+        // session keeps its id after the leader is gone.
+        let _ = Command::new("pkill")
+            .args(["-KILL", "--session", &self.pid.to_string()])
+            .status();
+    }
+}
+
+fn wait_for<T>(limit: Duration, mut check: impl FnMut() -> Option<T>) -> Option<T> {
+    let end = std::time::Instant::now() + limit;
+    loop {
+        if let Some(value) = check() {
+            return Some(value);
+        }
+        if std::time::Instant::now() > end {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Running, as opposed to gone or a zombie waiting to be reaped.
+fn process_alive(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(") ")
+                .map(|(_, rest)| !rest.starts_with('Z'))
+        })
+        .unwrap_or(false)
+}
+
+#[test]
+fn the_dashboard_exits_when_its_terminal_is_gone() {
+    let root = TempDir::new("tui_terminal_gone");
+    let mut dashboard = TerminalSession::start(&root, &["tui"]);
+    // Past a few of the watch's checks, a live terminal is not judged gone.
+    std::thread::sleep(Duration::from_millis(2500));
+    assert!(
+        process_alive(dashboard.pid),
+        "the dashboard exited while its terminal was open"
+    );
+    dashboard.close_terminal();
+    assert!(
+        dashboard.exited_within(Duration::from_secs(10)),
+        "the dashboard still runs 10 s after its terminal closed"
+    );
+    let log = fs::read_to_string(root.join("dejaview.log")).expect("read log");
+    assert!(log.contains("terminal is gone"), "log={log}");
+}
+
+#[test]
+fn the_logo_preview_exits_when_its_terminal_is_gone() {
+    let root = TempDir::new("preview_terminal_gone");
+    let mut preview = TerminalSession::start(&root, &["tui-logo-preview"]);
+    preview.close_terminal();
+    assert!(
+        preview.exited_within(Duration::from_secs(10)),
+        "the logo preview still runs 10 s after its terminal closed"
+    );
+    let log = fs::read_to_string(root.join("dejaview.log")).expect("read log");
+    assert!(log.contains("terminal is gone"), "log={log}");
+}
+
+#[test]
+fn a_scan_the_dashboard_started_stops_when_its_terminal_is_gone() {
+    let root = TempDir::new("tui_terminal_gone_scan");
+    let downloads = root.join("downloads");
+    let media = root.join("media");
+    fs::create_dir_all(&downloads).expect("create downloads");
+    fs::create_dir_all(&media).expect("create media");
+    // Two copies large enough that the scan is still reading when the
+    // terminal closes.
+    for path in [media.join("big.mkv"), downloads.join("big.mkv")] {
+        let file = fs::File::create(&path).expect("create sparse file");
+        file.set_len(8 << 30).expect("size sparse file");
+    }
+    configure_small_files(&root, &downloads, &media);
+
+    let mut dashboard = TerminalSession::start(&root, &["tui"]);
+    dashboard.press("s");
+    let log_path = root.join("dejaview.log");
+    let scan_started = wait_for(Duration::from_secs(30), || {
+        fs::read_to_string(&log_path)
+            .ok()
+            .filter(|log| log.contains("op=scan msg=\"run started\""))
+    });
+    assert!(scan_started.is_some(), "the dashboard started a scan");
+    dashboard.close_terminal();
+
+    assert!(
+        dashboard.exited_within(Duration::from_secs(30)),
+        "the dashboard still runs 30 s after its terminal closed"
+    );
+    let log = fs::read_to_string(&log_path).expect("read log");
+    assert!(
+        log.contains("cancelled by user before any change was made"),
+        "the scan was cancelled, not left running: log={log}"
+    );
+    assert!(log.contains("terminal is gone"), "log={log}");
 }

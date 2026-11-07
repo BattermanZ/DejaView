@@ -53,6 +53,7 @@
 
 ### Fixed
 
+- The dashboard exits once its terminal closes, after stopping any scan or link it started as its cancel key does, which it waits up to 30 seconds for. Before, a dashboard whose terminal closed without a hang-up signal reaching it (the shell killed along with the window, or the dashboard started under `nohup`) kept running at a full CPU core until killed by hand, and a run it had started went on alone. [#13]
 - A scan or link run as a user who cannot write to the downloads folder, on a downloads folder with no space left, or as a user who cannot read the media folder, stops before it walks anything and says which folder and why. Before, such a scan could hash for hours and then fail to save its cache. `dejaview config validate`, every scan and link, and the dashboard's path editor now check a configuration the same way and name every problem at once. [#7]
 - A file whose name is not valid UTF-8 can be linked from the dashboard, and two names that differ only in such bytes are told apart: a report entry gives such a path's bytes in hex in `source_raw` or `target_raw`, and the cache keys each name apart. Before, `l` and `L` linked nothing for such a file, its report rows could not be told apart, and the cache kept one entry for both names, so both were hashed again on every run. [#5]
 - `cache audit-temp` and `cache cleanup-temp` find a temporary symlink left beside a download by a run stopped partway, and remove the link without touching the library file it points at. Before, they listed and removed only temporary files. [#5]
@@ -94,3 +95,4 @@
 [#9]: https://github.com/BattermanZ/DejaView/pull/9
 [#10]: https://github.com/BattermanZ/DejaView/pull/10
 [#11]: https://github.com/BattermanZ/DejaView/issues/11
+[#13]: https://github.com/BattermanZ/DejaView/issues/13
