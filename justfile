@@ -47,41 +47,56 @@ format:
 perf:
     cargo test --release --locked --test perf_harness -- --ignored --nocapture
 
-# A downloads folder and a media folder under .dev/sandbox, with duplicate
-# pairs, a same-size file that differs, and two copies of one library file in
-# the downloads folder. It starts over each time, and points the config `just
-# try` uses at itself.
+# A downloads folder and a media folder under .dev/sandbox, of sparse files
+# with film and episode sizes (see scripts/sandbox.sh for what each one
+# shows): rows that become hardlinks, rows that become symlinks because their
+# library file is on a second filesystem, rows already linked, files that
+# differ, and a link and a read that fail. It starts over each time, and
+# points the config `just try` uses at itself.
 #
 # A fresh scratch library to run DejaView against.
 sandbox:
     #!/usr/bin/env bash
     set -euo pipefail
-    rm -rf "{{ sandbox }}" "{{ dev_dir }}/home"
-    d="{{ sandbox }}/downloads"; m="{{ sandbox }}/media"
-    mkdir -p "$d/Arrival.2016.1080p" "$d/Show.S01" "$m/Movies" "$m/TV/Show/Season 1"
-    fill() { head -c "$2" /dev/urandom > "$1"; }
-    fill "$m/Movies/Arrival (2016).mkv" 3000000
-    fill "$m/TV/Show/Season 1/Show S01E01.mkv" 2000000
-    fill "$m/TV/Show/Season 1/Show S01E02.mkv" 2000000
-    cp "$m/Movies/Arrival (2016).mkv" "$d/Arrival.2016.1080p/Arrival.2016.1080p.mkv"
-    cp "$m/TV/Show/Season 1/Show S01E01.mkv" "$d/Show.S01/Show.S01E01.mkv"
-    cp "$m/TV/Show/Season 1/Show S01E01.mkv" "$d/Show.S01/Show.S01E01.copy.mkv"
-    fill "$d/Show.S01/Show.S01E02.mkv" 2000000
-    just try config set-downloads "$PWD/$d" >/dev/null
-    just try config set-media "$PWD/$m" >/dev/null
+    rm -rf "{{ dev_dir }}/home"
+    # The second disk lives in memory, under a name unique to this checkout.
+    shm=""
+    # It needs a private mount namespace, which some containers refuse.
+    if [ -d /dev/shm ] && command -v setpriv >/dev/null \
+        && unshare --user --map-root-user --mount true 2>/dev/null; then
+        shm="/dev/shm/dejaview-sandbox-$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
+    fi
+    scripts/sandbox.sh "$PWD/{{ sandbox }}" "$shm"
+    just try config set-downloads "$PWD/{{ sandbox }}/downloads" >/dev/null
+    just try config set-media "$PWD/{{ sandbox }}/media" >/dev/null
     just try config set-min-age 0 >/dev/null
-    echo "Sandbox ready under {{ sandbox }}: 3 duplicates of 2 library files, 1 same-size file that differs."
-    echo "Try: just try scan"
+    echo "Sandbox ready under {{ sandbox }}. Try: just try tui"
 
 # Its config and log are kept under .dev/home, so the real ones are never
-# touched. The cache lives in the downloads folder, as always.
+# touched. The cache lives in the downloads folder, as always. When the
+# sandbox has a second disk, dejaview runs in a private mount namespace where
+# that disk is mounted into the library, as a user that holds no
+# capabilities, so file permissions still apply.
 #
-# Run dejaview against the sandbox: `just try scan`, `just try link --json`.
+# Run dejaview against the sandbox: `just try tui`, `just try scan`, `just try link --json`.
 try *args:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --locked --quiet
     home="$PWD/{{ dev_dir }}/home"
     mkdir -p "$home"
-    HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_STATE_HOME="$home/state" RUST_BACKTRACE=0 \
-        "{{ target_dir }}/debug/dejaview" "$@"
+    run=(env HOME="$home" XDG_CONFIG_HOME="$home/config" XDG_STATE_HOME="$home/state" RUST_BACKTRACE=0
+        "{{ target_dir }}/debug/dejaview" "$@")
+    mounts="{{ sandbox }}/.second-disk"
+    if [ ! -f "$mounts" ]; then
+        exec "${run[@]}"
+    fi
+    while IFS=$'\t' read -r src _; do
+        [ -d "$src" ] || { echo "error: the sandbox's second disk is gone (after a restart?). Run: just sandbox" >&2; exit 1; }
+    done < "$mounts"
+    exec unshare --user --map-root-user --mount -- bash -c '
+        set -euo pipefail
+        while IFS=$'"'"'\t'"'"' read -r src dst; do mount --bind "$src" "$dst"; done < "$1"
+        shift
+        exec setpriv --inh-caps=-all --bounding-set=-all -- "$@"
+    ' _ "$mounts" "${run[@]}"
