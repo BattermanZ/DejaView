@@ -1320,6 +1320,12 @@ impl App {
         self.run.report = Some(report);
     }
 
+    pub(crate) fn set_entry_error_for_test(&mut self, index: usize, error: &str) {
+        if let Some(report) = self.run.report.as_mut() {
+            report.entries[index].error = Some(error.to_string());
+        }
+    }
+
     pub(crate) fn toggle_path_mode_for_test(&mut self) {
         self.toggle_path_mode();
     }

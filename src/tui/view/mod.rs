@@ -448,6 +448,9 @@ fn inset(area: Rect, columns: u16) -> Rect {
     }
 }
 
+/// The rows the pairs keep, headings included, when the details grow.
+const MIN_PAIR_ROWS: u16 = 6;
+
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
     app.view_sizes().clear_clicks();
@@ -468,6 +471,19 @@ pub fn render(frame: &mut Frame, app: &App) {
         && let Some(rows) = details.take()
     {
         body = body.union(rows);
+    }
+    // A note too long for the details, such as a failure's, takes rows from
+    // the pairs above, up to a third of the screen, so it reads whole.
+    if let Some(area) = details.as_mut() {
+        let wanted = u16::try_from(pairs::details_rows(app, area.width)).unwrap_or(u16::MAX);
+        let most = (frame.area().height / 3).max(area.height);
+        let grow = wanted
+            .min(most)
+            .saturating_sub(area.height)
+            .min(body.height.saturating_sub(MIN_PAIR_ROWS));
+        body.height -= grow;
+        area.y -= grow;
+        area.height += grow;
     }
     if app.scan_running() {
         pairs::render_scan(frame, body, app);
