@@ -147,7 +147,8 @@ just check          # cargo fmt --check, then clippy on every target with warnin
 just test           # every test; under root, the unit tests again as nobody
 just format         # apply cargo fmt
 just perf           # the perf harness, in a release build
-just sandbox        # a fresh scratch downloads and media tree under .dev/sandbox
+just sandbox        # a fresh scratch tree under .dev/sandbox, Movies and TV as two library folders
+just sandbox one    # the same tree with media as the one library folder
 just try <args>     # run dejaview against it: just try scan, just try link --json
 ```
 
@@ -164,7 +165,9 @@ tests return early and still report `ok`. Run `just test` rather than `cargo
 test` in a root shell, which a cloud container is.
 
 **The live check is `just sandbox`, then `just try`.** Run the change the way
-a person would (`just try scan`, `just try link`) and look at the disk:
+a person would (`just try scan`, `just try link`) and look at the disk. A
+change to the walk, the cache, the report or the paths shown runs on both
+layouts: `just sandbox` (two library folders) and `just sandbox one` (one).
 `ls -li .dev/sandbox/downloads/*` shows a hardlink as an inode shared with the
 library file. `just try` keeps the config and log under `.dev/home`, so the
 real ones are never touched. A change to the TUI is looked at by a person in a
