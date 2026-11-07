@@ -611,7 +611,7 @@ impl App {
     }
 
     /// How far the full pass has read, how fast and how long it has left:
-    /// `12.3 GiB of 40.0 GiB  |  150.0 MiB/s  |  ETA 03:05`. Speed and time
+    /// `12.3 GiB of 40.0 GiB  |  150.0 MiB/s  |  ETA 03:05`, or `ETA 6h 20m`. Speed and time
     /// left wait for a second of reading.
     pub fn full_pass_progress(&self) -> Option<String> {
         let (done, total) = self.run.hash_bytes?;
@@ -1484,11 +1484,14 @@ impl App {
     }
 }
 
+/// `12:05` under an hour, `6h 20m` from an hour on, where the seconds no
+/// longer matter and a count of minutes such as `380:12` is hard to read.
 fn format_duration(duration: Duration) -> String {
     let secs = duration.as_secs();
-    let minutes = secs / 60;
-    let seconds = secs % 60;
-    format!("{minutes:02}:{seconds:02}")
+    if secs >= 3600 {
+        return format!("{}h {}m", secs / 3600, secs % 3600 / 60);
+    }
+    format!("{:02}:{:02}", secs / 60, secs % 60)
 }
 
 #[cfg(test)]
@@ -1504,6 +1507,17 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn a_duration_of_an_hour_or_more_reads_as_hours_and_minutes() {
+        let at = |secs| format_duration(Duration::from_secs(secs));
+        assert_eq!(at(0), "00:00");
+        assert_eq!(at(725), "12:05");
+        assert_eq!(at(3599), "59:59");
+        assert_eq!(at(3600), "1h 0m");
+        assert_eq!(at(380 * 60 + 12), "6h 20m");
+        assert_eq!(at(26 * 3600 + 5 * 60), "26h 5m");
+    }
 
     fn sample_report() -> RunReport {
         RunReport {
