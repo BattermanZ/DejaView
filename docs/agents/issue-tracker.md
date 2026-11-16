@@ -28,9 +28,13 @@ Tickets for DejaView live as GitHub issues on `BattermanZ/DejaView`. Use the
 ## Labels
 
 The triage roles are labels of the same name: the categories `bug` and
-`enhancement`, and the states `needs-triage`, `needs-info`, `ready-for-agent`,
-`ready-for-human` and `wontfix`. A ticket an agent files for the maintainer to
-approve takes `needs-triage`.
+`enhancement`, and the states `needs-triage`, `needs-info`, `ready-for-agent`
+and `wontfix`. Agents build every ticket, so there is no `ready-for-human`. A
+ticket an agent files for the maintainer to approve takes `needs-triage`.
+
+An assignee means a session is working on the ticket now, nothing else. A
+ticket that waits keeps `ready-for-agent` and its body opens, after any AI
+note, with `> **Do not start yet.** <what it waits for>`.
 
 **`ready-for-agent` goes on a ticket to build, never on a parent spec.** A spec
 whose work is its child tickets (each child names it under `## Parent`) is read
